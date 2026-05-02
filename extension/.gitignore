@@ -1,0 +1,5 @@
+*.log
+
+# Vendored libs are downloaded by `task ext:vendor` and not tracked.
+# This keeps the repo small and means contributors always get the latest minified versions.
+vendor/

@@ -1,0 +1,71 @@
+version: '3'
+
+vars:
+  DAEMON_HEALTH: http://localhost:8765/health
+
+# All shell logic lives in scripts/*.sh — Taskfile is just a router.
+# This keeps cmd: blocks one-liners and avoids Task's mvdan.cc/sh interpreter
+# tripping on bashisms ($!, $(cat ...), kill -0, etc.).
+
+tasks:
+  default:
+    desc: Show user-facing tasks
+    cmds:
+      - task --list
+
+  install:
+    desc: One-time setup — config, daemon image, vendor libs (any OpenAI-compatible backend)
+    cmds:
+      - bash scripts/install.sh
+
+  install:mlx:
+    desc: "Optional (macOS arm64): install mlx-openai-server + Qwen/Whisper weights (~10 GB)"
+    cmds:
+      - bash scripts/install.sh
+      - bash scripts/mlx.sh install
+
+  up:
+    desc: Start the daemon (and mlx-server if installed via task install:mlx)
+    cmds:
+      - bash scripts/mlx.sh start-if-present
+      - docker compose up -d
+      - sleep 2
+      - task: status
+
+  down:
+    desc: Stop everything (sqlite volume preserved)
+    cmds:
+      - docker compose down
+      - bash scripts/mlx.sh stop
+
+  status:
+    desc: Health check (mlx + daemon + docker containers)
+    cmds:
+      - bash scripts/mlx.sh status
+      - cmd: |
+          if curl -sf {{.DAEMON_HEALTH}} > /dev/null 2>&1; then
+            echo "✓ daemon healthy ({{.DAEMON_HEALTH}})"
+          else
+            echo "✗ daemon not responding"
+          fi
+        ignore_error: true
+      - docker compose ps
+
+  logs:
+    desc: Tail daemon logs (Ctrl-C to stop). For mlx logs see data/logs/mlx.*.log
+    cmds:
+      - docker compose logs -f daemon
+
+  reset:
+    desc: "DESTRUCTIVE — stop everything and DELETE the SQLite volume"
+    prompt: This removes ALL processed jobs from the database. Continue?
+    cmds:
+      - docker compose down -v
+      - bash scripts/mlx.sh stop
+
+  test:
+    desc: Run daemon tests + lint + typecheck inside the container
+    cmds:
+      - docker compose run --rm daemon ruff check src/
+      - docker compose run --rm daemon mypy src/
+      - docker compose run --rm daemon pytest

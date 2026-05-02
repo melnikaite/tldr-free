@@ -1,0 +1,32 @@
+server:
+  host: "0.0.0.0"            # required so the dockerized daemon can reach it via host.docker.internal
+  port: 18000                # 8000 is commonly taken by other dev stacks; pick anything free
+  log_level: INFO
+
+# mlx-server v1.8.1 has a known on-demand bug: the idle-unload timer is
+# scheduled when the FIRST request after a load completes, and subsequent
+# requests on the loaded model don't reset it (their resolve path
+# short-circuits via get_handler before ensure_on_demand_loaded). So a
+# batch of streaming requests within the idle window can trigger an
+# unload mid-stream of the LAST request.
+#
+# Mitigation here: pick idle_timeouts long enough that any realistic batch
+# fits inside a single window. The daemon also enforces a per-chunk
+# stream timeout (config.llm.stream_chunk_timeout_seconds) as
+# defence-in-depth so a hung backend stream eventually fails the job
+# instead of locking the queue forever.
+models:
+  - model_path: mlx-community/Qwen2.5-14B-Instruct-4bit
+    model_type: lm
+    served_model_name: qwen
+    context_length: 32768
+    on_demand: true
+    on_demand_idle_timeout: 1800   # 30 min — frees ~8 GB after a batch finishes
+    kv_bits: 4
+    kv_group_size: 64
+
+  - model_path: mlx-community/whisper-large-v3-mlx-4bit
+    model_type: whisper
+    served_model_name: whisper
+    on_demand: true
+    on_demand_idle_timeout: 3600   # 60 min — covers single long transcription streams

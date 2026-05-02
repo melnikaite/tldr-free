@@ -1,0 +1,92 @@
+# Daemon configuration. Loaded at startup by daemon/src/config.py.
+# Environment variables prefixed with TLDR__ override individual fields,
+# e.g. TLDR__OUTPUT__LANGUAGE=English
+#
+# The daemon talks to any OpenAI-compatible HTTP backend. Pick one of the
+# llm + whisper sections below (or write your own — base_url + model is all
+# we need). The daemon container reaches host services via host.docker.internal.
+
+# ---------------------------------------------------------------------------
+# Backend: mlx-openai-server (Apple Silicon, fastest local) — default
+# Install with: task install:mlx
+# ---------------------------------------------------------------------------
+llm:
+  base_url: http://host.docker.internal:18000/v1
+  api_key: dummy                                   # mlx-openai-server doesn't check it
+  model: qwen
+  context_length: 32768
+  single_pass_token_limit: 24000                   # above this → map-reduce
+  # Cap on simultaneous LLM calls. 1 keeps a single-user Mac responsive;
+  # bump to 2-3 on a beefy GPU server or hosted backend.
+  max_concurrent_calls: 1
+
+whisper:
+  base_url: http://host.docker.internal:18000/v1
+  api_key: dummy
+  model: whisper
+
+# ---------------------------------------------------------------------------
+# Backend: Ollama (any OS, easy install) — uncomment to switch
+# `ollama serve` listens on 11434 by default. `ollama pull qwen2.5:14b` first.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:11434/v1
+#   api_key: ollama
+#   model: qwen2.5:14b
+#   context_length: 32768
+#   single_pass_token_limit: 24000
+#   max_concurrent_calls: 1
+#
+# whisper:
+#   # Ollama doesn't ship Whisper. Point at any STT server (faster-whisper,
+#   # whisper.cpp HTTP, openai/whisper-large-v3 via vLLM, etc.).
+#   base_url: http://host.docker.internal:8123/v1
+#   api_key: dummy
+#   model: whisper-1
+
+# ---------------------------------------------------------------------------
+# Backend: LM Studio (Mac/Win, GUI) — uncomment to switch
+# Enable the local server in LM Studio → Developer; default port 1234.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:1234/v1
+#   api_key: lm-studio
+#   model: qwen2.5-14b-instruct      # whatever you loaded in LM Studio
+#   context_length: 32768
+#   single_pass_token_limit: 24000
+#   max_concurrent_calls: 1
+
+# ---------------------------------------------------------------------------
+# Output language. Use an ISO 639-1 code: en, ru, de, fr, es, it, pt, ja, …
+# (the daemon expands it to the full name when prompting the LLM, which
+# helps smaller models stick to the language). Anything else is passed
+# through verbatim, so you can also write "Brazilian Portuguese" if you
+# need precision.
+# ---------------------------------------------------------------------------
+output:
+  language: en
+
+youtube:
+  fast_path_max_attempts: 4
+  fast_path_backoff_seconds: [1, 4, 16, 60]
+  segment_window_seconds: 30        # aggregate transcript segments into [MM:SS]-marked windows
+  audio_format: opus
+  audio_bitrate_max: 64
+  ytdlp_sleep_interval: [3, 8]      # min, max seconds between yt-dlp requests
+  # When the youtube-transcript-api fast path fails, yt-dlp tries to grab
+  # auto-generated captions before falling back to Whisper. The original
+  # video language is always tried first; this list adds further preferences.
+  subtitle_lang_preferences: ["en", "ru"]
+
+storage:
+  data_dir: /data                   # mounted volume in the container
+  db_filename: tldr.db
+  retention_days: 365               # daemon deletes jobs older than this; 0 disables
+
+workers:
+  # Sleep this long between consecutive background jobs (Whisper queue and
+  # streaming summaries) to let the CPU/GPU cool down. 0 = back-to-back.
+  cooldown_seconds: 0
+
+logging:
+  level: INFO

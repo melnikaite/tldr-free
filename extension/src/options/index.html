@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TLDR — Options</title>
+    <style>
+      body { font-family: system-ui, sans-serif; padding: 1.5rem 2rem; max-width: 600px; }
+      label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+      input { width: 100%; padding: 0.5rem; font: inherit; }
+      button { margin-top: 1.5rem; padding: 0.5rem 1rem; }
+      .ok { color: #137333; }
+      .err { color: #c5221f; }
+    </style>
+  </head>
+  <body>
+    <h1>TLDR — Options</h1>
+
+    <label for="daemon-url">Daemon URL</label>
+    <input id="daemon-url" type="url" placeholder="http://127.0.0.1:8765" />
+
+    <button id="save">Save</button>
+    <span id="status"></span>
+
+    <script type="module" src="./options.js"></script>
+  </body>
+</html>

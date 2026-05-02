@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TLDR</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <strong>TLDR</strong>
+      <span id="stage-badge" class="badge stage hidden"></span>
+      <span id="processing-badge" class="badge hidden">queue: <span id="processing-count">0</span></span>
+      <button id="open-library">Library</button>
+    </header>
+
+    <main id="summary">
+      <p class="placeholder">Click the toolbar button on a page or YouTube video.</p>
+    </main>
+
+    <div id="chat-messages"></div>
+
+    <form id="chat-form">
+      <input id="chat-input" type="text" placeholder="Ask about this material..." disabled />
+      <button type="submit" disabled>Ask</button>
+    </form>
+
+    <!-- Vendored libs (classic scripts, expose globals: marked, DOMPurify) -->
+    <script src="../../vendor/marked.min.js"></script>
+    <script src="../../vendor/purify.min.js"></script>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

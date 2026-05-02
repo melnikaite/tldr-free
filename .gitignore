@@ -1,0 +1,32 @@
+# Real configs (copies of *.example)
+config/*.yaml
+!config/*.yaml.example
+
+# mlx-server runtime state
+.mlx.pid
+data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Node / extension
+node_modules/
+dist/
+.vite/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

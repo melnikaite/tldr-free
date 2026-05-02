@@ -1,0 +1,25 @@
+services:
+  daemon:
+    build:
+      context: ./daemon
+      dockerfile: Dockerfile
+    container_name: tldr-daemon
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - tldr-data:/data
+      - ./config/tldr.yaml:/app/config/tldr.yaml:ro
+      - ./daemon/src:/app/src       # hot-reload during development
+      - ./daemon/tests:/app/tests   # so `task test` sees freshly-edited tests
+    environment:
+      TLDR_CONFIG: /app/config/tldr.yaml
+      DATA_DIR: /data
+      LOG_LEVEL: INFO
+      TZ: Europe/Berlin
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  tldr-data:
+    name: tldr-data

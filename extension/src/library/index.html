@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Library — TLDR</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Library</h1>
+      <div class="filters">
+        <select id="filter-status">
+          <option value="">All status</option>
+          <option value="done">Done</option>
+          <option value="queued,running">In progress</option>
+          <option value="failed">Failed</option>
+        </select>
+        <select id="filter-kind">
+          <option value="">All kinds</option>
+          <option value="page">Pages</option>
+          <option value="youtube">YouTube</option>
+        </select>
+        <input id="filter-search" type="search" placeholder="Search title..." />
+        <span class="spacer"></span>
+        <button id="queue-toggle" type="button" title="Whisper queue control">
+          <span id="queue-toggle-label">Queue: …</span>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <table id="jobs">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Title</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+
+    <!-- Vendored libs -->
+    <script src="../../vendor/marked.min.js"></script>
+    <script src="../../vendor/purify.min.js"></script>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
