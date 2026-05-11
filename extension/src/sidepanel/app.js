@@ -184,7 +184,12 @@ async function _openUrl(url) {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
-  if (msg.type === "tab-changed") {
+  if (msg.type === "tab-switching") {
+    // The active tab is changing. Abort any in-flight stream immediately so a
+    // `done` event from the previous job can't render stale content while we
+    // wait for `tab-changed` (which arrives after listJobs completes).
+    abortActiveStream();
+  } else if (msg.type === "tab-changed") {
     handleTabChanged(msg.url, msg.jobId).catch((e) =>
       console.error("[TLDR] tab-changed", e),
     );
@@ -446,26 +451,25 @@ function streamSummaryFor(job) {
     } else if (ev.type === "done") {
       cancelRender();
       streamAccCache.delete(job.id);   // job finished — no longer need replay
-      // renderSummary replaces the whole summaryEl (same path as the cached
-      // case), so there is no risk of leaving behind a stale textContent view
-      // if ev.content and acc both happen to be empty (joined the stream late).
-      renderSummary(job, ev.content || acc);
+      const content = ev.content || acc;
       markAllDone(phases);
       setStage(null);
-      syncChatEnabled(true);
       abortActiveStream();
-      // Pull fresh job for chat context (raw_text, summary_md).
-      // Also re-patch the title: the YouTube pipeline overwrites the initial
-      // video-id placeholder with the real title mid-stream (via yt-dlp), but
-      // renderSummary above re-renders from the captured `job` (which still
-      // has the placeholder). One extra DOM write after the round-trip fixes it.
+      // Fetch the fresh job BEFORE rendering so video_id and the canonical
+      // title are available. The job object captured at stream start has
+      // video_id=null (set mid-pipeline by _set_extracted) and may still
+      // carry the video-id placeholder as title. Rendering with the stale
+      // object would leave [MM:SS] timecodes as plain text instead of links.
       daemon.getJob(job.id).then(fresh => {
         setActiveJob(fresh);
-        if (fresh.title && fresh.title !== job.title) {
-          const link = summaryEl.querySelector(".job-title a");
-          if (link) link.textContent = fresh.title;
-        }
-      }).catch(() => {});
+        renderSummary(fresh, content);
+        syncChatEnabled(true);
+      }).catch(() => {
+        // Daemon unreachable — fall back to the stale job; timecodes won't
+        // be links but at least the summary text is shown.
+        renderSummary(job, content);
+        syncChatEnabled(true);
+      });
     } else if (ev.type === "error") {
       cancelRender();
       streamAccCache.delete(job.id);   // job failed — drop replay buffer
