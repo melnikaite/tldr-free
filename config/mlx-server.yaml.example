@@ -16,12 +16,17 @@ server:
 # defence-in-depth so a hung backend stream eventually fails the job
 # instead of locking the queue forever.
 models:
-  - model_path: mlx-community/Qwen3-4B-Instruct-2507-4bit
+  # LLM: Gemma 4 E4B (4-bit) — ~5 GB, fits in 8 GB unified memory.
+  # NOTE: mlx-openai-server support for Gemma 4 is pending a stable release;
+  # if it doesn't load, fall back to mlx-community/gemma-3-12b-it-4bit until fixed.
+  # For the larger MoE flagship, swap in:
+  #   mlx-community/gemma-4-26b-a4b-it-4bit
+  - model_path: mlx-community/gemma-4-e4b-it-4bit
     model_type: lm
-    served_model_name: qwen
-    context_length: 32768
+    served_model_name: gemma4
+    context_length: 131072
     on_demand: true
-    on_demand_idle_timeout: 1800   # 30 min — frees ~3 GB after a batch finishes
+    on_demand_idle_timeout: 1800   # 30 min — frees ~5 GB after a batch finishes
     kv_bits: 4
     kv_group_size: 64
 

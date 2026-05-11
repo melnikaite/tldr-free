@@ -30,3 +30,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Claude Code
+.claude/scheduled_tasks.lock

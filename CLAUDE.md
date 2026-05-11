@@ -30,7 +30,7 @@ don't try to mirror every line.
 
 ```bash
 task install              # one-time: config + daemon image + extension vendor libs
-task install:mlx          # OPTIONAL: macOS arm64 mlx-openai-server + Qwen/Whisper weights (~10 GB)
+task install:mlx          # OPTIONAL: macOS arm64 mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)
 task up                   # daemon (docker) + mlx-server if installed
 task down                 # stop (sqlite volume preserved)
 task test                 # ruff + mypy + pytest inside the daemon container

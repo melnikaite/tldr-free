@@ -114,7 +114,7 @@ sparse usage (one job, gap, another job) reloads the model fresh each
 time. Mitigation is in `~/.mlx-server/config.yaml` (seeded from
 `config/mlx-server.yaml.example` by `task install:mlx`): pick idle_timeouts long
 enough that any realistic batch fits inside a single window
-(qwen: 1800 s, whisper: 3600 s). The per-chunk timeout above catches
+(gemma4: 1800 s, whisper: 3600 s). The per-chunk timeout above catches
 the case where someone runs a huge batch and the timer still fires.
 
 ## Background work is globally pausable — soft pause between steps
