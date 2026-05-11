@@ -218,6 +218,13 @@ async function submitJob(req, sourceTabId) {
 /** @type {Map<number, string>} */
 const lastSyncedUrlByTab = new Map();
 
+// Monotonic counter so the side panel can drop responses for tabs the user
+// has already left. Every call to `syncSidepanelForTab` bumps it; the late
+// completion of an older listJobs gets discarded both here (we skip the
+// final broadcast if `version !== switchVersion`) and on the receiver
+// side (it ignores messages with stale `version`).
+let switchVersion = 0;
+
 /** @param {chrome.tabs.Tab} tab */
 async function syncSidepanelForTab(tab) {
   const url = tab?.url;
@@ -230,6 +237,13 @@ async function syncSidepanelForTab(tab) {
   if (!/^https?:/i.test(url)) return;
 
   const normalized = normalizeUrl(url);
+  const version = ++switchVersion;
+
+  // Phase 1: tell the panel which tab we're moving to *before* hitting the
+  // daemon. jobId is omitted to mean "still resolving". The panel uses this
+  // to decide whether to blank to a spinner (different URL) or stay put
+  // (same URL — e.g. window focus restored on the same tab).
+  await broadcast({ type: "set-active-tab", version, url: normalized });
 
   let jobId = null;
   try {
@@ -237,11 +251,16 @@ async function syncSidepanelForTab(tab) {
     jobId = resp.items?.[0]?.id ?? null;
   } catch (err) {
     console.warn("[TLDR] tab sync listJobs failed", err);
-    return;
+    // Fall through with jobId = null — phase 2 is always sent so the panel
+    // stays in sync even when the daemon is temporarily unreachable.
   }
 
+  // A newer syncSidepanelForTab fired after us — its phase 1 already moved
+  // the panel forward. Don't clobber it with our late phase 2.
+  if (version !== switchVersion) return;
+
   await chrome.storage.session.set({ activeJobId: jobId, activeUrl: normalized });
-  await broadcast({ type: "tab-changed", url: normalized, jobId });
+  await broadcast({ type: "set-active-tab", version, url: normalized, jobId });
 }
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {

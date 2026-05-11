@@ -23,6 +23,9 @@ async function getBaseUrl() {
 
 async function request(path, init) {
   const baseUrl = await getBaseUrl();
+  // `init` (including `signal`) is passed straight to fetch. Callers can
+  // hook up timeouts via `AbortSignal.timeout(ms)` or cancel via their own
+  // AbortController.
   const res = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
@@ -35,6 +38,13 @@ async function request(path, init) {
   return res.json();
 }
 
+// If the daemon stops sending chunks for this many ms, we assume the stream
+// is dead (network glitch, daemon crashed, or — most commonly here — the
+// side panel was throttled/paused by Chrome while its window was minimised
+// and the underlying fetch reader is hung). Throwing closes the generator,
+// the caller's `finally` runs, and chat input gets re-enabled.
+const SSE_CHUNK_TIMEOUT_MS = 120_000;
+
 /**
  * SSE generator — POST `path` with `body` and yield each parsed `data:` frame
  * as the typed event union `T`. Used by both /ai/stream modes (summary, QA).
@@ -42,14 +52,16 @@ async function request(path, init) {
  * @template T
  * @param {string} path
  * @param {object} body
+ * @param {{ signal?: AbortSignal }} [opts]
  * @returns {AsyncGenerator<T, void, void>}
  */
-async function* sseStream(path, body) {
+async function* sseStream(path, body, opts = {}) {
   const baseUrl = await getBaseUrl();
   const res = await fetch(`${baseUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify(body),
+    signal: opts.signal,
   });
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
@@ -58,27 +70,46 @@ async function* sseStream(path, body) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const frame = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("data: ")) {
-          const json = line.slice(6);
-          if (json) {
-            try {
-              yield /** @type {T} */ (JSON.parse(json));
-            } catch (e) {
-              console.warn("malformed SSE frame", json, e);
+  try {
+    while (true) {
+      // Per-chunk timeout: if the daemon stops sending for SSE_CHUNK_TIMEOUT_MS
+      // we throw and let the caller's `finally` clean up. Needs Promise.race
+      // (not AbortSignal.timeout on fetch) because the timeout resets on
+      // every successful chunk.
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`SSE stream stalled (no chunk for ${SSE_CHUNK_TIMEOUT_MS}ms)`)),
+            SSE_CHUNK_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("data: ")) {
+            const json = line.slice(6);
+            if (json) {
+              try {
+                yield /** @type {T} */ (JSON.parse(json));
+              } catch (e) {
+                console.warn("malformed SSE frame", json, e);
+              }
             }
           }
         }
       }
     }
+  } finally {
+    // Release the underlying body stream so the fetch is fully torn down,
+    // whether we exited normally, by timeout, by caller `break`, or by the
+    // caller aborting via `opts.signal`.
+    try { await reader.cancel(); } catch { /* ignore */ }
   }
 }
 
@@ -98,9 +129,10 @@ export const daemon = {
 
   /**
    * @param {{ status?: JobStatus[], kind?: string, tag?: string, url?: string, limit?: number, offset?: number }} [params]
+   * @param {RequestInit} [init] standard fetch init — pass `{ signal }` for timeout/cancel
    * @returns {Promise<JobListResponse>}
    */
-  listJobs: (params) => {
+  listJobs: (params, init) => {
     const qs = new URLSearchParams();
     if (params?.status?.length) qs.set("status", params.status.join(","));
     if (params?.kind) qs.set("kind", params.kind);
@@ -108,14 +140,15 @@ export const daemon = {
     if (params?.limit !== undefined) qs.set("limit", String(params.limit));
     if (params?.offset !== undefined) qs.set("offset", String(params.offset));
     const q = qs.toString();
-    return request(`/jobs${q ? `?${q}` : ""}`);
+    return request(`/jobs${q ? `?${q}` : ""}`, init);
   },
 
   /**
    * @param {string} id
+   * @param {RequestInit} [init]
    * @returns {Promise<JobDetails>}
    */
-  getJob: (id) => request(`/jobs/${id}`),
+  getJob: (id, init) => request(`/jobs/${id}`, init),
 
   /**
    * @param {string} id
@@ -169,6 +202,3 @@ export const daemon = {
    */
   aiQa: (req) => sseStream("/ai/qa", req),
 };
-
-/** Convenience type re-export so consumers don't have to dual-import. */
-export const _types = { ChatMessage: /** @type {ChatMessage} */ (undefined) };

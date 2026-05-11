@@ -9,9 +9,14 @@
 //     or from Library on retry/open): if shouldSwitch=true, switch to the
 //     new job. This is the primary path; storage.onChanged is a backup
 //     (same-value sets aren't guaranteed to notify).
-//   - On `tab-changed` broadcast (background.js noticed the active tab
+//   - On `set-active-tab` broadcast (background.js noticed the active tab
 //     changed): switch the panel to that tab's cached job, or render
-//     "no summary yet" if it has none.
+//     "no summary yet" if it has none. The message arrives twice per
+//     switch — once before listJobs (jobId omitted) so the panel can
+//     blank to a spinner, and once after (jobId resolved) so it can
+//     render the final state. A monotonic `version` discards stale
+//     phase-2 messages when the user switches again before listJobs
+//     for the previous tab finishes.
 //   - Chat history persists in SQLite (per job). On job switch we GET
 //     /jobs/{id}/messages and render the saved bubbles before any new
 //     question.
@@ -26,6 +31,7 @@
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { renderMarkdown } from "../lib/markdown.js";
+import { resolveVideoId } from "../lib/url.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import { setActiveJob, getActiveJob, renderHistory, clearChat } from "./chat.js";
 
@@ -182,18 +188,26 @@ async function _openUrl(url) {
   chrome.tabs.create({ url });
 }
 
+// Monotonic version of the latest tab switch the side panel has acknowledged.
+// background.js increments its counter on every syncSidepanelForTab; we drop
+// any message with an older version so out-of-order listJobs completions
+// can't act on a tab the user has already left.
+let lastTabVersion = 0;
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
-  if (msg.type === "tab-changed") {
-    handleTabChanged(msg.url, msg.jobId).catch((e) =>
-      console.error("[TLDR] tab-changed", e),
+  if (msg.type === "set-active-tab") {
+    if (typeof msg.version === "number" && msg.version < lastTabVersion) return;
+    if (typeof msg.version === "number") lastTabVersion = msg.version;
+    handleSetActiveTab(msg).catch((e) =>
+      console.error("[TLDR] set-active-tab", e),
     );
   } else if (msg.type === "job-created") {
     handleJobCreated(msg).catch((e) =>
       console.error("[TLDR] job-created", e),
     );
   } else if (msg.type === "extraction-error") {
-    renderError(msg.error || "Failed to extract page content.");
+    renderState({ mode: "error", message: msg.error || "Failed to extract page content." });
   }
 });
 
@@ -273,7 +287,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 bootstrap().catch((e) => {
   console.error("[TLDR] sidepanel bootstrap", e);
-  renderError(stringifyError(e));
+  renderState({ mode: "error", message: stringifyError(e) });
 });
 
 async function bootstrap() {
@@ -285,48 +299,87 @@ async function bootstrap() {
   if (activeJobId) {
     await loadAndRender(activeJobId);
   } else if (activeUrl) {
-    renderNoSummary(activeUrl);
-    syncChatEnabled(false);
+    renderState({ mode: "no-summary", url: activeUrl });
   }
 }
 
 /**
- * Tab follow: the active tab changed.
- * @param {string} url
- * @param {string | null} jobId
+ * Single entry point for tab-follow. Background fires this twice per switch:
+ *
+ *   phase 1 ({version, url}):           "moving to this tab, jobId unknown yet"
+ *   phase 2 ({version, url, jobId}):    "listJobs done — here's the answer"
+ *
+ * The version filter above (`lastTabVersion`) discards stale phase-2 messages
+ * if a newer switch already fired. Everything else is handled by
+ * `renderState` idempotency: re-rendering the same state is a no-op, so we
+ * don't need a side-flag like the old `domBlankedBySwitch` to remember
+ * whether the DOM was wiped.
+ *
+ * @param {{ version?: number, url: string, jobId?: string | null }} msg
  */
-async function handleTabChanged(url, jobId) {
-  if (jobId) {
-    const active = await getActiveJob();
-    if (active && active.id === jobId) return;
-    await loadAndRender(jobId);
-  } else {
-    abortActiveStream();
+async function handleSetActiveTab(msg) {
+  const { url, jobId } = msg;
+  const active = await getActiveJob();
+
+  if (jobId === undefined) {
+    // Phase 1: probe. background still resolving.
+    if (active?.url === url) return;   // same tab — keep current view
+    renderState({ mode: "loading" });
+    return;
+  }
+
+  // Phase 2: definitive answer.
+  if (jobId === null) {
     setActiveJob(null);
     clearChat();
-    renderNoSummary(url);
-    syncChatEnabled(false);
+    renderState({ mode: "no-summary", url });
     window.scrollTo({ top: 0 });
+    return;
+  }
+
+  if (active && active.id === jobId) {
+    // Same job — restore from in-memory. If renderState is already showing
+    // the right thing, its idempotency check turns this into a no-op (so
+    // window focus restored on the same tab doesn't flicker). If the DOM
+    // was blanked to loading in phase 1, this transition replaces it.
+    renderFromJob(active);
+    return;
+  }
+  await loadAndRender(jobId);
+}
+
+/**
+ * Pick the right renderState mode based on a job's current status.
+ * Used wherever we have a job in hand and want "show this job, whatever
+ * state it's in" without re-implementing the switch four times.
+ *
+ * @param {import("../lib/api-types.js").JobDetails} job
+ */
+function renderFromJob(job) {
+  if (job.status === "done" && job.summary_md) {
+    renderState({ mode: "done", job, content: job.summary_md });
+  } else if (job.status === "failed") {
+    renderState({ mode: "error", message: job.error || "Job failed.", job });
+  } else {
+    renderState({ mode: "streaming", job });
   }
 }
 
 /** @param {string} jobId */
 async function loadAndRender(jobId) {
-  abortActiveStream();
-  renderLoading();
-  syncChatEnabled(false);
+  renderState({ mode: "loading" });
   // Reset scroll to the top so the user sees the new title / summary from
   // the start (otherwise we may be parked deep in the previous job's chat).
   window.scrollTo({ top: 0 });
 
   // Safety net: if getJob hangs (daemon down, dead service worker, …) the
-  // user gets a real error after 8s instead of an endless spinner.
+  // user gets a real error after 8s instead of an indefinite spinner.
   let job;
   try {
-    job = await withTimeout(daemon.getJob(jobId), 8000, `getJob(${jobId})`);
+    job = await daemon.getJob(jobId, { signal: AbortSignal.timeout(8000) });
   } catch (err) {
     console.error("[TLDR] getJob failed", err);
-    renderError(stringifyError(err));
+    renderState({ mode: "error", message: stringifyError(err) });
     return;
   }
   setActiveJob(job);
@@ -334,54 +387,184 @@ async function loadAndRender(jobId) {
   // Pull chat history in parallel with summary rendering.
   loadHistory(jobId).catch((e) => console.warn("[TLDR] message history failed", e));
 
-  if (job.status === "done" && job.summary_md) {
-    renderSummary(job, job.summary_md);
-    setStage(null);
-    syncChatEnabled(true);
-    return;
-  }
-  if (job.status === "failed") {
-    renderError(job.error || "Job failed.", job);
-    setStage(null);
-    return;
-  }
+  renderFromJob(job);
+}
 
-  // queued / running → subscribe to live /ai/stream.
-  await streamSummaryFor(job);
+// ---------------------------------------------------------------------------
+// Single source of truth for the summary pane.
+//
+// `renderState({mode, ...})` owns the triplet (`summaryEl.innerHTML`, the
+// stage badge, chat enablement) for every state the pane can be in. Callers
+// describe the new state declaratively; this function does the DOM writes,
+// the secondary state plumbing, and the stream subscription teardown.
+//
+// Idempotent via `currentRender.key` — calling with the same state twice is
+// a no-op, which matters for `streaming` (re-entering would drop the live
+// subscription and reset the timeline) and `done` (would re-render the same
+// markdown for no reason). State transitions still always render.
+// ---------------------------------------------------------------------------
+
+/** @typedef {(
+ *   | { mode: "loading" }
+ *   | { mode: "no-summary", url: string }
+ *   | { mode: "error", message: string, job?: import("../lib/api-types.js").JobDetails | null }
+ *   | { mode: "done", job: import("../lib/api-types.js").JobDetails, content: string }
+ *   | { mode: "streaming", job: import("../lib/api-types.js").JobDetails }
+ * )} ViewState */
+
+/** @type {{ key: string } | null} */
+let currentRender = null;
+
+/** @param {ViewState} state */
+function renderState(state) {
+  const key = _stateKey(state);
+  if (currentRender?.key === key) return;
+  currentRender = { key };
+
+  // Every state transition drops any live subscription from the previous
+  // state. Streaming re-attaches its own below.
+  abortActiveStream();
+
+  switch (state.mode) {
+    case "loading":
+      summaryEl.innerHTML = `
+        <div class="status-block">
+          <div class="spinner" aria-hidden="true"></div>
+          <p>Loading…</p>
+        </div>
+      `;
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+
+    case "no-summary":
+      summaryEl.innerHTML = `
+        <div class="placeholder-block">
+          <p class="muted small url-line">${escapeHtml(state.url || "")}</p>
+          <button class="summarize-btn" type="button">Summarize this page</button>
+        </div>
+      `;
+      _bindSummarizeButton();
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+
+    case "error": {
+      const titleHtml = _titleHtml(state.job || null);
+      const retryHtml = state.job?.id
+        ? `<button class="retry-btn" data-retry-id="${escapeHtml(state.job.id)}">Retry</button>`
+        : "";
+      summaryEl.innerHTML = `
+        ${titleHtml}
+        <div class="status-block error">
+          <p><strong>Error.</strong></p>
+          <p class="muted small">${escapeHtml(state.message)}</p>
+          ${retryHtml}
+        </div>
+      `;
+      _bindRetryButton(state.job || null);
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+    }
+
+    case "done": {
+      const titleHtml = _titleHtml(state.job);
+      const html = renderMarkdown(state.content || "_(empty summary)_", resolveVideoId(state.job));
+      summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
+      setStage(null);
+      syncChatEnabled(true);
+      return;
+    }
+
+    case "streaming": {
+      const titleHtml = _titleHtml(state.job);
+      summaryEl.innerHTML =
+        `${titleHtml}` +
+        `<ul class="timeline" id="phase-timeline"></ul>` +
+        `<div class="markdown-body" id="summary-stream"></div>`;
+      _attachStreamSubscription(state.job);
+      // Chat is disabled while streaming: daemon /ai/qa requires status=done.
+      syncChatEnabled(false);
+      return;
+    }
+  }
+}
+
+/** @param {ViewState} state */
+function _stateKey(state) {
+  switch (state.mode) {
+    case "loading":    return "loading";
+    case "no-summary": return `no-summary:${state.url || ""}`;
+    case "error":      return `error:${state.job?.id || ""}:${state.message}`;
+    case "done":       return `done:${state.job.id}:${state.content?.length ?? 0}`;
+    case "streaming":  return `streaming:${state.job.id}`;
+  }
 }
 
 /**
- * Drive the summary area for a queued/running job from /events.
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ */
+function _titleHtml(job) {
+  if (!job?.title) return "";
+  const safeUrl = escapeHtml(job.url);
+  const safeTitle = escapeHtml(job.title);
+  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>`;
+}
+
+function _bindSummarizeButton() {
+  const btn = /** @type {HTMLButtonElement | null} */ (
+    summaryEl.querySelector(".summarize-btn")
+  );
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+    try {
+      await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
+    } catch (err) {
+      console.error("[TLDR] summarize-active-tab failed", err);
+      renderState({ mode: "error", message: stringifyError(err) });
+    }
+  });
+}
+
+/** @param {import("../lib/api-types.js").JobDetails | null} job */
+function _bindRetryButton(job) {
+  const btn = /** @type {HTMLButtonElement | null} */ (summaryEl.querySelector(".retry-btn"));
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const id = btn.dataset.retryId;
+    if (!id) return;
+    btn.setAttribute("disabled", "true");
+    try {
+      await daemon.retryJob(id);
+      await loadAndRender(id);
+    } catch (err) {
+      console.error("[TLDR] retry failed", err);
+      btn.removeAttribute("disabled");
+      renderState({ mode: "error", message: stringifyError(err), job });
+    }
+  });
+}
+
+/**
+ * Wire up the live event-stream subscription for a streaming job. Expects
+ * `summaryEl` to already contain the streaming skeleton (timeline + stream
+ * div). The unsubscribe handle goes into `activeStreamUnsubscribe`; any
+ * later `renderState(...)` (or explicit `abortActiveStream`) tears it down.
  *
  * No second SSE connection is opened — we filter the global event stream by
  * job_id. This keeps each side panel at exactly one long-lived connection
- * and avoids running into Chrome's 6-per-origin HTTP/1.1 cap, which used
- * to leave subsequent fetches "stalled" with no entry in DevTools' Network
- * tab while a /ai/stream connection still hung from a prior pipeline.
- *
- * UI shape during streaming:
- *   <h2>title</h2>
- *   <ul class="timeline">
- *     <li class="phase phase--done">  ✓  Extracting page content
- *     <li class="phase phase--active"> dots Transcribing audio
- *   </ul>
- *   <div class="markdown-body" id="summary-stream"></div>  ← starts empty
- *
- * On the first delta the timeline collapses to a muted strip and tokens
- * begin flowing into #summary-stream. On done it's replaced with the
- * rendered markdown.
+ * and avoids running into Chrome's 6-per-origin HTTP/1.1 cap.
  *
  * @param {import("../lib/api-types.js").JobDetails} job
  */
-function streamSummaryFor(job) {
-  const titleHtml = renderTitleHtml(job);
-  const initialStage = job.progress_stage || "queued";
-  summaryEl.innerHTML =
-    `${titleHtml}` +
-    `<ul class="timeline" id="phase-timeline"></ul>` +
-    `<div class="markdown-body" id="summary-stream"></div>`;
+function _attachStreamSubscription(job) {
   const timelineEl = /** @type {HTMLElement} */ (document.getElementById("phase-timeline"));
   const streamEl = /** @type {HTMLElement} */ (document.getElementById("summary-stream"));
+  const videoId = resolveVideoId(job);
+  const initialStage = job.progress_stage || "queued";
 
   /** @type {Array<{stage:string, detail:(string|undefined), status:"active"|"done"|"failed", error?:string}>} */
   const phases = [];
@@ -398,36 +581,25 @@ function streamSummaryFor(job) {
   let rafId = null;
   setStage(initialStage);
 
-  // If we already have buffered content, collapse the phase timeline and
-  // render it right away so the user sees the full replay instead of a blank.
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
-    streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+    streamEl.innerHTML = renderMarkdown(acc, videoId);
   }
 
-  /**
-   * Schedule a markdown re-render for the next animation frame.
-   * Using rAF as a throttle: multiple delta events arriving in the same JS
-   * task batch collapse into one DOM write per frame (~60 Hz max, but in
-   * practice limited by the daemon's ~10 Hz delta flush rate). This gives
-   * progressive formatted rendering during streaming instead of raw text.
-   */
+  // rAF throttle: multiple delta events in the same JS task batch collapse
+  // into one DOM write per frame.
   const scheduleRender = () => {
-    if (rafId !== null) return;          // already queued
+    if (rafId !== null) return;
     rafId = requestAnimationFrame(() => {
       rafId = null;
-      if (acc) streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+      if (acc) streamEl.innerHTML = renderMarkdown(acc, videoId);
     });
   };
-
   const cancelRender = () => {
     if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
   };
 
-  // Subscribe to the global event stream filtered by this job's id.
-  // The unsubscribe handle goes into `activeStreamUnsubscribe` so
-  // loadAndRender / handleTabChanged can drop it when the user moves on.
-  const unsubscribe = eventStream.subscribe((ev) => {
+  activeStreamUnsubscribe = eventStream.subscribe((ev) => {
     if (ev.job_id !== job.id) return;
     if (ev.type === "stage") {
       setStage(ev.stage, ev.detail);
@@ -441,44 +613,19 @@ function streamSummaryFor(job) {
         firstDelta = false;
       }
       acc += ev.delta;
-      streamAccCache.set(job.id, acc);  // keep replay buffer current
+      streamAccCache.set(job.id, acc);
       scheduleRender();
     } else if (ev.type === "done") {
       cancelRender();
-      streamAccCache.delete(job.id);   // job finished — no longer need replay
-      // renderSummary replaces the whole summaryEl (same path as the cached
-      // case), so there is no risk of leaving behind a stale textContent view
-      // if ev.content and acc both happen to be empty (joined the stream late).
-      renderSummary(job, ev.content || acc);
-      markAllDone(phases);
-      setStage(null);
-      syncChatEnabled(true);
-      abortActiveStream();
-      // Pull fresh job for chat context (raw_text, summary_md).
-      // Also re-patch the title: the YouTube pipeline overwrites the initial
-      // video-id placeholder with the real title mid-stream (via yt-dlp), but
-      // renderSummary above re-renders from the captured `job` (which still
-      // has the placeholder). One extra DOM write after the round-trip fixes it.
-      daemon.getJob(job.id).then(fresh => {
-        setActiveJob(fresh);
-        if (fresh.title && fresh.title !== job.title) {
-          const link = summaryEl.querySelector(".job-title a");
-          if (link) link.textContent = fresh.title;
-        }
-      }).catch(() => {});
+      streamAccCache.delete(job.id);
+      const content = ev.content || acc;
+      renderState({ mode: "done", job, content });
     } else if (ev.type === "error") {
       cancelRender();
-      streamAccCache.delete(job.id);   // job failed — drop replay buffer
-      markActiveFailed(phases, ev.error || "Error");
-      renderTimeline(timelineEl, phases);
-      renderError(ev.error, job);
-      setStage(null);
-      syncChatEnabled(false);
-      abortActiveStream();
+      streamAccCache.delete(job.id);
+      renderState({ mode: "error", message: ev.error || "Error", job });
     }
   });
-
-  activeStreamUnsubscribe = unsubscribe;
 }
 
 // ---------------------------------------------------------------------------
@@ -587,94 +734,6 @@ async function loadHistory(jobId) {
   }
 }
 
-/**
- * @param {import("../lib/api-types.js").JobDetails} job
- * @param {string} markdown
- */
-function renderSummary(job, markdown) {
-  const titleHtml = renderTitleHtml(job);
-  const html = renderMarkdown(markdown || "_(empty summary)_", job.video_id);
-  summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
-}
-
-/** @param {import("../lib/api-types.js").JobDetails | null} job */
-function renderTitleHtml(job) {
-  if (!job?.title) return "";
-  const safeUrl = escapeHtml(job.url);
-  const safeTitle = escapeHtml(job.title);
-  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>`;
-}
-
-function renderLoading() {
-  summaryEl.innerHTML = `
-    <div class="status-block">
-      <div class="spinner" aria-hidden="true"></div>
-      <p>Loading…</p>
-    </div>
-  `;
-}
-
-/** @param {string} url */
-function renderNoSummary(url) {
-  summaryEl.innerHTML = `
-    <div class="placeholder-block">
-      <p class="muted small url-line">${escapeHtml(url || "")}</p>
-      <button class="summarize-btn" type="button">Summarize this page</button>
-    </div>
-  `;
-  const btn = /** @type {HTMLButtonElement | null} */ (
-    summaryEl.querySelector(".summarize-btn")
-  );
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      btn.textContent = "Starting…";
-      try {
-        await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
-      } catch (err) {
-        console.error("[TLDR] summarize-active-tab failed", err);
-        renderError(stringifyError(err));
-      }
-    });
-  }
-  setStage(null);
-}
-
-/**
- * @param {string} message
- * @param {import("../lib/api-types.js").JobDetails} [job]
- */
-function renderError(message, job) {
-  const titleHtml = renderTitleHtml(job || null);
-  const retryHtml = job?.id
-    ? `<button class="retry-btn" data-retry-id="${escapeHtml(job.id)}">Retry</button>`
-    : "";
-  summaryEl.innerHTML = `
-    ${titleHtml}
-    <div class="status-block error">
-      <p><strong>Error.</strong></p>
-      <p class="muted small">${escapeHtml(message)}</p>
-      ${retryHtml}
-    </div>
-  `;
-  const btn = summaryEl.querySelector(".retry-btn");
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      const id = /** @type {HTMLElement} */ (btn).dataset.retryId;
-      if (!id) return;
-      btn.setAttribute("disabled", "true");
-      try {
-        await daemon.retryJob(id);
-        await loadAndRender(id);
-      } catch (err) {
-        console.error("[TLDR] retry failed", err);
-        btn.removeAttribute("disabled");
-        renderError(stringifyError(err), job);
-      }
-    });
-  }
-}
-
 /** @param {string | null} stage @param {string | null | undefined} [detail] */
 function setStage(stage, detail) {
   if (!stageBadgeEl) return;
@@ -715,26 +774,3 @@ function syncChatEnabled(enabled) {
   if (chatSubmit) chatSubmit.disabled = !enabled;
 }
 
-/**
- * Race a promise against a timeout. Used as a safety net so a hung HTTP
- * call (daemon stopped, container restarting, MV3 service worker dead) shows
- * a real error instead of an indefinite spinner.
- *
- * @template T
- * @param {Promise<T>} promise
- * @param {number} ms
- * @param {string} label
- * @returns {Promise<T>}
- */
-function withTimeout(promise, ms, label) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${label} timed out after ${ms}ms`)),
-      ms,
-    );
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
