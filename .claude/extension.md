@@ -109,8 +109,8 @@ On every job switch, `app.js` calls `daemon.listMessages(jobId)` and
 `chat.renderHistory(items)` to redraw the saved bubbles. So chat is
 preserved across tab switches, browser restarts, and side-panel close.
 
-To wipe one job's chat: `daemon.clearMessages(id)` (DELETE
-`/jobs/{id}/messages`). Library page exposes a button if needed.
+There's no "clear chat" — deleting the job from the Library drops its
+`Message` rows via FK cascade.
 
 ## Side panel state
 

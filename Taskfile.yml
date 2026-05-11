@@ -52,7 +52,7 @@ tasks:
       - docker compose ps
 
   logs:
-    desc: Tail daemon logs (Ctrl-C to stop). For mlx logs see data/logs/mlx.*.log
+    desc: "Tail daemon logs (Ctrl-C to stop). For mlx logs see ~/.mlx-server/logs/server.*.log"
     cmds:
       - docker compose logs -f daemon
 

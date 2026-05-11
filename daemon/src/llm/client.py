@@ -7,6 +7,13 @@
         Streaming. Yields token strings as they arrive — used by the
         single-pass / reduce summary path and by QA.
 
+    async def complete_with_messages(messages, *, tools, max_tokens, ...) -> Any
+        Non-streaming, accepts a messages list (for tool-calling flows).
+
+    async def stream_with_messages(messages, *, max_tokens, ...) -> AsyncIterator[str]
+        Streaming from a messages list. ``complete`` and ``stream_complete``
+        are thin wrappers around these two primitives.
+
 Built lazily from config.llm.{base_url, api_key, model}.
 
 Concurrency + pause: one global semaphore (``_LLM_LOCK``) serialises every
@@ -34,8 +41,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from functools import lru_cache
+from typing import Any, cast
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 from src.config import get_config
 
@@ -51,6 +60,22 @@ def _client() -> AsyncOpenAI:
 
 def _model() -> str:
     return get_config().llm.model
+
+
+def _extra_body() -> dict[str, str] | None:
+    """Return extra request-body fields needed by the configured backend.
+
+    ``reasoning_effort`` disables chain-of-thought on models like Gemma 4 in
+    LM Studio. Without it the model exhausts ``max_tokens`` on thinking tokens
+    and emits no ``delta.content``. Set ``llm.reasoning_effort: "none"`` in
+    config/tldr.yaml to activate. Backends that don't know the field ignore it
+    (mlx-openai-server, Ollama, llama-server) or return a 400 — in which case
+    remove the key from the config for that backend.
+    """
+    effort = get_config().llm.reasoning_effort
+    if effort is not None:
+        return {"reasoning_effort": effort}
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -102,56 +127,60 @@ async def _acquire_llm_slot(respect_pause: bool) -> None:
         # Loop and wait for the pause to clear before retrying acquire.
 
 
-async def complete(
-    prompt: str,
+# ---------------------------------------------------------------------------
+# Core primitives — messages API
+# ---------------------------------------------------------------------------
+
+
+async def complete_with_messages(
+    messages: list[dict[str, Any]],
     *,
+    tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 1500,
     temperature: float = 0.3,
-    respect_pause: bool = True,
-) -> str:
-    """Non-streaming chat completion. Returns the full assistant response."""
+    respect_pause: bool = False,
+) -> Any:
+    """Non-streaming chat completion from a messages list. Returns the raw
+    OpenAI ``ChatCompletion`` object so the caller can inspect tool_calls."""
     await _acquire_llm_slot(respect_pause)
     try:
-        response = await _client().chat.completions.create(
+        kwargs: dict[str, Any] = dict(
             model=_model(),
-            messages=[{"role": "user", "content": prompt}],
+            messages=cast(list[ChatCompletionMessageParam], messages),
             max_tokens=max_tokens,
             temperature=temperature,
+            extra_body=_extra_body(),
         )
-        return response.choices[0].message.content or ""
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return await _client().chat.completions.create(**kwargs)
     finally:
         _llm_lock().release()
 
 
-async def stream_complete(
-    prompt: str,
+async def stream_with_messages(
+    messages: list[dict[str, Any]],
     *,
     max_tokens: int = 1500,
     temperature: float = 0.3,
-    respect_pause: bool = True,
+    respect_pause: bool = False,
 ) -> AsyncIterator[str]:
-    """Streaming chat completion. Yields delta.content strings as they arrive.
-
-    Pause is enforced at acquire time (``_acquire_llm_slot``): an in-flight
-    stream completes normally — we don't abort it mid-token. The next LLM
-    call (next chunk in map-reduce, or the next pipeline's summary) blocks
-    on the pause flag.
+    """Streaming chat completion from a messages list. Yields delta strings.
 
     Per-chunk timeout: if the backend stops sending tokens for
     ``config.llm.stream_chunk_timeout_seconds`` (default 60 s) we raise
-    ``TimeoutError`` instead of waiting forever. mlx-server v1.8.1 unloads
-    the model on idle while streaming responses are still being iterated,
-    leaving the SSE connection silently stuck — without this guard a single
-    hung stream blocks the LLM semaphore and freezes the entire queue.
+    ``TimeoutError`` instead of waiting forever.
     """
     await _acquire_llm_slot(respect_pause)
     try:
         stream = await _client().chat.completions.create(
             model=_model(),
-            messages=[{"role": "user", "content": prompt}],
+            messages=cast(list[ChatCompletionMessageParam], messages),
             max_tokens=max_tokens,
             temperature=temperature,
             stream=True,
+            extra_body=_extra_body(),
         )
         chunk_timeout = get_config().llm.stream_chunk_timeout_seconds
         stream_iter = stream.__aiter__()
@@ -171,3 +200,48 @@ async def stream_complete(
                 yield delta
     finally:
         _llm_lock().release()
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers — single-prompt API (backward-compatible)
+# ---------------------------------------------------------------------------
+
+
+async def complete(
+    prompt: str,
+    *,
+    max_tokens: int = 1500,
+    temperature: float = 0.3,
+    respect_pause: bool = True,
+) -> str:
+    """Non-streaming chat completion. Returns the full assistant response."""
+    response = await complete_with_messages(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        respect_pause=respect_pause,
+    )
+    return response.choices[0].message.content or ""
+
+
+async def stream_complete(
+    prompt: str,
+    *,
+    max_tokens: int = 1500,
+    temperature: float = 0.3,
+    respect_pause: bool = True,
+) -> AsyncIterator[str]:
+    """Streaming chat completion. Yields delta.content strings as they arrive.
+
+    Pause is enforced at acquire time (``_acquire_llm_slot``): an in-flight
+    stream completes normally — we don't abort it mid-token. The next LLM
+    call (next chunk in map-reduce, or the next pipeline's summary) blocks
+    on the pause flag.
+    """
+    async for delta in stream_with_messages(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        respect_pause=respect_pause,
+    ):
+        yield delta

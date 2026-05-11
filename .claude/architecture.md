@@ -3,11 +3,15 @@
 ```
 ┌─ Host ────────────────────────────────────────────────────────┐
 │                                                               │
-│  Any OpenAI-compatible LLM / Whisper backend                  │
-│   /v1/chat/completions      ←─ summary + QA                   │
-│   /v1/audio/transcriptions  ←─ Whisper fallback               │
-│  Examples: mlx-openai-server (Apple Silicon), Ollama,         │
-│   LM Studio, vLLM, llama.cpp, openai-edge, ...                │
+│  LLM backend  (llm.base_url)                                  │
+│   /v1/chat/completions  ←─ summary + QA                       │
+│   Any OpenAI-compatible server: mlx-openai-server, LM Studio, │
+│   Ollama, llama-server, vLLM, openai-edge, …                  │
+│                                                               │
+│  Whisper backend  (whisper.base_url, optional)                │
+│   /v1/audio/transcriptions  ←─ YouTube without captions       │
+│   mlx-openai-server (Apple Silicon) or whisper.cpp server     │
+│   Can be the same server as LLM or a different one            │
 │                                                               │
 │  ┌─ Docker: daemon (port 8765) ─────────────────────────────┐ │
 │  │  FastAPI                                                 │ │
@@ -35,11 +39,15 @@
 
 ## Why these splits
 
-- **Backend on the host.** Any OpenAI-compatible runner does. The bundled
-  mlx-openai-server option (`task install:mlx`) is fastest on Apple Silicon
-  because MLX needs direct Metal / Neural Engine access — inside Docker
-  (Linux VM on macOS) it falls back to CPU and runs 50–100× slower. Other
-  backends (Ollama, LM Studio, vLLM, …) are equally first-class via config.
+- **Backend on the host.** Any OpenAI-compatible runner does. `llm.base_url`
+  and `whisper.base_url` are configured independently — they can point at the
+  same server or different ones. The bundled mlx-openai-server option
+  (`task install:mlx`) is the only backend that serves both LLM and Whisper
+  from one process; it is also the fastest on Apple Silicon because MLX needs
+  direct Metal / Neural Engine access (inside Docker that falls back to CPU,
+  50–100× slower). For LLM-only needs any OpenAI-compatible server works
+  (LM Studio, Ollama, llama-server, vLLM, …). For Whisper separately,
+  whisper.cpp server exposes the same `/v1/audio/transcriptions` interface.
 - **Daemon runs in Docker.** Clean control over ffmpeg / yt-dlp / Python
   versions. SQLite lives in a named volume so `docker compose down`
   preserves the user's library. All HTTP is OpenAI-compat — daemon doesn't

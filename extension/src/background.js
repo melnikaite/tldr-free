@@ -73,17 +73,22 @@ chrome.action.onClicked.addListener(async (tab) => {
 // (summarize-active-tab — the in-panel "Summarize this page" button).
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
   if (!msg || typeof msg !== "object") return false;
 
+  // Content scripts run inside the tab; sender.tab.id is the source tab.
+  // We use it (NOT a URL comparison) to decide whether the just-submitted
+  // job should take over the side panel — see submitJob below.
+  const sourceTabId = sender?.tab?.id ?? null;
+
   if (msg.type === "extracted-page") {
-    handleExtractedPage(msg).catch((e) =>
+    handleExtractedPage(msg, sourceTabId).catch((e) =>
       console.error("[TLDR] handleExtractedPage", e),
     );
     return false;
   }
   if (msg.type === "extracted-youtube") {
-    handleExtractedYouTube(msg).catch((e) =>
+    handleExtractedYouTube(msg, sourceTabId).catch((e) =>
       console.error("[TLDR] handleExtractedYouTube", e),
     );
     return false;
@@ -103,7 +108,13 @@ async function handleSummarizeActiveTab() {
   await summarizeTab(tab);
 }
 
-async function handleExtractedPage(msg) {
+/**
+ * @param {{url:string, text?:string, title?:string|null}} msg
+ * @param {number|null} sourceTabId  tab.id of the page where the content
+ *   script ran. Used by submitJob to decide whether to take over the side
+ *   panel (only when the user is still on that tab).
+ */
+async function handleExtractedPage(msg, sourceTabId) {
   /** @type {JobCreateRequest} */
   const req = {
     url: normalizeUrl(msg.url),
@@ -111,10 +122,14 @@ async function handleExtractedPage(msg) {
     page_text: msg.text || "",
     page_title: msg.title || null,
   };
-  await submitJob(req);
+  await submitJob(req, sourceTabId);
 }
 
-async function handleExtractedYouTube(msg) {
+/**
+ * @param {{url:string, title?:string|null}} msg
+ * @param {number|null} sourceTabId
+ */
+async function handleExtractedYouTube(msg, sourceTabId) {
   let cookies = [];
   try {
     cookies = await getCookiesForDomain(".youtube.com");
@@ -129,7 +144,7 @@ async function handleExtractedYouTube(msg) {
     page_title: msg.title || null,
     cookies,
   };
-  await submitJob(req);
+  await submitJob(req, sourceTabId);
 }
 
 /**
@@ -140,13 +155,24 @@ async function handleExtractedYouTube(msg) {
  * The broadcast goes out for every successful submit so the sidebar's badge
  * counter and Library's table can refresh. We only flip the global
  * ``activeJobId`` (which the sidepanel uses to decide what to display)
- * when the just-submitted URL matches the user's currently-focused tab —
- * otherwise we'd hijack the panel away from whatever the user is now
- * looking at.
+ * when the user is still on the source tab (the one where they clicked
+ * summarize) — otherwise we'd hijack the panel away from whatever the user
+ * is now looking at.
+ *
+ * Tab-id comparison (NOT URL comparison) — `sender.tab.id` from the content
+ * script's message is the unambiguous identity of the source. URL comparison
+ * fails for SPAs (location.href in the content script can drift from
+ * Chrome's reported tab.url across awaits) and was the root cause of "I
+ * clicked summarize but the panel never updated".
+ *
+ * The broadcast also carries `shouldSwitch` so the side panel can switch in
+ * place even if `chrome.storage.onChanged` doesn't fire (e.g. value already
+ * matches; same-value sets are not guaranteed to notify).
  *
  * @param {JobCreateRequest} req
+ * @param {number|null} sourceTabId
  */
-async function submitJob(req) {
+async function submitJob(req, sourceTabId) {
   /** @type {JobCreateResponse} */
   let resp;
   try {
@@ -157,19 +183,26 @@ async function submitJob(req) {
     return;
   }
 
-  await broadcast({ type: "job-created", jobId: resp.id, url: req.url });
-
-  let activeUrl = null;
-  try {
-    const [activeTab] = await chrome.tabs.query({
-      active: true, lastFocusedWindow: true,
-    });
-    activeUrl = activeTab?.url ? normalizeUrl(activeTab.url) : null;
-  } catch (err) {
-    console.warn("[TLDR] tabs.query failed", err);
+  let shouldSwitch = false;
+  if (sourceTabId != null) {
+    try {
+      const [activeTab] = await chrome.tabs.query({
+        active: true, lastFocusedWindow: true,
+      });
+      shouldSwitch = activeTab?.id === sourceTabId;
+    } catch (err) {
+      console.warn("[TLDR] tabs.query failed", err);
+    }
   }
 
-  if (activeUrl === req.url) {
+  await broadcast({
+    type: "job-created",
+    jobId: resp.id,
+    url: req.url,
+    shouldSwitch,
+  });
+
+  if (shouldSwitch) {
     await chrome.storage.session.set({ activeJobId: resp.id, activeUrl: req.url });
   }
 }

@@ -4,7 +4,7 @@
 //   - On load: daemon.listJobs(), render rows.
 //   - Subscribe to GET /events for realtime updates (job created/updated/
 //     deleted, workers state). No polling.
-//   - Filters trigger refetch. Search filters the loaded list locally by title.
+//   - Status/kind filters trigger refetch from daemon.
 //   - Per-row actions: open in side panel (writes activeJobId to session storage,
 //     attempts chrome.sidePanel.open), delete (with confirm), retry (failed only).
 
@@ -27,20 +27,11 @@ const filterStatus = /** @type {HTMLSelectElement} */ (
 const filterKind = /** @type {HTMLSelectElement} */ (
   document.getElementById("filter-kind")
 );
-const filterSearch = /** @type {HTMLInputElement} */ (
-  document.getElementById("filter-search")
-);
-
 /** @type {JobSummary[]} */
 let allJobs = [];
 
 filterStatus.addEventListener("change", () => refetch());
 filterKind.addEventListener("change", () => refetch());
-let searchDebounce = 0;
-filterSearch.addEventListener("input", () => {
-  clearTimeout(searchDebounce);
-  searchDebounce = window.setTimeout(() => render(), 150);
-});
 
 // ---------------------------------------------------------------------------
 // Whisper queue pause/resume
@@ -171,16 +162,11 @@ async function refetch() {
 }
 
 function render() {
-  const q = filterSearch.value.trim().toLowerCase();
-  const items = q
-    ? allJobs.filter((j) => (j.title || "").toLowerCase().includes(q) || j.url.toLowerCase().includes(q))
-    : allJobs;
-
-  if (items.length === 0) {
+  if (allJobs.length === 0) {
     tbody.innerHTML = `<tr><td colspan="5" class="empty">No jobs found.</td></tr>`;
     return;
   }
-  tbody.innerHTML = items.map(renderRow).join("");
+  tbody.innerHTML = allJobs.map(renderRow).join("");
   // Wire up button handlers (event delegation would also work).
   for (const btn of tbody.querySelectorAll("button[data-action]")) {
     btn.addEventListener("click", (ev) => {
@@ -302,7 +288,12 @@ async function openInSidePanel(id) {
   await chrome.storage.session.set({ activeJobId: id });
   // Try to broadcast so an open side panel switches.
   try {
-    await chrome.runtime.sendMessage({ type: "job-created", jobId: id });
+    // shouldSwitch=true: Library "open in side panel" / "retry" is an
+    // explicit request to follow this job — bypass the source-tab guard
+    // background.js applies to toolbar-click submissions.
+    await chrome.runtime.sendMessage({
+      type: "job-created", jobId: id, shouldSwitch: true,
+    });
   } catch {
     // No side panel listening — that's fine, it'll read storage on next open.
   }

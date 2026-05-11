@@ -15,8 +15,6 @@
 
 /** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura"} TranscriptSource */
 
-/** @typedef {"transcript_unavailable" | "transcript_blocked" | "network_error"} DeferredReason */
-
 // ---------------------------------------------------------------------------
 // Cookie (forwarded from chrome.cookies.getAll)
 // ---------------------------------------------------------------------------
@@ -74,9 +72,9 @@
 /**
  * @typedef {JobSummary & {
  *   summary_md: string | null,
- *   raw_text_length: number | null,
  *   error: string | null,
- *   video_id: string | null
+ *   video_id: string | null,
+ *   partial_summary: string | null
  * }} JobDetails
  */
 

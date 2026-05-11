@@ -104,7 +104,6 @@ export const daemon = {
     const qs = new URLSearchParams();
     if (params?.status?.length) qs.set("status", params.status.join(","));
     if (params?.kind) qs.set("kind", params.kind);
-    if (params?.tag) qs.set("tag", params.tag);
     if (params?.url) qs.set("url", params.url);
     if (params?.limit !== undefined) qs.set("limit", String(params.limit));
     if (params?.offset !== undefined) qs.set("offset", String(params.offset));
@@ -154,18 +153,11 @@ export const daemon = {
   listMessages: (id) => request(`/jobs/${id}/messages`),
 
   /**
-   * Unified streaming endpoint for all AI responses.
-   *
-   * Summary mode (no `question`): subscribes to the job's extraction +
-   * summarization lifecycle. Live or replay-cached. Yields stage / delta /
-   * done / error events.
-   *
-   * QA mode (with `question`): triggers a new QA call. Persists the
-   * user message, streams the answer tokens, persists the assistant
-   * message, emits a final `done` event with the assistant message_id.
+   * Q&A streaming endpoint. Triggers a new QA call, persists user + assistant
+   * messages, streams the answer tokens, emits done with message_id.
    *
    * Usage:
-   *   for await (const ev of daemon.aiStream({ job_id })) {
+   *   for await (const ev of daemon.aiQa({ job_id, question })) {
    *     if (ev.type === "stage")  showStage(ev.stage);
    *     if (ev.type === "delta")  appendToBubble(ev.delta);
    *     if (ev.type === "done")   render(ev.content);
@@ -175,7 +167,7 @@ export const daemon = {
    * @param {AIStreamRequest} req
    * @returns {AsyncGenerator<AIStreamEvent, void, void>}
    */
-  aiStream: (req) => sseStream("/ai/stream", req),
+  aiQa: (req) => sseStream("/ai/qa", req),
 };
 
 /** Convenience type re-export so consumers don't have to dual-import. */

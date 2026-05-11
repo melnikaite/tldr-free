@@ -95,6 +95,8 @@ function replaceInTextNode(textNode, videoId) {
     a.href = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${seconds}s`;
     a.target = "_blank";
     a.rel = "noopener";
+    a.dataset.tldrSeconds = String(seconds);
+    a.dataset.tldrVideoId = videoId;
     a.textContent = m[0];
     frag.appendChild(a);
 

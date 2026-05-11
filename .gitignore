@@ -2,8 +2,8 @@
 config/*.yaml
 !config/*.yaml.example
 
-# mlx-server runtime state
-.mlx.pid
+# Daemon runtime state. mlx-server lives outside the repo at
+# ~/.mlx-server/ — see scripts/mlx.sh — so nothing mlx-related to ignore here.
 data/
 logs/
 

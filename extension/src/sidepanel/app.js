@@ -1,10 +1,17 @@
 // Side panel controller — action mode.
 //
 // Lifecycle:
-//   - On open / job-created / tab-changed: read activeJobId, fetch job
-//     details. If status=done → render cached summary_md. Otherwise open
-//     POST /ai/stream {job_id} (no question) and stream stage + delta
-//     events into the summary area in real time.
+//   - On open: read activeJobId from session storage, fetch job details.
+//     If status=done → render cached summary_md. Otherwise subscribe to
+//     /events filtered by job_id and pipe stage / delta / done into the
+//     summary area in real time.
+//   - On `job-created` broadcast (from background.js after a toolbar click,
+//     or from Library on retry/open): if shouldSwitch=true, switch to the
+//     new job. This is the primary path; storage.onChanged is a backup
+//     (same-value sets aren't guaranteed to notify).
+//   - On `tab-changed` broadcast (background.js noticed the active tab
+//     changed): switch the panel to that tab's cached job, or render
+//     "no summary yet" if it has none.
 //   - Chat history persists in SQLite (per job). On job switch we GET
 //     /jobs/{id}/messages and render the saved bubbles before any new
 //     question.
@@ -26,6 +33,13 @@ import { setActiveJob, getActiveJob, renderHistory, clearChat } from "./chat.js"
 // timeline + summary stream, job/workers drive the badge.
 const eventStream = openEventStream();
 
+// Module-level replay buffer: jobId → accumulated markdown text.
+// Keeps growing as delta events arrive; lets the panel immediately show
+// everything buffered so far when the user re-opens mid-generation, instead
+// of starting from the current moment. Cleared on job completion or deletion.
+/** @type {Map<string, string>} */
+const streamAccCache = new Map();
+
 const summaryEl = /** @type {HTMLElement} */ (document.getElementById("summary"));
 const badgeEl = /** @type {HTMLElement} */ (document.getElementById("processing-badge"));
 const badgeCountEl = /** @type {HTMLElement} */ (document.getElementById("processing-count"));
@@ -46,16 +60,162 @@ openLibraryBtn?.addEventListener("click", () => {
   chrome.tabs.create({ url: chrome.runtime.getURL("src/library/index.html") });
 });
 
+// ---------------------------------------------------------------------------
+// Timecode link handler — click on a [MM:SS] link in the summary.
+// If the YouTube video is already open in a tab: focus that tab and seek
+// the video element directly (no page reload). Otherwise open a new tab.
+// Delegated on summaryEl so it works across dynamic rerenders.
+// ---------------------------------------------------------------------------
+
+summaryEl.addEventListener("click", (ev) => {
+  const a = /** @type {HTMLElement} */ (ev.target).closest("a[data-tldr-seconds]");
+  // Only intercept plain left-clicks — let ctrl/cmd/middle-click fall through
+  // to the browser's native "open in new tab" behaviour.
+  if (!a || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+  ev.preventDefault();
+  const seconds = Number(/** @type {HTMLElement} */ (a).dataset.tldrSeconds);
+  const videoId = /** @type {HTMLElement} */ (a).dataset.tldrVideoId || "";
+  const fallbackUrl = /** @type {HTMLAnchorElement} */ (a).href;
+  _openTimecode(videoId, seconds, fallbackUrl).catch((err) =>
+    console.warn("[TLDR] timecode open failed:", err),
+  );
+});
+
+/**
+ * Find an already-open tab for ``url``.
+ * YouTube URLs are matched by video ID so extra query params (&t=, &autoplay=,
+ * etc.) on the open tab don't prevent the match.  All other URLs are matched
+ * by exact string equality.
+ * Returns the first matching Tab, or ``undefined`` if none is open.
+ *
+ * @param {string} url
+ * @returns {Promise<chrome.tabs.Tab | undefined>}
+ */
+async function _findTab(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith("youtube.com") && parsed.searchParams.has("v")) {
+      const videoId = parsed.searchParams.get("v");
+      const ytTabs = await chrome.tabs.query({ url: "*://www.youtube.com/watch*" });
+      return ytTabs.find((t) => {
+        try {
+          return new URL(t.url ?? "").searchParams.get("v") === videoId;
+        } catch {
+          return false;
+        }
+      });
+    }
+    const tabs = await chrome.tabs.query({});
+    return tabs.find((t) => t.url === url);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Focus ``tab`` (bring its window to the front and activate it).
+ *
+ * @param {chrome.tabs.Tab} tab
+ */
+async function _focusTab(tab) {
+  if (tab.windowId !== undefined) {
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
+  await chrome.tabs.update(/** @type {number} */ (tab.id), { active: true });
+}
+
+/**
+ * Focus an existing YouTube tab playing this video and seek to ``seconds``,
+ * or open a new tab if none is found.
+ *
+ * @param {string} videoId
+ * @param {number} seconds
+ * @param {string} fallbackUrl
+ */
+async function _openTimecode(videoId, seconds, fallbackUrl) {
+  const existing = await _findTab(fallbackUrl);
+  if (existing?.id !== undefined) {
+    await _focusTab(existing);
+    await chrome.scripting.executeScript({
+      target: { tabId: existing.id },
+      func: (t) => {
+        const video = document.querySelector("video");
+        if (video) video.currentTime = t;
+      },
+      args: [seconds],
+    });
+    return;
+  }
+  // No matching tab — open a new one at the correct timestamp.
+  chrome.tabs.create({ url: fallbackUrl });
+}
+
+// ---------------------------------------------------------------------------
+// Title link handler — click on the job title switches to the source tab if
+// it is already open, otherwise opens a new tab.  Mirrors the timecode link
+// behaviour.  Delegated on summaryEl so it works across dynamic rerenders.
+// ---------------------------------------------------------------------------
+
+summaryEl.addEventListener("click", (ev) => {
+  const a = /** @type {HTMLElement} */ (ev.target).closest(".job-title a");
+  // Only intercept plain left-clicks — let ctrl/cmd/middle-click fall through
+  // to the browser's native "open in new tab" behaviour.
+  if (!a || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+  ev.preventDefault();
+  const url = /** @type {HTMLAnchorElement} */ (a).href;
+  _openUrl(url).catch((err) =>
+    console.warn("[TLDR] title open failed:", err),
+  );
+});
+
+/**
+ * Focus an existing tab already showing ``url``, or open a new tab.
+ *
+ * @param {string} url
+ */
+async function _openUrl(url) {
+  const existing = await _findTab(url);
+  if (existing?.id !== undefined) {
+    await _focusTab(existing);
+    return;
+  }
+  chrome.tabs.create({ url });
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "tab-changed") {
     handleTabChanged(msg.url, msg.jobId).catch((e) =>
       console.error("[TLDR] tab-changed", e),
     );
+  } else if (msg.type === "job-created") {
+    handleJobCreated(msg).catch((e) =>
+      console.error("[TLDR] job-created", e),
+    );
   } else if (msg.type === "extraction-error") {
     renderError(msg.error || "Failed to extract page content.");
   }
 });
+
+/**
+ * The user just submitted a job. background.js broadcasts this every time
+ * POST /jobs returns, with `shouldSwitch=true` when the source tab is still
+ * the active one (no hijack). Library also sends it on retry/open with
+ * shouldSwitch=true to follow that job explicitly.
+ *
+ * Why this and not just `chrome.storage.onChanged` on activeJobId:
+ *   storage.onChanged is debounced — setting the same value twice (e.g.
+ *   re-clicking summarize on a deduped URL) won't fire a second time, so
+ *   the panel could miss a re-show. The broadcast always fires.
+ *
+ * @param {{jobId?:string, shouldSwitch?:boolean}} msg
+ */
+async function handleJobCreated(msg) {
+  if (!msg.jobId || !msg.shouldSwitch) return;
+  const active = await getActiveJob();
+  if (active?.id === msg.jobId) return;  // already showing it
+  await loadAndRender(msg.jobId);
+}
 
 eventStream.subscribe((event) => {
   if (event.type === "job") {
@@ -74,6 +234,7 @@ function handleJobEvent(event) {
   if (!j?.id) return;
   if (event.action === "deleted") {
     activeJobIds.delete(j.id);
+    streamAccCache.delete(j.id);
   } else if (j.status === "queued" || j.status === "running") {
     activeJobIds.add(j.id);
   } else {
@@ -227,9 +388,41 @@ function streamSummaryFor(job) {
   pushOrUpdatePhase(phases, initialStage, undefined);
   renderTimeline(timelineEl, phases);
 
-  let acc = "";
-  let firstDelta = true;
+  // Restore any text accumulated before this subscription started.
+  // Priority: module-level cache (exact, no gap — same browser session,
+  // panel re-opened) > server-side partial_summary (works after browser
+  // restart, may miss a few tokens between the getJob fetch and subscribe).
+  let acc = streamAccCache.get(job.id) || job.partial_summary || "";
+  let firstDelta = acc.length === 0;
+  /** @type {number | null} */
+  let rafId = null;
   setStage(initialStage);
+
+  // If we already have buffered content, collapse the phase timeline and
+  // render it right away so the user sees the full replay instead of a blank.
+  if (acc) {
+    timelineEl.classList.add("timeline--collapsed");
+    streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+  }
+
+  /**
+   * Schedule a markdown re-render for the next animation frame.
+   * Using rAF as a throttle: multiple delta events arriving in the same JS
+   * task batch collapse into one DOM write per frame (~60 Hz max, but in
+   * practice limited by the daemon's ~10 Hz delta flush rate). This gives
+   * progressive formatted rendering during streaming instead of raw text.
+   */
+  const scheduleRender = () => {
+    if (rafId !== null) return;          // already queued
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      if (acc) streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+    });
+  };
+
+  const cancelRender = () => {
+    if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+  };
 
   // Subscribe to the global event stream filtered by this job's id.
   // The unsubscribe handle goes into `activeStreamUnsubscribe` so
@@ -248,18 +441,34 @@ function streamSummaryFor(job) {
         firstDelta = false;
       }
       acc += ev.delta;
-      streamEl.textContent = acc;
+      streamAccCache.set(job.id, acc);  // keep replay buffer current
+      scheduleRender();
     } else if (ev.type === "done") {
-      const final = ev.content || acc;
+      cancelRender();
+      streamAccCache.delete(job.id);   // job finished — no longer need replay
+      // renderSummary replaces the whole summaryEl (same path as the cached
+      // case), so there is no risk of leaving behind a stale textContent view
+      // if ev.content and acc both happen to be empty (joined the stream late).
+      renderSummary(job, ev.content || acc);
       markAllDone(phases);
-      timelineEl.remove();
-      streamEl.innerHTML = renderMarkdown(final, job.video_id);
       setStage(null);
       syncChatEnabled(true);
       abortActiveStream();
       // Pull fresh job for chat context (raw_text, summary_md).
-      daemon.getJob(job.id).then(setActiveJob).catch(() => {});
+      // Also re-patch the title: the YouTube pipeline overwrites the initial
+      // video-id placeholder with the real title mid-stream (via yt-dlp), but
+      // renderSummary above re-renders from the captured `job` (which still
+      // has the placeholder). One extra DOM write after the round-trip fixes it.
+      daemon.getJob(job.id).then(fresh => {
+        setActiveJob(fresh);
+        if (fresh.title && fresh.title !== job.title) {
+          const link = summaryEl.querySelector(".job-title a");
+          if (link) link.textContent = fresh.title;
+        }
+      }).catch(() => {});
     } else if (ev.type === "error") {
+      cancelRender();
+      streamAccCache.delete(job.id);   // job failed — drop replay buffer
       markActiveFailed(phases, ev.error || "Error");
       renderTimeline(timelineEl, phases);
       renderError(ev.error, job);

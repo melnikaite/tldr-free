@@ -211,3 +211,93 @@ def test_find_pending_for_restart_picks_queued_and_running(isolated_db) -> None:
 
     pending = {j.id for j in repo.find_pending_for_restart()}
     assert pending == {a.id, b.id}
+
+
+# ---------------------------------------------------------------------------
+# reset_for_retry
+# ---------------------------------------------------------------------------
+
+
+def test_reset_for_retry_clears_error_and_restores_running(isolated_db) -> None:
+    j = repo.create_job(url="https://x", kind="page")
+    repo.mark_failed(j.id, error="something broke")
+
+    repo.reset_for_retry(j.id)
+
+    out = repo.get_job(j.id)
+    assert out is not None
+    assert out.status == "running"
+    assert out.progress_stage == "extracting"
+    assert out.error is None
+    assert out.completed_at is None
+
+
+def test_reset_for_retry_preserves_audio_path(isolated_db) -> None:
+    """audio_path must survive reset so the Whisper worker skips re-download."""
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.set_audio(j.id, audio_path="/tmp/audio.wav", audio_duration_seconds=120.0)
+    repo.mark_failed(j.id, error="transcription failed")
+
+    repo.reset_for_retry(j.id)
+
+    out = repo.get_job(j.id)
+    assert out is not None
+    assert out.audio_path == "/tmp/audio.wav"
+    assert out.audio_duration_seconds == 120.0
+
+
+# ---------------------------------------------------------------------------
+# delete_job — audio file cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_delete_job_unlinks_audio_file(isolated_db, tmp_path) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"fake audio data")
+    assert audio.exists()
+
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.set_audio(j.id, audio_path=str(audio))
+
+    deleted = repo.delete_job(j.id)
+
+    assert deleted is True
+    assert not audio.exists(), "audio file should have been unlinked"
+
+
+def test_delete_job_missing_audio_path_is_harmless(isolated_db) -> None:
+    """delete_job with a non-existent audio_path should not raise."""
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.set_audio(j.id, audio_path="/tmp/nonexistent_audio_12345.wav")
+
+    deleted = repo.delete_job(j.id)
+    assert deleted is True
+
+
+# ---------------------------------------------------------------------------
+# delete_jobs_older_than (retention)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_jobs_older_than_removes_old_keeps_recent(isolated_db) -> None:
+    old = repo.create_job(url="https://old", kind="page")
+    new = repo.create_job(url="https://new", kind="page")
+
+    # Back-date the old job.
+    raw = isolated_db.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(
+            "UPDATE job SET created_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", old.id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    cutoff = datetime(2020, 1, 1)
+    deleted = repo.delete_jobs_older_than(cutoff)
+
+    assert deleted == 1
+    assert repo.get_job(old.id) is None
+    assert repo.get_job(new.id) is not None

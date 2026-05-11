@@ -139,12 +139,36 @@ def _migration_v1(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v2 — drop unused FTS5 infrastructure
+# ---------------------------------------------------------------------------
+# job_fts and its sync triggers were added "for future search" but no search
+# endpoint was ever implemented. Drop them to remove dead maintenance overhead.
+
+_V2_STATEMENTS: tuple[str, ...] = (
+    "DROP TRIGGER IF EXISTS job_ai",
+    "DROP TRIGGER IF EXISTS job_ad",
+    "DROP TRIGGER IF EXISTS job_au",
+    "DROP TABLE IF EXISTS job_fts",
+)
+
+
+def _migration_v2(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V2_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
 
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _migration_v1),
+    (2, _migration_v2),
 ]
 
 

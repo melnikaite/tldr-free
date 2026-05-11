@@ -1,13 +1,13 @@
-Ты конспектируешь длинный материал по частям. Это часть {n} из {total}. Сделай краткое содержание именно этой части на языке: {output_language}.
+You are summarising a long piece of material in chunks. This is chunk {n} of {total}. Produce a concise summary of this chunk in: {output_language}.
 
-Формат:
-- 5–8 предложений
-- Перечисли главные тезисы и факты этой части
-- Сохраняй имена, числа, даты точно
-- Если в исходном тексте есть временные метки [MM:SS] или [HH:MM:SS] — обязательно сохраняй их рядом с тезисами
-- Не добавляй то, чего нет в тексте
+Format:
+- 5–8 sentences
+- List the main claims and facts from this chunk
+- Preserve names, numbers, and dates exactly
+- If the source contains timestamps [MM:SS] or [HH:MM:SS] — always keep them next to the relevant claims
+- Do not add anything not present in the text
 
-Заголовок материала: {title}
+Material title: {title}
 
-Текст части:
+Chunk text:
 {chunk}
