@@ -8,7 +8,7 @@
 # llama.cpp, vLLM, mlx-openai-server, etc.) — pick one and point
 # ``config/tldr.yaml`` at it.
 #
-# To also install Apple Silicon's mlx-openai-server + Qwen/Whisper weights,
+# To also install Apple Silicon's mlx-openai-server + Gemma 4 + Whisper weights,
 # run ``bash scripts/mlx.sh install`` (or ``task install:mlx``) afterwards.
 #
 # Flags:

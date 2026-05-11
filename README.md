@@ -48,11 +48,23 @@ Any OpenAI-compatible server works. Popular choices:
 
 | Backend | Platform | LLM | Whisper | Notes |
 |---|---|---|---|---|
-| [**mlx-openai-server**](https://pypi.org/project/mlx-openai-server/) | macOS Apple Silicon | ✅ | ✅ | Fastest local; `task install:mlx` |
+| [**Ollama**](https://ollama.com/) | Any OS, CPU / GPU | ✅ | ❌ | [Download](https://ollama.com/download), then `ollama pull gemma4:e4b` |
 | [**LM Studio**](https://lmstudio.ai/) | macOS / Windows | ✅ | ❌ | GUI; enable local server on port 1234 |
-| [**Ollama**](https://ollama.com/) | Any OS | ✅ | ❌ | `brew install ollama && ollama serve` |
+| [**mlx-openai-server**](https://pypi.org/project/mlx-openai-server/) | macOS Apple Silicon | ✅ | ✅ | Fastest local; `task install:mlx` |
 | [**llama-server**](https://github.com/ggml-org/llama.cpp) | Any OS | ✅ | ❌ | `brew install llama.cpp` |
-| vLLM, llama.cpp, openai-edge, … | Any OS | ✅ | ❌ | Any OpenAI-compat endpoint |
+| vLLM, openai-edge, … | Any OS | ✅ | ❌ | Any OpenAI-compat endpoint |
+
+> **Context window — expand it or long pages get silently truncated.**
+> Gemma 4 E4B supports 128K but both Ollama and LM Studio default to a much smaller window.
+>
+> **Ollama** — create a custom variant with the full context:
+> ```bash
+> printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile
+> ollama create gemma4:e4b-128k -f Modelfile
+> ```
+> Then set `model: gemma4:e4b-128k` and `context_length: 131072` in `config/tldr.yaml`.
+>
+> **LM Studio** — after loading the model, open its settings and set **Context Length** to `131072`.
 
 ### Whisper backend (optional — only for YouTube without captions)
 
@@ -62,6 +74,7 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 | Backend | Platform | Notes |
 |---|---|---|
 | **mlx-openai-server** | macOS Apple Silicon | Already included if you use it for LLM |
+| [**faster-whisper-server**](https://github.com/fedirz/faster-whisper-server) | Any OS, CPU / GPU | `docker run -p 8000:8000 fedirz/faster-whisper-server` |
 | [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
 
 ### Install
@@ -69,6 +82,7 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 ```bash
 task install            # config + daemon image + extension vendor libs
 # Edit config/tldr.yaml — set llm.base_url (and whisper.base_url if needed)
+# Ready-made blocks for Ollama, LM Studio, mlx, llama-server are in the file
 task up                 # starts daemon (and mlx-server if you ran task install:mlx)
 task status             # health check
 ```
@@ -133,8 +147,8 @@ the `context_length` field in `~/.mlx-server/config.yaml` (mlx-server).
 at ~60–70% of `context_length` to leave room for the system prompt and output.
 
 `tldr.yaml.example` has ready-made blocks for each backend combination:
-mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama+mlx,
-llama-server+whisper.cpp, and LLM-only (no Whisper).
+mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama, llama-server+whisper.cpp,
+and LLM-only (no Whisper).
 
 To free the machine for foreground work, click the **Pause processing**
 button in the Library page (top-right). It pauses everything: the Whisper
@@ -165,7 +179,7 @@ worker waits that many seconds between consecutive jobs.
 │  │  Async POST /jobs → background pipeline                  │ │
 │  │  Per-job event broker fans out stage / delta / done      │ │
 │  │  /ai/stream — single SSE endpoint for summary + Q&A      │ │
-│  │  Pausable Whisper queue + all background ML steps        │ │
+│  │  Whisper queue with pause/resume                         │ │
 │  │  Retry endpoint reuses cached audio                      │ │
 │  │  yt-dlp + auto-captions + Whisper fallback chain         │ │
 │  │  SQLite in named volume `tldr-data`                      │ │
@@ -220,9 +234,8 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
   works — the container is `python:3.11-slim`. No host Python needed.
 - **A backend**: see Quick start. Anything OpenAI-compatible works.
 - **Chrome 116+** (Manifest V3 side panel).
-- **Apple Silicon, optional**: only if you want the bundled mlx setup. ~6 GB
-  disk for Qwen3 4B + Whisper large-v3 weights, ~5 GB peak RAM with both
-  models loaded.
+- **Apple Silicon, optional**: only if you want the bundled mlx setup (`task install:mlx`).
+  ~6 GB disk for Gemma 4 E4B (4-bit) + Whisper large-v3 weights.
 
 ## License
 

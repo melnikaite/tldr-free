@@ -11,23 +11,38 @@
 # videos will error at the transcription step rather than falling back.
 
 # ---------------------------------------------------------------------------
-# Backend: mlx-openai-server — Apple Silicon, LLM + Whisper in one server
-# Install with: task install:mlx  (sets up ~/.mlx-server/config.yaml)
-# Fastest local option; uses Metal GPU natively.
+# Backend: Ollama (any OS, easiest setup) — default
+# Install: https://ollama.com/download
+# Then: ollama pull gemma4:e4b && ollama serve
 #
-# context_length must match the value in ~/.mlx-server/config.yaml.
-# single_pass_token_limit should be ~60-70% of context_length to leave
-# room for the system prompt and generated output.
+# IMPORTANT — Ollama uses a tiny context window by default (often 2048).
+# Gemma 4 E4B supports 128K. Expand it once with a Modelfile:
+#
+#   printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile
+#   ollama create gemma4:e4b-128k -f Modelfile
+#
+# Then set model: gemma4:e4b-128k below and context_length: 131072.
+# Without this, long pages and videos will be silently truncated.
 # ---------------------------------------------------------------------------
 llm:
-  base_url: http://host.docker.internal:18000/v1
-  api_key: dummy                                   # mlx-openai-server doesn't check it
-  model: qwen                                      # served_model_name in ~/.mlx-server/config.yaml
-  context_length: 32768                            # must match context_length in ~/.mlx-server/config.yaml
-  single_pass_token_limit: 24000                   # above this → map-reduce (~70% of context_length)
+  base_url: http://host.docker.internal:11434/v1
+  api_key: ollama
+  model: gemma4:e4b-128k                           # see note above; use gemma4:e4b if you skip the Modelfile step
+  context_length: 131072
+  single_pass_token_limit: 80000                   # above this → map-reduce (~60% of context_length)
+  # Cap on simultaneous LLM calls. 1 is safe on most local setups;
+  # bump to 2-3 on a beefy GPU server or a hosted backend.
   max_concurrent_calls: 1
 
 whisper:
+  # Whisper is only used as a last-resort fallback for YouTube videos with no
+  # captions. Most videos have auto-generated captions — you can leave this
+  # block pointing at a non-existent server and the daemon will skip Whisper
+  # gracefully. To enable it, pick a backend:
+  #
+  #   macOS Apple Silicon:  task install:mlx  (port 18000)
+  #   Any OS (Docker):      docker run -p 8000:8000 fedirz/faster-whisper-server
+  #   Any OS (brew):        brew install whisper-cpp && whisper-server -m ggml-large-v3.bin
   base_url: http://host.docker.internal:18000/v1
   api_key: dummy
   model: whisper                                   # served_model_name in ~/.mlx-server/config.yaml
@@ -36,13 +51,15 @@ whisper:
 # Backend: LM Studio (LLM) + mlx-openai-server (Whisper)
 # LM Studio: https://lmstudio.ai — GUI app, enable local server on port 1234.
 # Load any GGUF model (e.g. lmstudio-community/gemma-4-E4B-it-GGUF Q4_K_M).
-# mlx-openai-server stays running for Whisper only (remove the LLM model
-# from ~/.mlx-server/config.yaml if you want to free that memory).
 #
-# IMPORTANT — context_length must match what LM Studio actually loaded:
-#   lms ps                    # shows CONTEXT column for the loaded model
-# Set single_pass_token_limit to ~60% of context_length so there's room
-# for the system prompt and the generated summary.
+# IMPORTANT — LM Studio defaults to a small context window. After loading the
+# model, open its settings and set Context Length to 131072 — otherwise long
+# pages and videos will be silently truncated.
+# Check the active context: lms ps  (shows CONTEXT column for the loaded model)
+#
+# reasoning_effort: "low" keeps Gemma 4 thinking hidden in reasoning_content
+# (our code ignores it) and outputs a clean answer in content. Remove for
+# non-thinking models or if your LM Studio version doesn't support the field.
 # ---------------------------------------------------------------------------
 # llm:
 #   base_url: http://host.docker.internal:1234/v1
@@ -59,16 +76,20 @@ whisper:
 #   model: whisper
 
 # ---------------------------------------------------------------------------
-# Backend: Ollama (LLM) + mlx-openai-server (Whisper)
-# `brew install ollama && ollama serve` — listens on 11434 by default.
-# `ollama pull qwen3:4b` or any other model first.
+# Backend: mlx-openai-server — Apple Silicon, LLM + Whisper in one server
+# Install with: task install:mlx  (sets up ~/.mlx-server/config.yaml)
+# Fastest local option; uses Metal GPU natively.
+#
+# NOTE: mlx-openai-server support for Gemma 4 is pending a stable release.
+# If it doesn't load, edit ~/.mlx-server/config.yaml and switch to
+# mlx-community/gemma-3-12b-it-4bit (served_model_name: gemma3) until fixed.
 # ---------------------------------------------------------------------------
 # llm:
-#   base_url: http://host.docker.internal:11434/v1
-#   api_key: ollama
-#   model: qwen3:4b
-#   context_length: 32768
-#   single_pass_token_limit: 24000
+#   base_url: http://host.docker.internal:18000/v1
+#   api_key: dummy
+#   model: gemma4                                  # served_model_name in ~/.mlx-server/config.yaml
+#   context_length: 131072                         # must match context_length in ~/.mlx-server/config.yaml
+#   single_pass_token_limit: 80000                 # ~60% of context_length
 #   max_concurrent_calls: 1
 #
 # whisper:
@@ -79,7 +100,7 @@ whisper:
 # ---------------------------------------------------------------------------
 # Backend: llama-server (LLM) + whisper-server (Whisper) — cross-platform
 # `brew install llama.cpp whisper-cpp`
-# llama-server: llama-server -m model.gguf --port 8080 -ngl 99 -c 32768
+# llama-server: llama-server -m model.gguf --port 8080 -ngl 99 -c 131072
 # whisper-server: whisper-server -m ggml-large-v3.bin --port 8081
 #
 # The -c flag sets the context window. context_length here must match -c.
@@ -88,8 +109,8 @@ whisper:
 #   base_url: http://host.docker.internal:8080/v1
 #   api_key: dummy
 #   model: ""                                      # llama-server ignores model name
-#   context_length: 32768                          # must match -c flag passed to llama-server
-#   single_pass_token_limit: 24000                 # ~70% of context_length
+#   context_length: 131072                         # must match -c flag passed to llama-server
+#   single_pass_token_limit: 80000                 # ~60% of context_length
 #   max_concurrent_calls: 1
 #
 # whisper:
@@ -106,9 +127,9 @@ whisper:
 # llm:
 #   base_url: http://host.docker.internal:11434/v1
 #   api_key: ollama
-#   model: qwen3:4b
-#   context_length: 32768
-#   single_pass_token_limit: 24000
+#   model: gemma4:e4b
+#   context_length: 131072
+#   single_pass_token_limit: 80000
 #   max_concurrent_calls: 1
 
 # ---------------------------------------------------------------------------

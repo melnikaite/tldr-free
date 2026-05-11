@@ -19,7 +19,7 @@ tasks:
       - bash scripts/install.sh
 
   install:mlx:
-    desc: "Optional (macOS arm64): install mlx-openai-server + Qwen/Whisper weights (~10 GB)"
+    desc: "Optional (macOS arm64): install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
     cmds:
       - bash scripts/install.sh
       - bash scripts/mlx.sh install
