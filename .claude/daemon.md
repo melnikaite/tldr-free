@@ -17,7 +17,7 @@ daemon/
 │  ├─ config.py                 # YAML loader + env overrides; get_config() is the only accessor
 │  ├─ api/
 │  │  ├─ schemas.py            # Pydantic contract — READ-ONLY for non-API streams
-│  │  ├─ jobs.py               # POST/GET/DELETE /jobs + /jobs/{id}/{retry,messages}
+│  │  ├─ jobs.py               # /jobs CRUD + POST /jobs/{id}/retry + GET /jobs/{id}/messages
 │  │  ├─ ai.py                  # POST /ai/stream (summary + QA, per-job SSE)
 │  │  ├─ events.py              # GET /events (global SSE, type-filterable)
 │  │  ├─ workers.py             # GET/POST /workers/{pause,resume}

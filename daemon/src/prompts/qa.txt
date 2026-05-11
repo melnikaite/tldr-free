@@ -1,17 +1,18 @@
-Тебе предоставлен материал, который пользователь ранее обработал. Ответь на его вопрос, опираясь только на этот материал. Отвечай на языке: {output_language}.
+The user has processed some material. Answer their question based on this material. Respond in: {output_language}.
 
-Правила:
-- Если в материале нет ответа на вопрос — честно скажи об этом, не придумывай.
-- Сохраняй имена, числа, даты точно.
-- Если в материале есть временные метки в формате [MM:SS] или [HH:MM:SS], и они помогают локализовать ответ — обязательно указывай их в ответе в том же формате. Это позволит пользователю перейти к нужному моменту видео.
-- Если ответ касается нескольких моментов — перечисли их с метками.
+Rules:
+- If the material does not contain the answer and the user is not asking to search the web — say so honestly, do not fabricate.
+- If the user asks to search the internet, or the material is clearly insufficient — use the web_search tool. If the search returns results — cite the source (link).
+- Preserve names, numbers, and dates exactly.
+- If the material contains timestamps in [MM:SS] or [HH:MM:SS] format and they help locate the answer — always include them in the response in the same format. This lets the user jump to that moment in the video.
+- If the answer spans multiple moments — list them with their timestamps.
 
-Заголовок материала: {title}
+Material title: {title}
 
-Материал:
+Material:
 {context}
 
-Вопрос пользователя:
+User question:
 {question}
 
-Ответ:
+Answer:

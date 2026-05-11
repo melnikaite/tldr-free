@@ -110,11 +110,14 @@ class JobSummary(BaseModel):
 
 
 class JobDetails(JobSummary):
-    """Full job with summary_md (raw_text length only, not the body)."""
+    """Full job with summary_md and partial_summary for reconnect replay."""
     summary_md: str | None
-    raw_text_length: int | None
     error: str | None
     video_id: str | None
+    # Accumulated delta text while the job is still running. Lets a client
+    # that reconnects mid-generation (or restarts the browser) replay the
+    # buffered content without waiting for future deltas. None once done.
+    partial_summary: str | None = None
 
 
 class JobListResponse(BaseModel):
@@ -140,32 +143,21 @@ class MessagesListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# POST /ai/stream — unified streaming endpoint for ALL AI responses
+# POST /ai/qa — Q&A streaming endpoint
 # ---------------------------------------------------------------------------
 #
-# Request body:
-#   { job_id, question? }
+# Request body: { job_id, question }
 #
-# Two modes:
+# Triggers a new QA call. Streams answer tokens, persists user + assistant
+# messages (visible via GET /jobs/{id}/messages), emits done with message_id.
 #
-#   Without `question` → SUBSCRIBE TO SUMMARY for this job. If extraction is
-#   still running, wait for it (emitting "stage" events). When the summary
-#   runs, emit "delta" tokens. If the summary is already cached, replay it
-#   as a single delta + done. Multiple subscribers to the same job share
-#   the same broker fanout.
-#
-#   With `question` → TRIGGER A NEW QA. Stream the answer tokens. On
-#   completion, persist the user + assistant messages (visible via
-#   GET /jobs/{id}/messages) and emit a `done` event with `message_id`
-#   pointing at the assistant Message row.
-#
-# Response is text/event-stream. Each frame is a single line
-# `data: <json>\n\n` where <json> is one of AIStreamEvent variants below.
-# The stream ends with either `done` or `error`; the server closes after.
+# Response is text/event-stream. Each frame is `data: <json>\n\n`.
+# The stream ends with either `done` or `error`.
+
 
 class AIStreamRequest(BaseModel):
     job_id: str
-    question: str | None = None     # absent → summary mode; present → QA mode
+    question: str
 
 
 class AIStageEvent(BaseModel):

@@ -18,7 +18,8 @@ transcript-API fast path retains real timestamps.
 
 We pass ``timeout=None`` to httpx because transcription of a long file can
 take many minutes. The matching server-side timeout (``queue_timeout``)
-is bumped in ``config/mlx-server.yaml``.
+is bumped in ``~/.mlx-server/config.yaml`` (the live mlx-server config,
+outside the tldr repo so it can be shared across tools).
 """
 
 from __future__ import annotations

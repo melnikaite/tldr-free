@@ -84,11 +84,11 @@ async def test_long_text_uses_map_reduce(monkeypatch: pytest.MonkeyPatch) -> Non
     assert len(map_calls) >= 2
     # Reduce phase: exactly one stream_complete() call carrying the joined partials.
     assert len(stream_calls) == 1
-    assert "Конспекты частей:" in stream_calls[0]
+    assert "Chunk summaries:" in stream_calls[0]
     for p in map_calls:
         assert "English" in p
         assert "Long doc" in p
-        assert "Конспекты частей:" not in p
+        assert "Chunk summaries:" not in p
 
 
 @pytest.mark.asyncio

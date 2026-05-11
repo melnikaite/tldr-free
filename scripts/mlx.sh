@@ -6,10 +6,26 @@
 # Use it on macOS arm64 for the fastest local path; on other platforms point
 # config/tldr.yaml at Ollama / LM Studio / llama.cpp / vLLM instead.
 #
+# Live state lives OUTSIDE the tldr repo at $HOME/.mlx-server/ so the same
+# server can be reused by other tools (Zed, your CLI, anything that speaks
+# OpenAI-compatible HTTP). Add another model to that file and it's
+# immediately available — tldr doesn't own the server, just talks to it.
+#
+#   $HOME/.mlx-server/config.yaml          live config (edit to add models)
+#   $HOME/.mlx-server/server.pid           pid of running process
+#   $HOME/.mlx-server/logs/server.*.log    stdout / stderr
+#   $HOME/.venvs/mlx-server/               python venv with mlx-openai-server
+#
+# The repo only ships `config/mlx-server.yaml.example` — the install template
+# we copy to $HOME/.mlx-server/config.yaml on first install (and never
+# overwrite afterwards, so user edits stick).
+#
 # Subcommands:
 #   install               Install mlx-openai-server in ~/.venvs/mlx-server +
-#                         download Qwen + Whisper weights (~10 GB)
-#   start                 Start mlx-server in background, write PID to .mlx.pid
+#                         seed ~/.mlx-server/config.yaml + download Qwen + Whisper
+#                         weights (~6 GB)
+#   start                 Start mlx-server in background, write PID to
+#                         ~/.mlx-server/server.pid
 #   start-if-present      Start only if installed; no-op otherwise
 #                         (used by `task up` so non-mlx backends "just work")
 #   stop                  Stop mlx-server (SIGTERM, clean up PID file)
@@ -24,12 +40,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PID_FILE=".mlx.pid"
-LOG_DIR="data/logs"
+MLX_HOME="$HOME/.mlx-server"
+PID_FILE="$MLX_HOME/server.pid"
+LOG_DIR="$MLX_HOME/logs"
+CONFIG="$MLX_HOME/config.yaml"
+CONFIG_EXAMPLE="config/mlx-server.yaml.example"   # template, lives in repo
 VENV="$HOME/.venvs/mlx-server"
 BIN="$VENV/bin/mlx-openai-server"
-CONFIG="config/mlx-server.yaml"
-CONFIG_EXAMPLE="config/mlx-server.yaml.example"
 HEALTH_URL="http://localhost:18000/v1/models"
 
 if [ -t 1 ]; then
@@ -123,19 +140,20 @@ cmd_install() {
     ok "mlx-openai-server installed"
   fi
 
-  hdr "Copy mlx-server.yaml"
+  hdr "Set up $MLX_HOME (config + logs)"
   [ -f "$CONFIG_EXAMPLE" ] || err "$CONFIG_EXAMPLE not found"
+  mkdir -p "$LOG_DIR"
   if [ -f "$CONFIG" ]; then
-    skip "$CONFIG already exists"
+    skip "$CONFIG already exists (your edits preserved)"
   else
     cp "$CONFIG_EXAMPLE" "$CONFIG"
-    ok "$CONFIG copied from example"
+    ok "$CONFIG copied from $CONFIG_EXAMPLE"
   fi
 
   if [ "$download_models" = 1 ]; then
-    hdr "Download Qwen + Whisper weights (~10 GB, may take 10–30 min)"
+    hdr "Download Qwen + Whisper weights (~6 GB, may take 5–15 min)"
     "$VENV/bin/pip" install --quiet huggingface-hub
-    for repo in mlx-community/Qwen2.5-14B-Instruct-4bit mlx-community/whisper-large-v3-mlx-4bit; do
+    for repo in mlx-community/Qwen3-4B-Instruct-2507-4bit mlx-community/whisper-large-v3-mlx-4bit; do
       local cache_dir="$HOME/.cache/huggingface/hub/models--${repo//\//--}"
       if [ -d "$cache_dir/blobs" ] && [ "$(du -sm "$cache_dir/blobs" 2>/dev/null | awk '{print $1}')" -gt 1 ]; then
         skip "$repo already cached"
@@ -174,7 +192,7 @@ cmd_start() {
   # with "Fatal Python error: init_sys_streams: can't initialize sys standard streams".
   nohup "$BIN" launch --config "$CONFIG" \
     </dev/null \
-    >"$LOG_DIR/mlx.out.log" 2>"$LOG_DIR/mlx.err.log" &
+    >"$LOG_DIR/server.out.log" 2>"$LOG_DIR/server.err.log" &
   echo $! > "$PID_FILE"
   ok "mlx-server started (PID=$(cat "$PID_FILE"))"
 }

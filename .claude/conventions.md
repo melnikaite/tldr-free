@@ -111,7 +111,8 @@ idle window can unload the model mid-stream of the last request.
 
 We do NOT patch upstream — the bug only bites continuous batches, and
 sparse usage (one job, gap, another job) reloads the model fresh each
-time. Mitigation is in `config/mlx-server.yaml`: pick idle_timeouts long
+time. Mitigation is in `~/.mlx-server/config.yaml` (seeded from
+`config/mlx-server.yaml.example` by `task install:mlx`): pick idle_timeouts long
 enough that any realistic batch fits inside a single window
 (qwen: 1800 s, whisper: 3600 s). The per-chunk timeout above catches
 the case where someone runs a huge batch and the timer still fires.

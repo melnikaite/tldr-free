@@ -1,4 +1,4 @@
-"""Migration runner tests — verifies v1 schema lands and is idempotent."""
+"""Migration runner tests — verifies schema migrations land and are idempotent."""
 
 from __future__ import annotations
 
@@ -41,28 +41,30 @@ def _trigger_names(engine) -> set[str]:
         raw.close()
 
 
-def test_v1_creates_tables_fts_and_triggers(fresh_engine) -> None:
+def test_migrations_create_core_tables(fresh_engine) -> None:
+    """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1]
+    assert applied == [1, 2]
 
     tables = _table_names(fresh_engine)
-    # Core tables
-    for required in ("job", "message", "_migrations", "job_fts"):
+    for required in ("job", "message", "_migrations"):
         assert required in tables, f"missing table {required!r}; got {tables}"
 
+    # v2 dropped FTS5 infrastructure
+    assert "job_fts" not in tables
     triggers = _trigger_names(fresh_engine)
-    assert {"job_ai", "job_ad", "job_au"} <= triggers
+    assert not {"job_ai", "job_ad", "job_au"} & triggers
 
 
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1]
+    assert first == [1, 2]
     assert second == []  # nothing new to apply
 
-    # And the schema should still be intact
     tables = _table_names(fresh_engine)
-    assert "job" in tables and "job_fts" in tables
+    assert "job" in tables
+    assert "job_fts" not in tables
 
 
 def test_pragmas_are_applied(fresh_engine) -> None:
@@ -79,40 +81,5 @@ def test_pragmas_are_applied(fresh_engine) -> None:
 
         cur.execute("PRAGMA foreign_keys")
         assert int(cur.fetchone()[0]) == 1
-    finally:
-        raw.close()
-
-
-def test_fts_triggers_mirror_job_writes(fresh_engine) -> None:
-    """Insert/update/delete on job propagate into job_fts via the AI/AU/AD triggers."""
-    run_migrations(fresh_engine)
-    raw = fresh_engine.raw_connection()
-    try:
-        cur = raw.cursor()
-        # Insert a job row directly via raw SQL to keep the test focused on triggers.
-        cur.execute(
-            """
-            INSERT INTO job (id, url, kind, status, title, created_at, updated_at,
-                             raw_text, summary_md)
-            VALUES ('abc123def456', 'https://x', 'page', 'done', 'Hello world',
-                    datetime('now'), datetime('now'), 'a quick brown fox', 'tldr summary')
-            """
-        )
-        raw.commit()
-
-        cur.execute("SELECT count(*) FROM job_fts WHERE job_fts MATCH 'fox'")
-        assert cur.fetchone()[0] == 1
-
-        # Update title — should re-index
-        cur.execute("UPDATE job SET title = 'Different title' WHERE id = 'abc123def456'")
-        raw.commit()
-        cur.execute("SELECT count(*) FROM job_fts WHERE job_fts MATCH 'Different'")
-        assert cur.fetchone()[0] == 1
-
-        # Delete — should remove from FTS
-        cur.execute("DELETE FROM job WHERE id = 'abc123def456'")
-        raw.commit()
-        cur.execute("SELECT count(*) FROM job_fts WHERE job_fts MATCH 'fox'")
-        assert cur.fetchone()[0] == 0
     finally:
         raw.close()

@@ -34,6 +34,12 @@ class LLMConfig(BaseModel):
     # us). 60 s is generous for fast local backends and fast hosted ones; bump
     # for slow remote backends.
     stream_chunk_timeout_seconds: float = 60.0
+    # Pass reasoning_effort to the backend. Set to "none" to disable thinking
+    # mode on models like Gemma 4 in LM Studio — without it the model spends
+    # its entire max_tokens budget on chain-of-thought and emits no content.
+    # Leave null (the default) for backends that don't support this field;
+    # they will simply ignore or error on the extra body parameter.
+    reasoning_effort: str | None = None
 
 
 class WhisperConfig(BaseModel):

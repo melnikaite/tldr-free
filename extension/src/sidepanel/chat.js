@@ -77,7 +77,7 @@ async function handleAsk(question) {
   let textNode = null;
   let acc = "";
   try {
-    for await (const ev of daemon.aiStream({ job_id: activeJobId, question })) {
+    for await (const ev of daemon.aiQa({ job_id: activeJobId, question })) {
       if (ev.type === "stage") {
         // Stage signals (e.g. "thinking") arrive before the first delta;
         // the dots indicator already covers that, no extra UI needed.

@@ -4,8 +4,9 @@ POST /jobs is now ASYNC. The route persists the row, kicks off the pipeline
 (workers/pipeline.run_pipeline) as a background task, and returns 202 with
 the new job id. The client follows progress via POST /ai/stream {job_id}.
 
-Chat history per job lives in `Message`; this module exposes
-GET /jobs/{id}/messages and DELETE /jobs/{id}/messages.
+Chat history per job lives in `Message`; GET /jobs/{id}/messages returns
+the saved bubbles. There's no DELETE today — clearing chat means deleting
+the job (FK cascade drops the messages with it).
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from src.api.schemas import (
 )
 from src.storage import repo
 from src.workers import pipeline, youtube
+from src.workers.broker import get_stream_buffer
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +111,9 @@ def _to_summary(job: Any) -> JobSummary:
 
 
 def _to_details(job: Any) -> JobDetails:
-    raw_text_length = len(job.raw_text) if job.raw_text is not None else None
+    # Include in-flight buffer for running jobs so reconnecting clients can
+    # replay buffered content without waiting for future delta events.
+    partial = get_stream_buffer(job.id) if JobStatus(job.status) == JobStatus.RUNNING else None
     return JobDetails(
         id=job.id,
         url=job.url,
@@ -125,9 +129,9 @@ def _to_details(job: Any) -> JobDetails:
         updated_at=job.updated_at,
         completed_at=job.completed_at,
         summary_md=job.summary_md,
-        raw_text_length=raw_text_length,
         error=job.error,
         video_id=job.video_id,
+        partial_summary=partial or None,
     )
 
 

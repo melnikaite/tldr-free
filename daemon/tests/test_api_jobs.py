@@ -8,7 +8,7 @@ Note: POST /jobs is now ASYNC — it returns 202 with the new id and runs the
 extraction + summary in a background task. Tests that need the final state
 either:
   - poll GET /jobs/{id} until status transitions, or
-  - subscribe to POST /ai/stream {job_id} and read events.
+  - subscribe to POST /ai/qa {job_id, question} and read events.
 """
 
 from __future__ import annotations
@@ -79,7 +79,15 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(yt_worker, "download_subtitles", _fake_subs)
 
-    # 4) Trafilatura.
+    # 4) DuckDuckGo search — return a deterministic result so tests never hit the network.
+    from src.workers import search as search_mod
+
+    async def _fake_ddg_search(query: str, max_results: int = 5) -> list[dict]:  # noqa: ANN001
+        return [{"title": "Fake result", "href": "https://example.com/result", "body": query}]
+
+    monkeypatch.setattr(search_mod, "ddg_search", _fake_ddg_search)
+
+    # 5) Trafilatura.
     from src.workers import page as page_worker
 
     async def _fake_extract(url: str) -> tuple[str | None, str]:
@@ -87,7 +95,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(page_worker, "extract_with_trafilatura", _fake_extract)
 
-    # 5) Whisper worker → no-op so lifespan can spin up cleanly.
+    # 6) Whisper worker → no-op so lifespan can spin up cleanly.
     from src.workers import runner as runner_mod
 
     async def _noop_worker(queue, repo_module):  # noqa: ANN001
@@ -102,7 +110,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(main_mod, "whisper_worker", _noop_worker)
 
-    # 6) Retention worker → no-op so it doesn't run during tests.
+    # 7) Retention worker → no-op so it doesn't run during tests.
     from src.workers import retention as retention_mod
 
     async def _noop_retention() -> None:
@@ -115,7 +123,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(retention_mod, "retention_worker", _noop_retention)
     monkeypatch.setattr(main_mod, "retention_worker", _noop_retention)
 
-    # 7) Reset queue + broker + workers control singletons between tests.
+    # 8) Reset queue + broker + workers control singletons between tests.
     from src.workers import broker as broker_mod
     from src.workers import control as control_mod
     from src.workers import queue as queue_mod
@@ -234,14 +242,14 @@ def test_get_jobs_filters_and_total(client: TestClient) -> None:
     assert all(item["kind"] == "page" for item in body["items"])
 
 
-def test_get_job_detail_includes_raw_text_length(client: TestClient) -> None:
+def test_get_job_detail_has_no_raw_text_length(client: TestClient) -> None:
     create = client.post(
         "/jobs",
         json={"url": "https://x", "kind": "page", "page_text": "abcdef"},
     ).json()
 
     final = _wait_until_done(client, create["id"])
-    assert final["raw_text_length"] == 6
+    assert "raw_text_length" not in final
     assert final["video_id"] is None
 
 
@@ -300,7 +308,7 @@ def test_post_jobs_returns_existing_for_same_url(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /ai/stream — summary + QA modes
+# /ai/qa — Q&A mode
 # ---------------------------------------------------------------------------
 
 
@@ -315,24 +323,7 @@ def _read_sse_events(response) -> list[dict]:
     return out
 
 
-def test_ai_stream_summary_replays_cached_done(client: TestClient) -> None:
-    """When the job is already done, /ai/stream replays summary_md as one
-    delta + done — no broker subscription needed."""
-    create = client.post(
-        "/jobs", json={"url": "https://x", "kind": "page", "page_text": "hello"}
-    ).json()
-    _wait_until_done(client, create["id"])
-
-    r = client.post("/ai/stream", json={"job_id": create["id"]})
-    assert r.status_code == 200
-    events = _read_sse_events(r)
-    types = [e["type"] for e in events]
-    assert types == ["delta", "done"]
-    assert "summary" in events[0]["delta"].lower()
-    assert events[1]["content"] == events[0]["delta"]
-
-
-def test_ai_stream_qa_persists_messages(client: TestClient) -> None:
+def test_ai_qa_persists_messages(client: TestClient) -> None:
     """QA mode persists user + assistant messages, emits done with message_id."""
     create = client.post(
         "/jobs", json={"url": "https://x", "kind": "page", "page_text": "hello"}
@@ -340,7 +331,7 @@ def test_ai_stream_qa_persists_messages(client: TestClient) -> None:
     _wait_until_done(client, create["id"])
 
     r = client.post(
-        "/ai/stream",
+        "/ai/qa",
         json={"job_id": create["id"], "question": "What is this about?"},
     )
     assert r.status_code == 200
@@ -361,8 +352,78 @@ def test_ai_stream_qa_persists_messages(client: TestClient) -> None:
     assert msgs["items"][1]["id"] == done["message_id"]
 
 
-def test_ai_stream_404_for_unknown_job(client: TestClient) -> None:
-    r = client.post("/ai/stream", json={"job_id": "nope"})
+def test_ai_qa_404_for_unknown_job(client: TestClient) -> None:
+    r = client.post("/ai/qa", json={"job_id": "nope", "question": "hi"})
     assert r.status_code == 404
+
+
+def test_ai_qa_409_when_job_not_done(client: TestClient) -> None:
+    """Q&A on a job that hasn't finished summarizing returns 409."""
+    # YouTube without transcript stays in queued state with the no-op worker.
+    r = client.post(
+        "/jobs",
+        json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "kind": "youtube"},
+    )
+    assert r.status_code == 202
+    job_id = r.json()["id"]
+
+    # Wait until the pipeline parks it in queued (Whisper deferred).
+    import time
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        detail = client.get(f"/jobs/{job_id}").json()
+        if detail["status"] == "queued":
+            break
+        time.sleep(0.05)
+
+    r = client.post("/ai/qa", json={"job_id": job_id, "question": "What is this?"})
+    assert r.status_code == 409
+    assert "not done" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{id}/retry
+# ---------------------------------------------------------------------------
+
+
+def test_retry_endpoint_returns_202_and_reruns(client: TestClient) -> None:
+    """Retry a failed job: endpoint returns 202, job transitions back to running."""
+    create = client.post(
+        "/jobs", json={"url": "https://x", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    # Force the job into failed state via internal API (no route to fail directly).
+    from src.storage import repo
+
+    repo.update_status(create["id"], status="failed", error="injected failure")
+
+    r = client.post(f"/jobs/{create['id']}/retry")
+    assert r.status_code == 202
+    body = r.json()
+    assert body["id"] == create["id"]
+    assert body["status"] == "running"
+
+    # Pipeline reruns and reaches done again.
+    final = _wait_until_done(client, create["id"])
+    assert final["status"] == "done"
+    assert final["error"] is None
+
+
+def test_retry_endpoint_404_for_unknown_job(client: TestClient) -> None:
+    r = client.post("/jobs/nope/retry")
+    assert r.status_code == 404
+
+
+def test_retry_endpoint_409_when_not_failed(client: TestClient) -> None:
+    """Only failed jobs can be retried."""
+    create = client.post(
+        "/jobs", json={"url": "https://x", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.post(f"/jobs/{create['id']}/retry")
+    assert r.status_code == 409
+    assert "failed" in r.json()["detail"]
 
 

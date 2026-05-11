@@ -2,56 +2,111 @@
 # Environment variables prefixed with TLDR__ override individual fields,
 # e.g. TLDR__OUTPUT__LANGUAGE=English
 #
-# The daemon talks to any OpenAI-compatible HTTP backend. Pick one of the
-# llm + whisper sections below (or write your own — base_url + model is all
-# we need). The daemon container reaches host services via host.docker.internal.
+# llm.base_url and whisper.base_url are INDEPENDENT — they can point at the
+# same server (e.g. mlx-openai-server serves both) or different ones
+# (e.g. LM Studio for LLM + whisper.cpp server for Whisper).
+#
+# Whisper is only needed as a last resort for YouTube videos that have no
+# official transcripts and no auto-generated captions. If you skip it those
+# videos will error at the transcription step rather than falling back.
 
 # ---------------------------------------------------------------------------
-# Backend: mlx-openai-server (Apple Silicon, fastest local) — default
-# Install with: task install:mlx
+# Backend: mlx-openai-server — Apple Silicon, LLM + Whisper in one server
+# Install with: task install:mlx  (sets up ~/.mlx-server/config.yaml)
+# Fastest local option; uses Metal GPU natively.
+#
+# context_length must match the value in ~/.mlx-server/config.yaml.
+# single_pass_token_limit should be ~60-70% of context_length to leave
+# room for the system prompt and generated output.
 # ---------------------------------------------------------------------------
 llm:
   base_url: http://host.docker.internal:18000/v1
   api_key: dummy                                   # mlx-openai-server doesn't check it
-  model: qwen
-  context_length: 32768
-  single_pass_token_limit: 24000                   # above this → map-reduce
-  # Cap on simultaneous LLM calls. 1 keeps a single-user Mac responsive;
-  # bump to 2-3 on a beefy GPU server or hosted backend.
+  model: qwen                                      # served_model_name in ~/.mlx-server/config.yaml
+  context_length: 32768                            # must match context_length in ~/.mlx-server/config.yaml
+  single_pass_token_limit: 24000                   # above this → map-reduce (~70% of context_length)
   max_concurrent_calls: 1
 
 whisper:
   base_url: http://host.docker.internal:18000/v1
   api_key: dummy
-  model: whisper
+  model: whisper                                   # served_model_name in ~/.mlx-server/config.yaml
 
 # ---------------------------------------------------------------------------
-# Backend: Ollama (any OS, easy install) — uncomment to switch
-# `ollama serve` listens on 11434 by default. `ollama pull qwen2.5:14b` first.
+# Backend: LM Studio (LLM) + mlx-openai-server (Whisper)
+# LM Studio: https://lmstudio.ai — GUI app, enable local server on port 1234.
+# Load any GGUF model (e.g. lmstudio-community/gemma-4-E4B-it-GGUF Q4_K_M).
+# mlx-openai-server stays running for Whisper only (remove the LLM model
+# from ~/.mlx-server/config.yaml if you want to free that memory).
+#
+# IMPORTANT — context_length must match what LM Studio actually loaded:
+#   lms ps                    # shows CONTEXT column for the loaded model
+# Set single_pass_token_limit to ~60% of context_length so there's room
+# for the system prompt and the generated summary.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:1234/v1
+#   api_key: lm-studio                             # LM Studio doesn't check it
+#   model: google/gemma-4-e4b                      # model ID shown by LM Studio API
+#   context_length: 131072                         # match `lms ps` CONTEXT column
+#   single_pass_token_limit: 80000                 # ~60% of context_length
+#   max_concurrent_calls: 1
+#   reasoning_effort: "low"                        # keep Gemma 4 thinking hidden; omit for non-thinking models
+#
+# whisper:
+#   base_url: http://host.docker.internal:18000/v1
+#   api_key: dummy
+#   model: whisper
+
+# ---------------------------------------------------------------------------
+# Backend: Ollama (LLM) + mlx-openai-server (Whisper)
+# `brew install ollama && ollama serve` — listens on 11434 by default.
+# `ollama pull qwen3:4b` or any other model first.
 # ---------------------------------------------------------------------------
 # llm:
 #   base_url: http://host.docker.internal:11434/v1
 #   api_key: ollama
-#   model: qwen2.5:14b
+#   model: qwen3:4b
 #   context_length: 32768
 #   single_pass_token_limit: 24000
 #   max_concurrent_calls: 1
 #
 # whisper:
-#   # Ollama doesn't ship Whisper. Point at any STT server (faster-whisper,
-#   # whisper.cpp HTTP, openai/whisper-large-v3 via vLLM, etc.).
-#   base_url: http://host.docker.internal:8123/v1
+#   base_url: http://host.docker.internal:18000/v1
 #   api_key: dummy
-#   model: whisper-1
+#   model: whisper
 
 # ---------------------------------------------------------------------------
-# Backend: LM Studio (Mac/Win, GUI) — uncomment to switch
-# Enable the local server in LM Studio → Developer; default port 1234.
+# Backend: llama-server (LLM) + whisper-server (Whisper) — cross-platform
+# `brew install llama.cpp whisper-cpp`
+# llama-server: llama-server -m model.gguf --port 8080 -ngl 99 -c 32768
+# whisper-server: whisper-server -m ggml-large-v3.bin --port 8081
+#
+# The -c flag sets the context window. context_length here must match -c.
 # ---------------------------------------------------------------------------
 # llm:
-#   base_url: http://host.docker.internal:1234/v1
-#   api_key: lm-studio
-#   model: qwen2.5-14b-instruct      # whatever you loaded in LM Studio
+#   base_url: http://host.docker.internal:8080/v1
+#   api_key: dummy
+#   model: ""                                      # llama-server ignores model name
+#   context_length: 32768                          # must match -c flag passed to llama-server
+#   single_pass_token_limit: 24000                 # ~70% of context_length
+#   max_concurrent_calls: 1
+#
+# whisper:
+#   base_url: http://host.docker.internal:8081/v1
+#   api_key: dummy
+#   model: whisper-1                               # whisper-server ignores model name
+
+# ---------------------------------------------------------------------------
+# Backend: LLM only — no Whisper fallback
+# Use any LLM server above. Omit the whisper block or point it at a
+# non-existent URL — YouTube jobs that reach the Whisper step will error.
+# Web-page jobs are unaffected (no Whisper needed).
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:11434/v1
+#   api_key: ollama
+#   model: qwen3:4b
 #   context_length: 32768
 #   single_pass_token_limit: 24000
 #   max_concurrent_calls: 1
@@ -60,8 +115,7 @@ whisper:
 # Output language. Use an ISO 639-1 code: en, ru, de, fr, es, it, pt, ja, …
 # (the daemon expands it to the full name when prompting the LLM, which
 # helps smaller models stick to the language). Anything else is passed
-# through verbatim, so you can also write "Brazilian Portuguese" if you
-# need precision.
+# through verbatim, so you can also write "Brazilian Portuguese" if needed.
 # ---------------------------------------------------------------------------
 output:
   language: en

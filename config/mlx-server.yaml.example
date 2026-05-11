@@ -16,12 +16,12 @@ server:
 # defence-in-depth so a hung backend stream eventually fails the job
 # instead of locking the queue forever.
 models:
-  - model_path: mlx-community/Qwen2.5-14B-Instruct-4bit
+  - model_path: mlx-community/Qwen3-4B-Instruct-2507-4bit
     model_type: lm
     served_model_name: qwen
     context_length: 32768
     on_demand: true
-    on_demand_idle_timeout: 1800   # 30 min — frees ~8 GB after a batch finishes
+    on_demand_idle_timeout: 1800   # 30 min — frees ~3 GB after a batch finishes
     kv_bits: 4
     kv_group_size: 64
 

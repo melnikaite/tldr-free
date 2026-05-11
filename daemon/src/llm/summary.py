@@ -57,7 +57,7 @@ async def _stream_single_pass(
     prompt = _build_single_pass_prompt(
         text, title=title, output_language=output_language
     )
-    async for delta in llm_client.stream_complete(prompt, max_tokens=1200, temperature=0.3):
+    async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
         yield delta
 
 
@@ -93,7 +93,7 @@ async def _stream_reduce(
         title=_safe_title(title),
         combined=combined,
     )
-    async for delta in llm_client.stream_complete(prompt, max_tokens=1200, temperature=0.3):
+    async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
         yield delta
 
 

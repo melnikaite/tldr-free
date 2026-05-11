@@ -1,21 +1,29 @@
-"""Single-job Q&A — streaming.
+"""Single-job Q&A — streaming with optional DuckDuckGo web search tool.
 
 Public surface:
-    async def stream_answer(*, job, question: str, output_language: str) -> AsyncIterator[str]
+    async def stream_answer(*, job, question: str, output_language: str)
+        -> AsyncIterator[str | dict[str, Any]]
+
         Builds context = job.raw_text if it fits else job.summary_md.
-        Loads prompts/qa.txt, formats with output_language, calls the LLM with
-        stream=True, yields token deltas as they arrive.
+        Offers a ``web_search`` tool to the LLM; if invoked, runs DuckDuckGo,
+        injects results into the conversation, then streams the final answer.
 
-Called from ``api/ai.py``'s POST /ai/stream when the request body has a
-``question`` field; the route wraps each yielded delta as an
-``AIDeltaEvent`` SSE frame and emits an ``AIDoneEvent`` at the end.
+        Yields:
+          - ``str`` — token delta for the final answer
+          - ``dict`` — stage event, e.g. {"type": "stage", "stage": "searching",
+            "detail": "<query>"}  (consumed by api/ai.py and forwarded as SSE)
 
-The prompt instructs the LLM to include [MM:SS] markers in the answer when
-they help locate the relevant moment in the source video.
+        Graceful degradation: if the backend does not support tool calling
+        (returns an error on the first call), falls back to plain
+        stream_complete with the original prompt.
+
+Called from ``api/ai.py`` POST /ai/qa.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from pathlib import Path
@@ -24,17 +32,37 @@ from typing import Any
 from src.config import get_config
 from src.llm import client as llm_client
 from src.llm.tokens import count_tokens
+from src.workers import search as _search
+
+log = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# Reserve room for the prompt scaffolding + the answer — we don't want to
-# squeeze context to the bone.
+# Reserve room for the prompt scaffolding + the answer.
 _PROMPT_OVERHEAD_TOKENS = 4000
 
-# We accept any object with `.title`, `.raw_text`, `.summary_md` attributes —
-# storage.db.Job is the runtime type, but tests pass dataclasses or simple
-# namespaces. Typed as `Any` (not a Protocol) so callers don't need to
-# subclass anything.
+# Tool definition sent to the LLM on every QA call.
+_WEB_SEARCH_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for current information not covered in the provided material. "
+            "Use this when the user explicitly asks to search the internet, or when the "
+            "material clearly does not contain what they need."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Concise search query in the user's language",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 @lru_cache(maxsize=1)
@@ -47,12 +75,28 @@ def _select_context(job: Any) -> str:
 
     Falls back to "" when neither is set.
     """
-    raw = (getattr(job, "raw_text", None) or "")
-    summary = (getattr(job, "summary_md", None) or "")
+    raw = getattr(job, "raw_text", None) or ""
+    summary = getattr(job, "summary_md", None) or ""
     budget = get_config().llm.context_length - _PROMPT_OVERHEAD_TOKENS
     if raw and count_tokens(raw) <= budget:
         return raw
     return summary
+
+
+def _build_messages(
+    *,
+    output_language: str,
+    title: str,
+    context: str,
+    question: str,
+) -> list[dict[str, Any]]:
+    prompt = _load_prompt().format(
+        output_language=output_language,
+        title=title,
+        context=context,
+        question=question,
+    )
+    return [{"role": "user", "content": prompt}]
 
 
 async def stream_answer(
@@ -60,26 +104,101 @@ async def stream_answer(
     job: Any,
     question: str,
     output_language: str,
-) -> AsyncIterator[str]:
-    """Yield assistant token deltas for a Q&A turn over `job`.
+) -> AsyncIterator[str | dict[str, Any]]:
+    """Yield token deltas (str) or stage dicts (dict) for a QA turn.
 
-    Loads `prompts/qa.txt`, formats it with `{title}`, `{context}`, `{question}`,
-    `{output_language}`, then streams the model's reply.
+    Flow:
+    1. Non-streaming call with the web_search tool offered → detect tool use.
+    2a. Tool called → emit ``searching`` stage, run DDG, append results,
+        stream the final answer.
+    2b. No tool call → yield the direct answer content.
+    3. Fallback: if step 1 raises (backend unsupported), stream without tools.
     """
     context = _select_context(job)
-    title = (getattr(job, "title", None) or "")
-    prompt = _load_prompt().format(
+    title = getattr(job, "title", None) or ""
+    messages = _build_messages(
         output_language=output_language,
         title=title,
         context=context,
         question=question,
     )
-    # respect_pause=False — Q&A bypasses the global pause gate because the
-    # user is actively waiting on the answer.
-    async for delta in llm_client.stream_complete(
-        prompt, max_tokens=2000, temperature=0.3, respect_pause=False
-    ):
-        yield delta
+
+    # Step 1: non-streaming call with tools so we can detect tool invocations.
+    try:
+        response = await llm_client.complete_with_messages(
+            messages,
+            tools=[_WEB_SEARCH_TOOL],
+            max_tokens=2000,
+            temperature=0.3,
+        )
+    except Exception:
+        log.warning("tool-capable request failed; falling back to plain stream", exc_info=True)
+        async for delta in llm_client.stream_complete(
+            messages[0]["content"],
+            max_tokens=2000,
+            temperature=0.3,
+            respect_pause=False,
+        ):
+            yield delta
+        return
+
+    choice = response.choices[0]
+    tool_calls = choice.message.tool_calls
+
+    if tool_calls:
+        # Append the assistant message (with tool_calls) to the history.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": choice.message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+
+        for tc in tool_calls:
+            if tc.function.name != "web_search":
+                continue
+            try:
+                args = json.loads(tc.function.arguments)
+                query = args.get("query") or question
+            except (json.JSONDecodeError, KeyError):
+                query = question
+
+            log.info("web_search tool called: %r", query)
+            yield {"type": "stage", "stage": "searching", "detail": query}
+
+            results = await _search.ddg_search(query)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": _search.format_results(results),
+                }
+            )
+
+        # Step 2a: stream the grounded final answer.
+        async for delta in llm_client.stream_with_messages(
+            messages,
+            max_tokens=2000,
+            temperature=0.3,
+        ):
+            yield delta
+
+    else:
+        # Step 2b: model answered directly — yield content as a single delta.
+        content = choice.message.content or ""
+        if content:
+            yield content
 
 
 __all__ = ["stream_answer"]

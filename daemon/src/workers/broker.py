@@ -2,22 +2,19 @@
 
 Two brokers live here:
 
-- ``JobEventBroker`` — keyed by ``job_id``. Per-job summary streaming.
-  Subscribed by ``POST /ai/stream`` (summary mode) so a client following
-  one specific job sees only its events.
+- ``JobEventBroker`` — per-job event publisher. Maintains the stream replay
+  buffer (so reconnecting clients can resume mid-generation) and mirrors every
+  published event into the global ``EventBroker`` with ``job_id`` attached.
+  Producers (pipeline, runner) call ``publish(job_id, event)``; no one
+  subscribes per-job — all consumers use the global stream.
 
 - ``EventBroker`` — single global channel. Used by ``GET /events`` so the
   Library and Side panel can react to ANY job change, worker state flip,
   or per-job stage/delta in real time without polling. Subscribers filter
   by event type (and ``job_id`` field where present).
 
-Why two? The job-stream is a stable per-job lifecycle replay (subscribe,
-get all events for that job until done). The global stream is a firehose
-for UIs that need awareness across all jobs.
-
-Producers publish to BOTH:
-  * the per-job stream so /ai/stream subscribers see live progress
-  * the global stream so Library/Side panel react instantly
+Why two? The job broker is a thin routing layer that adds ``job_id`` and
+maintains the replay buffer; the global broker is the actual fan-out.
 
 Subscribers are stored in dicts keyed by ``id(queue)`` so unsubscribe is
 O(1) — important once a few panels are open and disconnect/reconnect on
@@ -37,49 +34,53 @@ log = logging.getLogger(__name__)
 
 _QUEUE_MAX = 256        # bounded so a slow subscriber can't grow memory unbounded
 
+# ---------------------------------------------------------------------------
+# Stream replay buffer
+# ---------------------------------------------------------------------------
+# Accumulates the full delta text for every running job so a client that
+# (re-)connects mid-generation — or opens the browser fresh — can fetch the
+# buffered text via GET /jobs/{id} and resume from the right position.
+# Keyed by job_id; cleared when the job finishes (done / error).
+
+_stream_buffers: dict[str, str] = {}
+
+
+def get_stream_buffer(job_id: str) -> str:
+    """Return accumulated delta text for a still-running job (empty string if none)."""
+    return _stream_buffers.get(job_id, "")
+
+
+def _clear_stream_buffer(job_id: str) -> None:
+    _stream_buffers.pop(job_id, None)
+
 
 class JobEventBroker:
-    """In-memory pub/sub keyed by job_id."""
+    """Per-job event publisher with stream replay buffer.
 
-    def __init__(self) -> None:
-        # job_id → {id(queue): queue} so unsubscribe is O(1).
-        self._subs: dict[str, dict[int, asyncio.Queue[dict[str, Any]]]] = {}
-
-    def subscribe(self, job_id: str) -> asyncio.Queue[dict[str, Any]]:
-        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_QUEUE_MAX)
-        self._subs.setdefault(job_id, {})[id(q)] = q
-        return q
-
-    def unsubscribe(self, job_id: str, q: asyncio.Queue[dict[str, Any]]) -> None:
-        subs = self._subs.get(job_id)
-        if not subs:
-            return
-        subs.pop(id(q), None)
-        if not subs:
-            self._subs.pop(job_id, None)
+    Maintains ``_stream_buffers`` so ``GET /jobs/{id}`` can return
+    ``partial_summary`` for in-progress jobs. Every published event is also
+    mirrored to the global ``EventBroker`` with ``job_id`` attached, making
+    it visible to ``GET /events`` subscribers (Library, Side panel).
+    """
 
     def publish(self, job_id: str, event: dict[str, Any]) -> None:
-        """Fan out an event to every active subscriber for ``job_id``.
+        """Publish ``event`` for ``job_id``.
 
-        Drops the event for any subscriber whose queue is full (back-pressure
-        protection). Slow subscribers see gaps rather than blocking the producer.
-
-        Also mirrors the event into the global ``EventBroker`` with ``job_id``
-        attached, so /events subscribers (Library, Side panel) react in
-        real-time without per-job subscribe calls.
+        - Appends delta text to the stream replay buffer.
+        - Clears the buffer on terminal events (``done`` / ``error``).
+        - Mirrors to the global broker with ``job_id`` attached.
         """
-        # Iterate a snapshot so a concurrent unsubscribe doesn't mutate
-        # the dict mid-loop.
-        for q in list(self._subs.get(job_id, {}).values()):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                log.warning("broker: dropping event for slow subscriber on job %s", job_id)
+        event_type = event.get("type")
+        if event_type == "delta":
+            _stream_buffers[job_id] = _stream_buffers.get(job_id, "") + event.get("delta", "")
+        elif event_type in ("done", "error"):
+            _clear_stream_buffer(job_id)
+
         _event_broker.publish({**event, "job_id": job_id})
 
     def reset(self) -> None:
-        """Drop all subscriptions. Test helper."""
-        self._subs.clear()
+        """Test helper — clear replay buffers."""
+        _stream_buffers.clear()
 
 
 class EventBroker:
@@ -127,7 +128,7 @@ def get_event_broker() -> EventBroker:
 
 
 def reset_broker() -> None:
-    """Test helper — wipe all subscriptions."""
+    """Test helper — wipe all subscriptions and replay buffers."""
     _broker.reset()
     _event_broker.reset()
 
@@ -171,20 +172,3 @@ def job_event(action: str, job: dict[str, Any]) -> dict[str, Any]:
 def workers_event(state: dict[str, Any]) -> dict[str, Any]:
     """Workers control / queue snapshot — paused flag + queue counters."""
     return {"type": "workers", "state": state}
-
-
-def job_stage_event(job_id: str, stage: str, detail: str | None = None) -> dict[str, Any]:
-    """Wrap stage_event with job_id for the global stream."""
-    return {"type": "stage", "job_id": job_id, "stage": stage, "detail": detail}
-
-
-def job_delta_event(job_id: str, delta: str) -> dict[str, Any]:
-    return {"type": "delta", "job_id": job_id, "delta": delta}
-
-
-def job_done_event(job_id: str, content: str) -> dict[str, Any]:
-    return {"type": "done", "job_id": job_id, "content": content}
-
-
-def job_error_event(job_id: str, error: str) -> dict[str, Any]:
-    return {"type": "error", "job_id": job_id, "error": error}

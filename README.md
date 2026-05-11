@@ -28,8 +28,9 @@ whatever runner you like.
   preserved on the first two paths.
 - **Persistent chat per job.** Q&A history is stored in SQLite, survives tab
   switches and browser restarts.
-- **Pause/resume the Whisper queue** when you need the machine for foreground
-  work and don't want a 100-video backlog burning your CPU.
+- **Pause/resume all background ML** when you need the machine for foreground
+  work. The in-flight step finishes; the next step parks at a checkpoint
+  until you click Resume. Q&A stays responsive throughout.
 - **Auto retry of failed jobs** — keeps the cached audio file so the slow
   yt-dlp step is skipped on retry.
 - **No build step for the extension.** Vanilla JS + ES modules. Edit a file,
@@ -37,24 +38,44 @@ whatever runner you like.
 
 ## Quick start
 
-You need a running OpenAI-compatible LLM (and an OpenAI-compatible Whisper
-backend, if you want long YouTube transcription as a fallback). Three common
-setups:
+TLDR needs two OpenAI-compatible endpoints: one for the LLM (`llm.base_url`)
+and one for Whisper transcription (`whisper.base_url`). They can be the same
+server or different ones — configure them independently in `config/tldr.yaml`.
 
-| Backend | Where it runs | Install |
+### LLM backend (required)
+
+Any OpenAI-compatible server works. Popular choices:
+
+| Backend | Platform | LLM | Whisper | Notes |
+|---|---|---|---|---|
+| [**mlx-openai-server**](https://pypi.org/project/mlx-openai-server/) | macOS Apple Silicon | ✅ | ✅ | Fastest local; `task install:mlx` |
+| [**LM Studio**](https://lmstudio.ai/) | macOS / Windows | ✅ | ❌ | GUI; enable local server on port 1234 |
+| [**Ollama**](https://ollama.com/) | Any OS | ✅ | ❌ | `brew install ollama && ollama serve` |
+| [**llama-server**](https://github.com/ggml-org/llama.cpp) | Any OS | ✅ | ❌ | `brew install llama.cpp` |
+| vLLM, llama.cpp, openai-edge, … | Any OS | ✅ | ❌ | Any OpenAI-compat endpoint |
+
+### Whisper backend (optional — only for YouTube without captions)
+
+Required only when `youtube-transcript-api` and yt-dlp captions both fail.
+If you skip it, those videos will error instead of transcribing via Whisper.
+
+| Backend | Platform | Notes |
 |---|---|---|
-| [**Ollama**](https://ollama.com/) | Any OS, CPU/GPU | `brew install ollama && ollama pull qwen2.5:14b && ollama serve` |
-| [**LM Studio**](https://lmstudio.ai/) | macOS / Windows GUI | Download, load a model, enable the local server |
-| [**mlx-openai-server**](https://pypi.org/project/mlx-openai-server/) | macOS Apple Silicon (fastest local) | `task install:mlx` (this repo) |
+| **mlx-openai-server** | macOS Apple Silicon | Already included if you use it for LLM |
+| [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
 
-Pick one, then:
+### Install
 
 ```bash
 task install            # config + daemon image + extension vendor libs
-# Edit config/tldr.yaml so llm.base_url / whisper.base_url point at your backend
+# Edit config/tldr.yaml — set llm.base_url (and whisper.base_url if needed)
 task up                 # starts daemon (and mlx-server if you ran task install:mlx)
 task status             # health check
 ```
+
+If you use `task install:mlx`, the live mlx-server config lives at
+`~/.mlx-server/config.yaml` — outside this repo so you can share it with
+other tools. Edit that file, `task down && task up`, done.
 
 Load the extension once:
 
@@ -68,7 +89,7 @@ Load the extension once:
 task up          # start
 task down        # stop (sqlite volume preserved)
 task status      # health check
-task logs        # tail daemon logs (mlx logs are in data/logs/mlx.{out,err}.log)
+task logs        # tail daemon logs (mlx logs are in ~/.mlx-server/logs/server.{out,err}.log)
 task reset       # destructive: wipes the database volume (asks for confirmation)
 task test        # ruff + mypy + pytest inside the daemon container
 ```
@@ -77,16 +98,26 @@ task test        # ruff + mypy + pytest inside the daemon container
 
 `config/tldr.yaml` (created from `tldr.yaml.example` on `task install`) holds
 the backend URLs, output language, retry behaviour, retention window, and
-concurrency caps. Highlights:
+concurrency caps.
+
+`llm.base_url` and `whisper.base_url` are **independent** — point them at the
+same server or different ones:
 
 ```yaml
+# Example: LM Studio for LLM, mlx-server for Whisper
 llm:
-  base_url: http://host.docker.internal:11434/v1   # Ollama on host
-  model: qwen2.5:14b
-  max_concurrent_calls: 1                          # 1 keeps a single Mac responsive
+  base_url: http://host.docker.internal:1234/v1    # LM Studio
+  model: google/gemma-4-e4b                        # model ID shown by LM Studio
+  context_length: 131072                           # must match what the backend loaded
+  single_pass_token_limit: 80000                   # ~60% of context_length
+  max_concurrent_calls: 1
+
+whisper:
+  base_url: http://host.docker.internal:18000/v1   # mlx-openai-server
+  model: whisper
 
 output:
-  language: en                                     # ISO 639-1; or any free-form name the LLM understands
+  language: en                                     # ISO 639-1 or full name
 
 youtube:
   subtitle_lang_preferences: ["en", "ru"]
@@ -95,8 +126,15 @@ storage:
   retention_days: 365                              # 0 disables auto-cleanup
 ```
 
-The `tldr.yaml.example` file in the repo has commented-out blocks for Ollama,
-LM Studio, and mlx-openai-server — copy whichever applies.
+**`context_length` must match what the backend actually loaded** — a mismatch
+causes "n_keep >= n_ctx" errors. Check with `lms ps` (LM Studio) or look at
+the `context_length` field in `~/.mlx-server/config.yaml` (mlx-server).
+`single_pass_token_limit` caps the input before map-reduce kicks in; keep it
+at ~60–70% of `context_length` to leave room for the system prompt and output.
+
+`tldr.yaml.example` has ready-made blocks for each backend combination:
+mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama+mlx,
+llama-server+whisper.cpp, and LLM-only (no Whisper).
 
 To free the machine for foreground work, click the **Pause processing**
 button in the Library page (top-right). It pauses everything: the Whisper
@@ -127,7 +165,7 @@ worker waits that many seconds between consecutive jobs.
 │  │  Async POST /jobs → background pipeline                  │ │
 │  │  Per-job event broker fans out stage / delta / done      │ │
 │  │  /ai/stream — single SSE endpoint for summary + Q&A      │ │
-│  │  Whisper queue with pause/resume                         │ │
+│  │  Pausable Whisper queue + all background ML steps        │ │
 │  │  Retry endpoint reuses cached audio                      │ │
 │  │  yt-dlp + auto-captions + Whisper fallback chain         │ │
 │  │  SQLite in named volume `tldr-data`                      │ │
@@ -161,8 +199,8 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
 │   ├── install.sh                # core install (config + daemon image + vendor libs)
 │   └── mlx.sh                    # optional Apple Silicon backend: install + start/stop/status
 ├── config/
-│   ├── mlx-server.yaml.example   # only used with --mlx
-│   └── tldr.yaml.example
+│   ├── mlx-server.yaml.example   # template; on `task install:mlx` copied to ~/.mlx-server/config.yaml
+│   └── tldr.yaml.example         # template; on `task install` copied to config/tldr.yaml
 ├── docs/
 │   └── logo-banner.svg
 ├── daemon/                       # FastAPI service in Docker
@@ -182,8 +220,8 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
   works — the container is `python:3.11-slim`. No host Python needed.
 - **A backend**: see Quick start. Anything OpenAI-compatible works.
 - **Chrome 116+** (Manifest V3 side panel).
-- **Apple Silicon, optional**: only if you want the bundled mlx setup. ~10 GB
-  disk for Qwen 14B + Whisper large-v3 weights, ~10 GB peak RAM with both
+- **Apple Silicon, optional**: only if you want the bundled mlx setup. ~6 GB
+  disk for Qwen3 4B + Whisper large-v3 weights, ~5 GB peak RAM with both
   models loaded.
 
 ## License
