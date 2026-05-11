@@ -42,21 +42,35 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _PROMPT_OVERHEAD_TOKENS = 4000
 
 # Tool definition sent to the LLM on every QA call.
+#
+# Wording matters for small models (Gemma 4 E4B in particular). Be explicit
+# about WHEN to call: the model will not invoke this unless triggers are
+# spelled out concretely. "Search the web" alone is too generic — list the
+# user intents (latest/news/today/find/check/source) that should fire it.
 _WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "web_search",
         "description": (
-            "Search the web for current information not covered in the provided material. "
-            "Use this when the user explicitly asks to search the internet, or when the "
-            "material clearly does not contain what they need."
+            "Search the web via DuckDuckGo. Call this tool whenever the answer "
+            "to the user's question is not plainly stated in the material that "
+            "was provided to you. This is the default fallback — do NOT respond "
+            "with 'the material does not contain that' without first trying a "
+            "web_search. Also call this tool for any current/recent information "
+            "(news, prices, weather, releases, status) and whenever the user "
+            "asks to search, look up, find, google, or check something. The "
+            "ONLY time to skip the tool is when the answer is already clearly "
+            "in the provided material."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Concise search query in the user's language",
+                    "description": (
+                        "Concise search query in the user's language. "
+                        "Include the topic from the material if it adds context."
+                    ),
                 },
             },
             "required": ["query"],

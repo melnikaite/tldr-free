@@ -231,13 +231,20 @@ async function syncSidepanelForTab(tab) {
 
   const normalized = normalizeUrl(url);
 
+  // Notify the side panel immediately so it can abort any in-flight stream
+  // before the listJobs round-trip completes.  Without this, a `done` SSE
+  // event arriving while listJobs is running renders stale content for the
+  // previous tab.
+  await broadcast({ type: "tab-switching" });
+
   let jobId = null;
   try {
     const resp = await daemon.listJobs({ url: normalized, limit: 1 });
     jobId = resp.items?.[0]?.id ?? null;
   } catch (err) {
     console.warn("[TLDR] tab sync listJobs failed", err);
-    return;
+    // Fall through with jobId = null — tab-changed is always sent so the
+    // panel stays in sync even when the daemon is temporarily unreachable.
   }
 
   await chrome.storage.session.set({ activeJobId: jobId, activeUrl: normalized });

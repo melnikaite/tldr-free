@@ -167,6 +167,39 @@ cmd_install() {
     skip "model download skipped (--skip-models). They'll be fetched on first request."
   fi
 
+  hdr "Install LaunchAgent (auto-start mlx-server on login)"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist="$plist_dir/com.tldr.mlx-server.plist"
+  mkdir -p "$plist_dir"
+  if [ -f "$plist" ]; then
+    skip "LaunchAgent already exists ($plist)"
+  else
+    cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tldr.mlx-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$REPO_ROOT/scripts/mlx.sh</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/launchagent.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/launchagent.log</string>
+</dict>
+</plist>
+PLIST
+    launchctl load "$plist"
+    ok "LaunchAgent installed and loaded ($plist)"
+  fi
+
   echo
   ok "MLX install complete. Next: 'task up' to start the daemon + mlx-server."
 }
@@ -177,9 +210,18 @@ cmd_install() {
 
 cmd_start() {
   mkdir -p "$LOG_DIR"
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    skip "mlx-server already running (PID=$(cat "$PID_FILE"))"
-    return 0
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid=$(cat "$PID_FILE")
+    # kill -0 only checks that a process with this PID exists — after a reboot
+    # the PID can be reused by an unrelated process.  Verify it is actually
+    # our mlx-openai-server before trusting the PID file.
+    if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o args= 2>/dev/null | grep -q "mlx-openai-server"; then
+      skip "mlx-server already running (PID=$pid)"
+      return 0
+    fi
+    # Stale PID (process gone or reused) — remove it and start fresh.
+    rm -f "$PID_FILE"
   fi
   if [ ! -x "$BIN" ]; then
     err "mlx-openai-server not found at $BIN. Run 'task install:mlx' or point config/tldr.yaml at another OpenAI-compatible backend."
