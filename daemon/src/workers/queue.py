@@ -122,14 +122,24 @@ async def re_enqueue_pending(queue: WhisperQueue, repo_module: object) -> int:
             await queue.put(WhisperTask(job_id=job_id, url=url, cookies=[]))
             n += 1
         else:
-            # A page job left in queued/running can't be resumed (no audio,
-            # the request body is gone). Mark failed so the row reflects reality.
+            # Page and media jobs left in queued/running can't be resumed —
+            # page has no audio + the request body is gone; media doesn't
+            # persist its extracted media_url anywhere (it lives only in
+            # the WhisperTask we're trying to recover from). Mark failed so
+            # the row reflects reality and the user can resubmit from the
+            # extension.
             mark_failed = getattr(repo_module, "mark_failed", None)
             if mark_failed is not None:
+                reason = (
+                    "daemon restarted mid-stream; media url not persisted, "
+                    "please re-summarize from the extension"
+                    if kind == "media"
+                    else "daemon restarted; page job not resumable"
+                )
                 try:
-                    mark_failed(job_id, error="daemon restarted; page job not resumable")
+                    mark_failed(job_id, error=reason)
                 except Exception:
-                    log.exception("failed to mark stale page job %s as failed", job_id)
+                    log.exception("failed to mark stale %s job %s as failed", kind, job_id)
     if n:
         log.info("queue: re-enqueued %d pending youtube job(s) on startup", n)
     return n

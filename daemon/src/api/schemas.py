@@ -24,6 +24,12 @@ from pydantic import BaseModel
 class JobKind(StrEnum):
     PAGE = "page"
     YOUTUBE = "youtube"
+    # Generic media URL: anything yt-dlp can extract — direct mp4/webm,
+    # HLS (.m3u8), DASH (.mpd), iframe embeds (Vimeo, Dailymotion, Twitch
+    # VOD, Bunny, Brightcove, JW Player, Wistia, Streamable, SoundCloud,
+    # Spotify, …). Distinguished from YOUTUBE because there's no
+    # subtitle/captions fast path — everything goes straight to Whisper.
+    MEDIA = "media"
 
 
 class JobStatus(StrEnum):
@@ -71,9 +77,16 @@ class Cookie(BaseModel):
 
 class JobCreateRequest(BaseModel):
     url: str
-    kind: Literal["page", "youtube", "auto"] = "auto"
+    kind: Literal["page", "youtube", "media", "auto"] = "auto"
     page_text: str | None = None     # extension-extracted clean text (Readability)
     page_title: str | None = None
+    # Direct media stream URL discovered by the extension on the page (a
+    # <video src=…>, <audio src=…>, or known iframe embed). yt-dlp's
+    # generic + site-specific extractors handle it. When present, the
+    # daemon prefers ``JobKind.MEDIA`` regardless of host. ``url`` stays
+    # the human-visible page URL — used for library dedup, display, and
+    # the "open source" link.
+    media_url: str | None = None
     cookies: list[Cookie] | None = None
 
 

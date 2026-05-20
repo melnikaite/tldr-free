@@ -97,6 +97,7 @@ async def run_pipeline(
     url: str,
     page_text: str | None,
     page_title: str | None,
+    media_url: str | None,
     cookies: list[Any],
 ) -> None:
     """Top-level pipeline runner. Decides the path based on kind + extraction.
@@ -108,6 +109,20 @@ async def run_pipeline(
     try:
         if kind == JobKind.PAGE:
             await _run_page(job_id, url=url, page_text=page_text, page_title=page_title)
+        elif kind == JobKind.MEDIA:
+            if not media_url:
+                # Defensive: api/jobs validates this upstream, but the
+                # invariant lives here too so callers don't accidentally
+                # call us with kind=MEDIA + no URL and get a silent hang.
+                repo.mark_failed(job_id, error="media kind requires media_url")
+                broker.publish(job_id, error_event("media kind requires media_url"))
+                return
+            await _run_media(
+                job_id,
+                media_url=media_url,
+                page_title=page_title,
+                cookies=cookies,
+            )
         else:
             await _run_youtube(job_id, url=url, page_title=page_title, cookies=cookies)
     except Exception as exc:
@@ -311,6 +326,44 @@ async def _run_youtube(
 
 
 # ---------------------------------------------------------------------------
+# Generic media path (non-YouTube): direct mp4/webm, HLS/DASH, iframe embeds
+# Vimeo/Dailymotion/Twitch/Bunny/Brightcove/JW/Wistia/Streamable/SoundCloud/…
+#
+# No subtitle fast path (most non-YouTube sites don't expose machine-readable
+# captions). Drop straight onto the Whisper queue, which already handles
+# yt-dlp audio download → transcribe → summarize for any URL yt-dlp can
+# extract from. The runner is URL-agnostic — ``WhisperTask.url`` becomes the
+# argument to ``youtube.download_audio`` regardless of the original kind.
+# ---------------------------------------------------------------------------
+
+
+async def _run_media(
+    job_id: str,
+    *,
+    media_url: str,
+    page_title: str | None,  # noqa: ARG001  — title is read from the DB row by the worker
+    cookies: list[Any],
+) -> None:
+    broker = get_broker()
+    try:
+        await get_queue().put(
+            WhisperTask(job_id=job_id, url=media_url, cookies=cookies)
+        )
+    except Exception as exc:
+        log.exception("failed to enqueue media job %s", job_id)
+        repo.mark_failed(job_id, error=f"queue error: {exc}")
+        broker.publish(job_id, error_event(f"queue error: {exc}"))
+        return
+
+    repo.update_status(
+        job_id,
+        status=JobStatus.QUEUED.value,
+        progress_stage="queued",
+    )
+    broker.publish(job_id, stage_event("queued"))
+
+
+# ---------------------------------------------------------------------------
 # Shared: persist raw_text (mid-pipeline), summarize, mark done
 # ---------------------------------------------------------------------------
 
@@ -454,10 +507,22 @@ _YOUTUBE_HOSTS = {
 }
 
 
-def infer_kind(url: str, declared: str) -> JobKind:
-    """Map ``kind="auto"`` to the concrete enum based on the URL host."""
-    if declared in (JobKind.PAGE.value, JobKind.YOUTUBE.value):
+def infer_kind(url: str, declared: str, media_url: str | None = None) -> JobKind:
+    """Map ``kind="auto"`` to the concrete enum based on the URL host.
+
+    Resolution order for ``declared == "auto"``:
+      1. ``media_url`` set → ``MEDIA`` (extension found a transcribable
+         media element on the page; takes priority over host inference so
+         a YouTube *embed* on a third-party site still flows through the
+         generic media path with the iframe URL, not through the YouTube
+         fast path on the page URL).
+      2. URL host in ``_YOUTUBE_HOSTS`` → ``YOUTUBE``.
+      3. Otherwise → ``PAGE``.
+    """
+    if declared in (JobKind.PAGE.value, JobKind.YOUTUBE.value, JobKind.MEDIA.value):
         return JobKind(declared)
+    if media_url:
+        return JobKind.MEDIA
     host = (urlparse(url).hostname or "").lower()
     if host in _YOUTUBE_HOSTS:
         return JobKind.YOUTUBE

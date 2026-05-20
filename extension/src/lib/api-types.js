@@ -9,7 +9,7 @@
 // Enums (string literal unions in JSDoc-land)
 // ---------------------------------------------------------------------------
 
-/** @typedef {"page" | "youtube"} JobKind */
+/** @typedef {"page" | "youtube" | "media"} JobKind */
 
 /** @typedef {"queued" | "running" | "done" | "failed"} JobStatus */
 
@@ -37,9 +37,10 @@
 /**
  * @typedef {object} JobCreateRequest
  * @property {string} url
- * @property {"page" | "youtube" | "auto"} kind
+ * @property {"page" | "youtube" | "media" | "auto"} kind
  * @property {string | null} [page_text]
  * @property {string | null} [page_title]
+ * @property {string | null} [media_url]   - direct media URL (yt-dlp-extractable). Sets kind=media when present under auto.
  * @property {Cookie[] | null} [cookies]
  */
 

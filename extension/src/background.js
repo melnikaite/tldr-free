@@ -5,7 +5,7 @@
 // open (see sidepanel/app.js); when the panel is closed nobody needs to know.
 
 import { daemon } from "./lib/daemon-client.js";
-import { getCookiesForDomain } from "./lib/cookies.js";
+import { getCookiesForDomain, getCookiesForUrl } from "./lib/cookies.js";
 import { normalizeUrl } from "./lib/url.js";
 import { stringifyError } from "./lib/utils.js";
 
@@ -93,6 +93,12 @@ chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
     );
     return false;
   }
+  if (msg.type === "extracted-media") {
+    handleExtractedMedia(msg, sourceTabId).catch((e) =>
+      console.error("[TLDR] handleExtractedMedia", e),
+    );
+    return false;
+  }
   if (msg.type === "summarize-active-tab") {
     handleSummarizeActiveTab().catch((e) =>
       console.error("[TLDR] summarize-active-tab", e),
@@ -121,6 +127,40 @@ async function handleExtractedPage(msg, sourceTabId) {
     kind: "page",
     page_text: msg.text || "",
     page_title: msg.title || null,
+  };
+  await submitJob(req, sourceTabId);
+}
+
+/**
+ * Generic media discovered on a non-YouTube page (native <video>/<audio>
+ * with a real URL, or an iframe embed from a known media host). The daemon
+ * routes this to ``kind=media`` and feeds ``mediaUrl`` straight to yt-dlp,
+ * which has site-specific extractors for hundreds of hosts plus a generic
+ * fallback for direct mp4/HLS/DASH links.
+ *
+ * Cookies: we forward exactly the cookies a real HTTP request to
+ * ``mediaUrl`` would carry (URL-scoped, via chrome.cookies.getAll({url})).
+ * That covers session cookies for player auth, CDN signing tokens, etc.,
+ * without leaking unrelated cookies from sibling subdomains.
+ *
+ * @param {{url:string, mediaUrl:string, title?:string|null}} msg
+ * @param {number|null} sourceTabId
+ */
+async function handleExtractedMedia(msg, sourceTabId) {
+  let cookies = [];
+  try {
+    cookies = await getCookiesForUrl(msg.mediaUrl);
+  } catch (err) {
+    console.warn("[TLDR] cookies.getAll(url) failed", err);
+  }
+
+  /** @type {JobCreateRequest} */
+  const req = {
+    url: normalizeUrl(msg.url),
+    kind: "media",
+    media_url: msg.mediaUrl,
+    page_title: msg.title || null,
+    cookies,
   };
   await submitJob(req, sourceTabId);
 }

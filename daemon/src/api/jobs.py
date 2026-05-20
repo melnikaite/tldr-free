@@ -183,11 +183,15 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
                 )
                 return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
 
-        kind = pipeline.infer_kind(req.url, req.kind)
+        kind = pipeline.infer_kind(req.url, req.kind, req.media_url)
 
         # For YouTube the extension's scraped title is unreliable (SPA, fast
         # tab switching), so seed with the video id. The pipeline overwrites
         # it with yt-dlp's canonical title within a couple of seconds.
+        # For MEDIA we trust the extension's scrape — yt-dlp on arbitrary
+        # media URLs doesn't reliably surface a human title (the URL might
+        # be a CDN .mp4), and the extension's og:title / h1 / document.title
+        # is the best signal we have.
         initial_title = req.page_title
         if kind == JobKind.YOUTUBE:
             with contextlib.suppress(ValueError):
@@ -212,6 +216,7 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             url=req.url,
             page_text=req.page_text,
             page_title=req.page_title,
+            media_url=req.media_url,
             cookies=list(req.cookies or []),
         )
     )
@@ -293,6 +298,18 @@ async def retry_job(job_id: str) -> JSONResponse:
         )
 
     kind = JobKind(job.kind)
+    # MEDIA jobs can't be retried server-side: the media_url discovered on
+    # the page lives only on the extension side (and can be a signed/expiring
+    # CDN URL). Tell the caller explicitly so the UI can prompt the user to
+    # re-summarize from the extension tab where the URL is fresh.
+    if kind == JobKind.MEDIA:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "media jobs cannot be retried from the daemon — the media URL is "
+            "discovered per-page and may be signed/expiring. Open the source "
+            "tab and click Summarize again.",
+        )
+
     # repo.reset_for_retry emits job_event("updated") so the Library refreshes.
     repo.reset_for_retry(job_id)
 
@@ -303,6 +320,7 @@ async def retry_job(job_id: str) -> JSONResponse:
             url=job.url,
             page_text=None,        # extension may no longer be on this page; trafilatura will refetch
             page_title=job.title,
+            media_url=None,        # not persisted; media retry path was rejected above
             cookies=[],            # cookies aren't persisted on the job row
         )
     )
