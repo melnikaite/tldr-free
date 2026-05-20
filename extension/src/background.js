@@ -223,7 +223,23 @@ const lastSyncedUrlByTab = new Map();
 // completion of an older listJobs gets discarded both here (we skip the
 // final broadcast if `version !== switchVersion`) and on the receiver
 // side (it ignores messages with stale `version`).
+//
+// Versions are wall-clock (Date.now) floored to strict-monotonic, NOT a
+// plain in-memory counter, so the version space survives service-worker
+// restarts. MV3 routinely tears down idle backgrounds after ~30s; a fresh
+// 0-reset counter would then issue versions smaller than the side panel's
+// remembered `lastTabVersion`, and the receiver would silently drop every
+// `set-active-tab` until the panel itself reloaded — most visibly: switch
+// tabs after a quiet period and the panel keeps showing the previous job.
+// `Math.max(prev + 1, Date.now())` guarantees the new value is strictly
+// larger than both the local counter and any version any previous worker
+// ever issued (assuming a sane clock).
 let switchVersion = 0;
+
+function nextSwitchVersion() {
+  switchVersion = Math.max(switchVersion + 1, Date.now());
+  return switchVersion;
+}
 
 /** @param {chrome.tabs.Tab} tab */
 async function syncSidepanelForTab(tab) {
@@ -237,7 +253,7 @@ async function syncSidepanelForTab(tab) {
   if (!/^https?:/i.test(url)) return;
 
   const normalized = normalizeUrl(url);
-  const version = ++switchVersion;
+  const version = nextSwitchVersion();
 
   // Phase 1: tell the panel which tab we're moving to *before* hitting the
   // daemon. jobId is omitted to mean "still resolving". The panel uses this

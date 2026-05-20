@@ -338,15 +338,108 @@ async function handleSetActiveTab(msg) {
   }
 
   if (active && active.id === jobId) {
-    // Same job — restore from in-memory. If renderState is already showing
-    // the right thing, its idempotency check turns this into a no-op (so
-    // window focus restored on the same tab doesn't flicker). If the DOM
-    // was blanked to loading in phase 1, this transition replaces it.
+    // Same job — render from in-memory. renderState idempotency keeps this
+    // a no-op when nothing changed (window focus restored on the same tab
+    // shouldn't flicker), and replaces a loading skeleton from phase 1.
+    //
+    // BUT: the cache can be stale in two ways — non-terminal status, or
+    // terminal status with a missing payload (see `isCacheStale` for why).
+    // Fall back to the cached view if the refresh fails.
+    if (isCacheStale(active)) {
+      const refreshed = await refreshActiveJob();
+      if (refreshed) return;
+    }
     renderFromJob(active);
     return;
   }
   await loadAndRender(jobId);
 }
+
+/**
+ * Whether the cached active-job representation is too stale to render off
+ * directly — caller should refresh from the daemon before rendering.
+ *
+ * Two cases count as stale:
+ *
+ * 1. **Non-terminal status.** The daemon may have advanced past the
+ *    cached stage while the side panel was paused (window minimised
+ *    throttles SSE), so the cache could under-report progress.
+ *
+ * 2. **Terminal status with missing payload.** This happens when
+ *    `patchActiveJobIfMatches` receives a `job_event` (a lightweight
+ *    JobSummary that has `status="done"` but no `summary_md`) and the
+ *    per-job SSE "done" frame that *does* carry the content is dropped —
+ *    typically because the side panel was throttled mid-stream by a
+ *    window minimise. `renderFromJob` then sees `status="done" &&
+ *    !summary_md` and falls through to the streaming placeholder,
+ *    re-rendering the "Queued for transcription" view over a job that
+ *    actually finished hours ago.
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null | undefined} j
+ */
+function isCacheStale(j) {
+  if (!j) return false;
+  if (j.status !== "done" && j.status !== "failed") return true;
+  if (j.status === "done" && !j.summary_md) return true;
+  if (j.status === "failed" && !j.error) return true;
+  return false;
+}
+
+/**
+ * Re-fetch the currently-shown job from the daemon and re-render via
+ * `renderFromJob`. Returns false if there's no active job or the fetch
+ * failed (caller is responsible for any fallback).
+ *
+ * Why this exists: the side panel subscribes to GET /events for live
+ * streaming state, but events that fire while the panel is throttled
+ * (most commonly: window minimised → Chrome pauses SSE → /events "done"
+ * arrives into a stalled fetch reader) are lost — EventSource has no
+ * server-side replay. Without an explicit refresh, a streaming job
+ * that finished during the pause is stuck on "queued"/"running" forever
+ * even though the daemon long since wrote summary_md.
+ *
+ * Idempotent: `renderState` short-circuits when nothing changed, so
+ * calling this when the job really is still streaming costs one HTTP
+ * round-trip and zero DOM mutations.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function refreshActiveJob() {
+  const active = await getActiveJob();
+  if (!active) return false;
+  try {
+    const fresh = await daemon.getJob(active.id, { signal: AbortSignal.timeout(8000) });
+    setActiveJob(fresh);
+    renderFromJob(fresh);
+    return true;
+  } catch (err) {
+    console.warn("[TLDR] refresh active job failed", err);
+    return false;
+  }
+}
+
+// When the side panel becomes visible again (window restored from minimise,
+// most often), any /events messages that landed during the pause are gone —
+// the daemon only ever pushes live, no server-side replay. Two things may
+// have gone stale:
+//   1. The currently-shown job — could be stuck on "queued"/"running" even
+//      though it actually finished while we were away.
+//   2. The processing badge counter — could over-count if "done" events for
+//      OTHER jobs were lost during the pause.
+// Refresh both. Terminal cached state never changes so the refresh is
+// skipped there for free.
+//
+// Independent from background.js's tab-sync because that path early-returns
+// for non-summarizable tabs (Library, chrome://, …), so a user staring at
+// Library when they un-minimise gets no `set-active-tab` and would
+// otherwise stay stuck on the cached streaming view.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  seedBadge().catch(() => {});
+  getActiveJob().then((j) => {
+    if (isCacheStale(j)) refreshActiveJob();
+  });
+});
 
 /**
  * Pick the right renderState mode based on a job's current status.
@@ -619,11 +712,30 @@ function _attachStreamSubscription(job) {
       cancelRender();
       streamAccCache.delete(job.id);
       const content = ev.content || acc;
+      // Persist summary_md into the in-memory active-job cache: a later
+      // renderFromJob(active) (window restore, tab switch back) would
+      // otherwise see status="done" with summary_md=null (the daemon's
+      // job_event publishes JobSummary without summary_md) and fall
+      // through to the streaming placeholder. Merge into the *current*
+      // active so mid-stream patches (yt-dlp title, etc.) aren't lost.
+      getActiveJob().then((cur) => {
+        if (cur?.id === job.id) {
+          setActiveJob({ ...cur, status: "done", summary_md: content });
+        }
+      });
       renderState({ mode: "done", job, content });
     } else if (ev.type === "error") {
       cancelRender();
       streamAccCache.delete(job.id);
-      renderState({ mode: "error", message: ev.error || "Error", job });
+      const error = ev.error || "Error";
+      // Same reasoning as the "done" branch — mirror status/error into the
+      // cache so the failed-state render branch is taken on later renders.
+      getActiveJob().then((cur) => {
+        if (cur?.id === job.id) {
+          setActiveJob({ ...cur, status: "failed", error });
+        }
+      });
+      renderState({ mode: "error", message: error, job });
     }
   });
 }

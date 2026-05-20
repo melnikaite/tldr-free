@@ -153,7 +153,7 @@ cmd_install() {
   if [ "$download_models" = 1 ]; then
     hdr "Download Gemma 4 E4B + Whisper weights (~6 GB, may take 5–20 min)"
     "$VENV/bin/pip" install --quiet huggingface-hub
-    for repo in mlx-community/gemma-4-e4b-it-4bit mlx-community/whisper-large-v3-mlx-4bit; do
+    for repo in mlx-community/gemma-4-e4b-it-4bit mlx-community/whisper-large-v3-turbo; do
       local cache_dir="$HOME/.cache/huggingface/hub/models--${repo//\//--}"
       if [ -d "$cache_dir/blobs" ] && [ "$(du -sm "$cache_dir/blobs" 2>/dev/null | awk '{print $1}')" -gt 1 ]; then
         skip "$repo already cached"
