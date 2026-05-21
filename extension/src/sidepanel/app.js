@@ -174,6 +174,45 @@ summaryEl.addEventListener("click", (ev) => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Generic external-link handler — catches every `<a href>` anywhere in the
+// side panel that isn't a timecode marker or the job-title link (those have
+// their own handlers above with custom focus/seek logic).
+//
+// Why this exists: links produced by `marked` (both in the summary body and
+// in assistant chat bubbles) have no `target` attribute, and Chrome side
+// panels can't navigate top-level, so a plain anchor click is a silent no-op
+// in the side panel iframe. We translate every click into
+// `chrome.tabs.create()` so external URLs reliably open in a new browser tab.
+//
+// Attached to ``document.body`` so the handler covers BOTH ``#summary`` and
+// ``#chat-messages`` — markdown rendering happens in both surfaces.
+//
+// Skips ``javascript:``, ``#``-only, and empty hrefs — those are not
+// external navigation and shouldn't be hijacked.
+// ---------------------------------------------------------------------------
+
+document.body.addEventListener("click", (ev) => {
+  const target = /** @type {HTMLElement} */ (ev.target);
+  const a = /** @type {HTMLAnchorElement | null} */ (target.closest("a[href]"));
+  if (!a) return;
+  // Skip anchors that the timecode / title handlers already own.
+  if (a.dataset.tldrSeconds !== undefined) return;
+  if (a.closest(".job-title")) return;
+  // Honour modifier keys / non-left clicks — browser default already DTRT.
+  if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+
+  const raw = a.getAttribute("href") || "";
+  // In-page anchors and javascript: shouldn't open a new tab.
+  if (!raw || raw.startsWith("#") || raw.startsWith("javascript:")) return;
+  const href = a.href;  // resolved absolute URL
+  if (!href) return;
+  ev.preventDefault();
+  chrome.tabs.create({ url: href }).catch((err) =>
+    console.warn("[TLDR] external link open failed:", err),
+  );
+});
+
 /**
  * Focus an existing tab already showing ``url``, or open a new tab.
  *
