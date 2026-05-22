@@ -12,6 +12,8 @@ the job (FK cascade drops the messages with it).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import logging
 from datetime import datetime
@@ -183,7 +185,21 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
                 )
                 return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
 
-        kind = pipeline.infer_kind(req.url, req.kind, req.media_url)
+        # Decode the optional PDF payload up front so we can fail fast on
+        # bad base64 rather than crashing the pipeline coroutine later.
+        pdf_bytes: bytes | None = None
+        if req.pdf_bytes_b64:
+            try:
+                pdf_bytes = base64.b64decode(req.pdf_bytes_b64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"pdf_bytes_b64 is not valid base64: {exc}",
+                ) from exc
+
+        kind = pipeline.infer_kind(
+            req.url, req.kind, req.media_url, pdf_bytes_present=pdf_bytes is not None,
+        )
 
         # For YouTube the extension's scraped title is unreliable (SPA, fast
         # tab switching), so seed with the video id. The pipeline overwrites
@@ -217,6 +233,7 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             page_text=req.page_text,
             page_title=req.page_title,
             media_url=req.media_url,
+            pdf_bytes=pdf_bytes,
             cookies=list(req.cookies or []),
         )
     )
@@ -309,6 +326,16 @@ async def retry_job(job_id: str) -> JSONResponse:
             "discovered per-page and may be signed/expiring. Open the source "
             "tab and click Summarize again.",
         )
+    # PDF jobs from ``file://`` URLs had their bytes shipped in the original
+    # POST and we don't persist them. http(s) PDFs retry fine because the
+    # daemon refetches the URL itself.
+    if kind == JobKind.PDF and job.url.startswith("file://"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "local (file://) PDF jobs cannot be retried from the daemon — the "
+            "uploaded bytes aren't persisted. Open the PDF tab and click "
+            "Summarize again.",
+        )
 
     # repo.reset_for_retry emits job_event("updated") so the Library refreshes.
     repo.reset_for_retry(job_id)
@@ -321,6 +348,7 @@ async def retry_job(job_id: str) -> JSONResponse:
             page_text=None,        # extension may no longer be on this page; trafilatura will refetch
             page_title=job.title,
             media_url=None,        # not persisted; media retry path was rejected above
+            pdf_bytes=None,        # not persisted; file:// retry was rejected above
             cookies=[],            # cookies aren't persisted on the job row
         )
     )

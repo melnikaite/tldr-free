@@ -26,6 +26,9 @@ whatever runner you like.
 - **Two paths for YouTube transcripts.** First the official transcript API,
   then yt-dlp's auto-captions, then Whisper as a last resort. Timecodes
   preserved on the first two paths.
+- **PDFs work too.** http(s) or local `file://` PDFs are parsed in the
+  side panel via pdf.js and summarised like any other page. (Image-only
+  scans need OCR first — not built in.)
 - **Persistent chat per job.** Q&A history is stored in SQLite, survives tab
   switches and browser restarts.
 - **Pause/resume all background ML** when you need the machine for foreground
@@ -195,10 +198,9 @@ worker waits that many seconds between consecutive jobs.
         └───────────────────────────────────────────┘
 ```
 
-More detail in [`.claude/architecture.md`](.claude/architecture.md). For
-contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
-[`.claude/extension.md`](.claude/extension.md) and
-[`.claude/conventions.md`](.claude/conventions.md).
+More detail in [`.claude/architecture.md`](.claude/architecture.md), plus
+topic-specific docs under [`.claude/`](.claude/) — see
+[`CLAUDE.md`](CLAUDE.md) for the full map.
 
 ## Repository layout
 
@@ -206,7 +208,7 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
 .
 ├── README.md
 ├── CLAUDE.md                     # orientation for code agents (links to .claude/*.md)
-├── .claude/                      # architecture / daemon / extension / conventions
+├── .claude/                      # topic-named contributor docs (see CLAUDE.md for the map)
 ├── Taskfile.yml                  # all dev commands
 ├── docker-compose.yml
 ├── scripts/

@@ -40,6 +40,7 @@ from src.config import get_config
 from src.llm import summary as llm_summary
 from src.storage import repo
 from src.workers import page, timecodes, youtube
+from src.workers import pdf as pdf_worker
 from src.workers.broker import (
     delta_event,
     done_event,
@@ -98,6 +99,7 @@ async def run_pipeline(
     page_text: str | None,
     page_title: str | None,
     media_url: str | None,
+    pdf_bytes: bytes | None,
     cookies: list[Any],
 ) -> None:
     """Top-level pipeline runner. Decides the path based on kind + extraction.
@@ -120,6 +122,14 @@ async def run_pipeline(
             await _run_media(
                 job_id,
                 media_url=media_url,
+                page_title=page_title,
+                cookies=cookies,
+            )
+        elif kind == JobKind.PDF:
+            await _run_pdf(
+                job_id,
+                url=url,
+                pdf_bytes=pdf_bytes,
                 page_title=page_title,
                 cookies=cookies,
             )
@@ -364,6 +374,72 @@ async def _run_media(
 
 
 # ---------------------------------------------------------------------------
+# PDF path — text via pypdf (fast path), vision OCR fallback for scanned PDFs
+# ---------------------------------------------------------------------------
+
+
+async def _run_pdf(
+    job_id: str,
+    *,
+    url: str,
+    pdf_bytes: bytes | None,
+    page_title: str | None,
+    cookies: list[Any],
+) -> None:
+    broker = get_broker()
+    cfg = get_config()
+
+    repo.update_status(job_id, status=JobStatus.RUNNING.value, progress_stage="extracting")
+    broker.publish(job_id, stage_event("extracting"))
+
+    await _checkpoint_pause(job_id, broker, "extracting")
+
+    try:
+        text, transcript_source = await pdf_worker.process_pdf(
+            job_id=job_id, url=url, pdf_bytes=pdf_bytes, cookies=cookies,
+        )
+    except Exception as exc:
+        log.exception("pdf extraction failed for %s", job_id)
+        repo.mark_failed(job_id, error=f"pdf extraction failed: {exc}")
+        broker.publish(job_id, error_event(f"pdf extraction failed: {exc}"))
+        return
+    finally:
+        # Release the raw PDF bytes (tens of MB for big files) before the
+        # LLM summary step starts — extraction is the only step that needs
+        # them. Without this, a 30 MB PDF stays resident through minutes
+        # of streaming summary, multiplied by every concurrent job.
+        pdf_bytes = None
+
+    text = text.strip()
+    if not text:
+        repo.mark_failed(
+            job_id,
+            error="pdf produced no extractable text (try OCRing it first)",
+        )
+        broker.publish(job_id, error_event("pdf produced no extractable text"))
+        return
+
+    await _checkpoint_pause(job_id, broker, "extracting")
+
+    _persist_extracted(
+        job_id,
+        raw_text=text,
+        title=page_title,
+        transcript_source=transcript_source,
+    )
+    broker.publish(job_id, stage_event("ready"))
+
+    await _summarize_and_finish(
+        job_id,
+        text=text,
+        title=page_title,
+        transcript_source=transcript_source,
+        video_id=None,
+        cfg=cfg,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared: persist raw_text (mid-pipeline), summarize, mark done
 # ---------------------------------------------------------------------------
 
@@ -507,8 +583,14 @@ _YOUTUBE_HOSTS = {
 }
 
 
-def infer_kind(url: str, declared: str, media_url: str | None = None) -> JobKind:
-    """Map ``kind="auto"`` to the concrete enum based on the URL host.
+def infer_kind(
+    url: str,
+    declared: str,
+    media_url: str | None = None,
+    *,
+    pdf_bytes_present: bool = False,
+) -> JobKind:
+    """Map ``kind="auto"`` to the concrete enum based on the URL + hints.
 
     Resolution order for ``declared == "auto"``:
       1. ``media_url`` set → ``MEDIA`` (extension found a transcribable
@@ -516,14 +598,23 @@ def infer_kind(url: str, declared: str, media_url: str | None = None) -> JobKind
          a YouTube *embed* on a third-party site still flows through the
          generic media path with the iframe URL, not through the YouTube
          fast path on the page URL).
-      2. URL host in ``_YOUTUBE_HOSTS`` → ``YOUTUBE``.
-      3. Otherwise → ``PAGE``.
+      2. ``pdf_bytes_present`` or URL path ends in ``.pdf`` → ``PDF``.
+      3. URL host in ``_YOUTUBE_HOSTS`` → ``YOUTUBE``.
+      4. Otherwise → ``PAGE``.
     """
-    if declared in (JobKind.PAGE.value, JobKind.YOUTUBE.value, JobKind.MEDIA.value):
+    if declared in (
+        JobKind.PAGE.value,
+        JobKind.YOUTUBE.value,
+        JobKind.MEDIA.value,
+        JobKind.PDF.value,
+    ):
         return JobKind(declared)
     if media_url:
         return JobKind.MEDIA
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    if pdf_bytes_present or (parsed.path or "").lower().endswith(".pdf"):
+        return JobKind.PDF
+    host = (parsed.hostname or "").lower()
     if host in _YOUTUBE_HOSTS:
         return JobKind.YOUTUBE
     return JobKind.PAGE

@@ -1,8 +1,9 @@
 # CLAUDE.md — context for code agents
 
 TLDR is a local Chrome extension + Python daemon that summarises web pages
-and YouTube videos and answers follow-up questions about the processed
-material. Single-user, runs on whoever's machine.
+(HTML and PDF), YouTube videos, and any other audio/video found on the
+page (whatever yt-dlp can extract), and answers follow-up questions about
+the processed material. Single-user, runs on whoever's machine.
 
 The daemon talks to any **OpenAI-compatible** LLM/Whisper backend over HTTP
 — Ollama, LM Studio, mlx-openai-server, vLLM, llama.cpp, etc. The bundled
@@ -13,44 +14,54 @@ who want the fastest local path; nothing in the daemon assumes it.
 
 Pick the file that matches what you're doing — don't read them all at once.
 
-- [.claude/architecture.md](.claude/architecture.md) — components, data flow,
-  why mlx is on the host and the rest is in Docker, the request lifecycles.
-- [.claude/daemon.md](.claude/daemon.md) — Python source layout, where to add
-  endpoints / migrations / workers / prompts.
-- [.claude/extension.md](.claude/extension.md) — JS extension layout (MV3,
-  vanilla, no build step), tab tracking, side panel + library wiring.
-- [.claude/conventions.md](.claude/conventions.md) — invariants you must
-  respect (API contract mirroring, single timecode formatter, output_language
-  threading, URL normalization, hot-reload rules).
+**Layout & data flow** (start here for "how is this structured"):
+
+- [architecture.md](.claude/architecture.md) — components, why mlx is on the
+  host and the rest is in Docker, request lifecycles per `JobKind`.
+- [daemon.md](.claude/daemon.md) — lifespan startup order, how a POST /jobs
+  flows through, where to add new things.
+- [extension.md](.claude/extension.md) — surfaces × daemon connections,
+  side panel lifecycle, tab tracking, side-panel staleness defences.
+
+**Invariants** (don't break these without good reason):
+
+- [contract.md](.claude/contract.md) — schemas mirror, URL normalization.
+- [events.md](.claude/events.md) — three SSE surfaces, broker model, repo
+  auto-publish.
+- [workers.md](.claude/workers.md) — async POST, soft pause, restart-safety
+  (incl. media-job ephemerality).
+- [llm.md](.claude/llm.md) — single semaphore, single timecode formatter,
+  `output_language` threading.
+
+**Dev loop & operations**:
+
+- [runbook.md](.claude/runbook.md) — first-time setup, daily commands,
+  reload matrix per change-type, troubleshooting (YouTube broken, context
+  truncation, mlx idle-unload, daemon unreachable, …), how to update yt-dlp /
+  Python deps / mlx-server / extension.
+- [ops.md](.claude/ops.md) — invariants behind the runbook: why uvicorn has
+  no `--reload`, why yt-dlp auto-upgrades, Taskfile-as-router policy,
+  testing philosophy.
 
 Code is the source of truth for details. These docs orient you fast; they
 don't try to mirror every line.
 
-## Working
+## Quick command reference
 
 ```bash
 task install              # one-time: config + daemon image + extension vendor libs
-task install:mlx          # OPTIONAL: macOS arm64 mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)
-task up                   # daemon (docker) + mlx-server if installed
+task install:mlx          # OPTIONAL: macOS arm64 mlx-openai-server + Gemma 4 + Whisper (~6 GB)
+task up                   # start daemon (+ mlx-server if installed)
 task down                 # stop (sqlite volume preserved)
 task test                 # ruff + mypy + pytest inside the daemon container
 task status               # health + container status
 task logs                 # tail daemon logs
-task reset                # destructive: wipe sqlite volume (asks for confirmation)
+task reset                # destructive: wipe sqlite volume (prompts)
 ```
 
-## Reload after changes
-
-- **Daemon code** (`daemon/src/*`): mounted in the container but uvicorn does
-  not auto-reload. Run `docker compose restart daemon`.
-- **Daemon dependencies** (`pyproject.toml`): `task install` (or
-  `docker compose build daemon`).
-- **YouTube libs** (`yt-dlp`, `youtube-transcript-api`): auto-upgraded on
-  every container start by `daemon/docker-entrypoint.sh`. So `task down &&
-  task up` is the universal "fix it" reflex when YouTube breaks.
-- **Extension code**: hit the reload icon on the TLDR card in
-  `chrome://extensions`. Chrome does NOT auto-reload unpacked extensions on
-  file change. Manifest changes sometimes need a full Remove + Load unpacked.
+After editing code: daemon → `docker compose restart daemon`; extension →
+reload icon in `chrome://extensions`. Full matrix in
+[runbook.md](.claude/runbook.md#reload-matrix).
 
 ## Adding features — 30-second tour
 

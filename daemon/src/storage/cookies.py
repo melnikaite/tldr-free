@@ -22,7 +22,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-import requests  # type: ignore[import-untyped]
+import requests
 
 from src.api.schemas import Cookie
 
@@ -38,23 +38,19 @@ def build_requests_session(cookies: list[Cookie]) -> requests.Session:
     """
     session = requests.Session()
     for cookie in cookies:
-        kwargs: dict[str, object] = {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path or "/",
-            "secure": bool(cookie.secure),
-        }
-        if cookie.expires is not None:
-            kwargs["expires"] = int(cookie.expires)
         # ``rest`` is the "free-form attributes" bag — HttpOnly belongs there
         # because the cookielib API doesn't expose it as a first-class kwarg.
-        rest: dict[str, str] = {}
-        if cookie.http_only:
-            rest["HttpOnly"] = ""
-        if rest:
-            kwargs["rest"] = rest
-        session.cookies.set(**kwargs)
+        rest: dict[str, str] | None = {"HttpOnly": ""} if cookie.http_only else None
+        expires = int(cookie.expires) if cookie.expires is not None else None
+        session.cookies.set(
+            name=cookie.name,
+            value=cookie.value,
+            domain=cookie.domain,
+            path=cookie.path or "/",
+            secure=bool(cookie.secure),
+            expires=expires,
+            rest=rest,
+        )
     return session
 
 

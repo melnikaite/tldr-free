@@ -16,6 +16,25 @@ import { stringifyError } from "./lib/utils.js";
 
 const YT_HOST_RE = /^https?:\/\/(?:[^/]*\.)?(?:youtube\.com|youtu\.be)(?:\/|$)/i;
 
+// PDF tabs are special: Chrome renders them in its own viewer
+// (a chrome-extension://… page) which we cannot inject content scripts
+// into. Match on the URL path — covers ``file:///x.pdf``,
+// ``https://host/foo.pdf?download=1``, etc. The actual parsing happens
+// daemon-side via pypdf (with multimodal vision OCR fallback for
+// scanned PDFs); the extension's job is just to detect the kind and,
+// for ``file://`` URLs the daemon can't reach, upload the bytes.
+const PDF_URL_RE = /\.pdf(?:$|[?#])/i;
+
+// Upload cap for ``file://`` PDFs. The extension's service worker
+// (a single MV3 background context) has a bounded heap, and
+// base64-encoding hundreds of megabytes there is the fastest way to
+// OOM-kill it — taking the entire extension down with no clear error.
+// 50 MB covers virtually every PDF that isn't a scanned book; for
+// those, OCR with ocrmypdf locally first and the daemon's text-first
+// path will read the result instantly. http(s) PDFs aren't subject to
+// this — the daemon fetches them itself with no extension memory cost.
+const MAX_LOCAL_PDF_BYTES = 50 * 1024 * 1024;
+
 chrome.runtime.onInstalled.addListener(() => {
   // Keep openPanelOnActionClick=false so chrome.action.onClicked fires for our
   // custom flow. We open the panel ourselves inside the click handler.
@@ -37,6 +56,20 @@ chrome.runtime.onInstalled.addListener(() => {
  */
 async function summarizeTab(tab) {
   if (!tab.id || !tab.url) return;
+
+  // PDFs: bypass content-script extraction entirely. Chrome's PDF viewer
+  // is a chrome-extension:// page that refuses script injection, and
+  // parsing PDFs is a daemon concern anyway (pypdf with vision OCR
+  // fallback for scanned PDFs). For http(s) the daemon fetches the URL
+  // itself; for file:// we read the bytes here and ship them along.
+  if (PDF_URL_RE.test(tab.url)) {
+    await handlePdfTab(tab).catch((err) => {
+      console.error("[TLDR] PDF submit failed", err);
+      broadcast({ type: "extraction-error", error: stringifyError(err) });
+    });
+    return;
+  }
+
   const isYouTube = YT_HOST_RE.test(tab.url);
   try {
     if (isYouTube) {
@@ -54,6 +87,105 @@ async function summarizeTab(tab) {
     console.error("[TLDR] executeScript failed", err);
     await broadcast({ type: "extraction-error", error: stringifyError(err) });
   }
+}
+
+/**
+ * Submit a PDF tab to the daemon as ``kind=pdf``. For http(s) URLs we
+ * just send the URL and any cookies — the daemon fetches the bytes
+ * itself. For ``file://`` URLs the daemon can't reach the host
+ * filesystem, so we read the file from the extension (where Chrome
+ * grants access if the user has enabled "Allow access to file URLs")
+ * and forward the bytes as base64.
+ *
+ * No content-script injection involved — Chrome's PDF viewer refuses
+ * `chrome.scripting.executeScript` and parsing PDFs belongs in the
+ * daemon anyway (pypdf + vision OCR fallback for scanned PDFs).
+ *
+ * @param {chrome.tabs.Tab} tab
+ */
+async function handlePdfTab(tab) {
+  if (!tab.url) return;
+  const isFileUrl = tab.url.startsWith("file://");
+
+  let cookies = [];
+  let pdfBytesB64 = null;
+  if (isFileUrl) {
+    // Daemon can't reach file:// — read the bytes here and upload.
+    let buf;
+    try {
+      const resp = await fetch(tab.url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      buf = await resp.arrayBuffer();
+    } catch (err) {
+      throw new Error(
+        'Could not read the local PDF. Open chrome://extensions, click "Details" ' +
+          'on the TLDR card, and enable "Allow access to file URLs". Then reload ' +
+          `the PDF tab and try again. (Underlying error: ${stringifyError(err)})`,
+      );
+    }
+    if (buf.byteLength > MAX_LOCAL_PDF_BYTES) {
+      const mb = (buf.byteLength / 1_048_576).toFixed(1);
+      const cap = Math.round(MAX_LOCAL_PDF_BYTES / 1_048_576);
+      throw new Error(
+        `Local PDF is ${mb} MB — over the ${cap} MB upload cap. ` +
+          "OCR the PDF locally first (e.g. ocrmypdf), or split it into smaller files.",
+      );
+    }
+    pdfBytesB64 = _arrayBufferToBase64(buf);
+  } else {
+    // http(s) — forward cookies so signed/auth-protected PDFs work.
+    try {
+      cookies = await getCookiesForUrl(tab.url);
+    } catch (err) {
+      console.warn("[TLDR] cookies.getAll(url) failed", err);
+    }
+  }
+
+  /** @type {JobCreateRequest} */
+  const req = {
+    url: normalizeUrl(tab.url),
+    kind: "pdf",
+    page_title: tab.title || null,
+    pdf_bytes_b64: pdfBytesB64,
+    cookies,
+  };
+  await submitJob(req, tab.id ?? null);
+}
+
+/**
+ * Base64-encode an ArrayBuffer with bounded peak memory.
+ *
+ * The naive ``btoa(String.fromCharCode(...all_bytes))`` approach
+ * accumulates the entire buffer as a UTF-16 JS string (each byte → 2
+ * bytes of memory) BEFORE encoding — that's 3× the PDF size briefly,
+ * which OOM-kills an MV3 service worker on multi-megabyte PDFs.
+ *
+ * Here we encode in 48 KB chunks (chosen as 49152 = 16384 × 3, a
+ * multiple of 3 so every chunk except the last produces a clean base64
+ * segment with no padding). Each chunk's intermediate binary string is
+ * only ~48 KB and is freed before the next chunk begins, so peak
+ * additional memory above the input is bounded by ``output.length``
+ * (~4/3 × input) — not 3× as with the naive form.
+ *
+ * @param {ArrayBuffer} buf
+ * @returns {string}
+ */
+function _arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  const CHUNK = 49152; // 48 KB, multiple of 3
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+    // Single-arg fromCharCode in a loop (NOT spread/apply) — keeps the
+    // intermediate string bounded by the chunk size, doesn't blow the
+    // call stack with hundreds of thousands of arguments.
+    let bin = "";
+    for (let j = 0; j < slice.length; j++) {
+      bin += String.fromCharCode(slice[j]);
+    }
+    parts.push(btoa(bin));
+  }
+  return parts.join("");
 }
 
 chrome.action.onClicked.addListener(async (tab) => {

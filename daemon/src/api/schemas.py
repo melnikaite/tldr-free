@@ -30,6 +30,12 @@ class JobKind(StrEnum):
     # Spotify, …). Distinguished from YOUTUBE because there's no
     # subtitle/captions fast path — everything goes straight to Whisper.
     MEDIA = "media"
+    # PDF documents. Text-first via pypdf; if pypdf returns ~nothing the
+    # daemon assumes the PDF is scanned/image-only and falls back to
+    # multimodal vision (pages rendered to PNG, sent to the LLM via
+    # ``image_url`` content). For http(s) URLs the daemon fetches itself;
+    # for ``file://`` the extension uploads bytes via ``pdf_bytes_b64``.
+    PDF = "pdf"
 
 
 class JobStatus(StrEnum):
@@ -45,6 +51,8 @@ class TranscriptSource(StrEnum):
     WHISPER = "whisper"
     PAGE_EXTRACT = "page_extract"     # extension extracted via Readability
     TRAFILATURA = "trafilatura"       # daemon fallback for pages without page_text
+    PDF_TEXT = "pdf_text"             # pypdf — text-first path on a native PDF
+    PDF_VISION = "pdf_vision"         # multimodal OCR — scanned/image-only fallback
 
 
 class DeferredReason(StrEnum):
@@ -77,7 +85,7 @@ class Cookie(BaseModel):
 
 class JobCreateRequest(BaseModel):
     url: str
-    kind: Literal["page", "youtube", "media", "auto"] = "auto"
+    kind: Literal["page", "youtube", "media", "pdf", "auto"] = "auto"
     page_text: str | None = None     # extension-extracted clean text (Readability)
     page_title: str | None = None
     # Direct media stream URL discovered by the extension on the page (a
@@ -87,6 +95,11 @@ class JobCreateRequest(BaseModel):
     # the human-visible page URL — used for library dedup, display, and
     # the "open source" link.
     media_url: str | None = None
+    # PDF bytes, base64-encoded. Set only when the source is a ``file://``
+    # URL the daemon can't reach itself (the extension reads the file via
+    # ``fetch()`` and forwards the bytes). For http(s) PDFs leave None and
+    # the daemon fetches the URL with the cookies below.
+    pdf_bytes_b64: str | None = None
     cookies: list[Cookie] | None = None
 
 

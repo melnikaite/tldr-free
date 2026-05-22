@@ -1,0 +1,18 @@
+You are extracting text from page {page} of a PDF so a downstream model can
+summarize it. Transcribe everything legible on the page, in the document's
+original language (do NOT translate).
+
+Rules:
+- Preserve reading order: top-to-bottom, left-to-right within columns.
+- Use blank lines between paragraphs.
+- Reproduce headings on their own lines.
+- For tables: lay out cells with whitespace so the structure stays legible
+  (header row, then data rows). Skip ruling lines.
+- For figures, charts, or diagrams: after the page text, add a single line
+  starting with "Figure:" describing what it shows (axes, labels, key
+  data, what conclusion it supports). Skip purely decorative graphics.
+- Reproduce inline math as plain text or LaTeX-ish (e.g. ``x^2 + y^2``).
+- Skip page headers/footers that repeat the document title or page number.
+
+Do NOT summarize, paraphrase, comment, or add anything not on the page.
+Output the transcription only.

@@ -9,11 +9,11 @@
 // Enums (string literal unions in JSDoc-land)
 // ---------------------------------------------------------------------------
 
-/** @typedef {"page" | "youtube" | "media"} JobKind */
+/** @typedef {"page" | "youtube" | "media" | "pdf"} JobKind */
 
 /** @typedef {"queued" | "running" | "done" | "failed"} JobStatus */
 
-/** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura"} TranscriptSource */
+/** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura" | "pdf_text" | "pdf_vision"} TranscriptSource */
 
 // ---------------------------------------------------------------------------
 // Cookie (forwarded from chrome.cookies.getAll)
@@ -37,10 +37,11 @@
 /**
  * @typedef {object} JobCreateRequest
  * @property {string} url
- * @property {"page" | "youtube" | "media" | "auto"} kind
+ * @property {"page" | "youtube" | "media" | "pdf" | "auto"} kind
  * @property {string | null} [page_text]
  * @property {string | null} [page_title]
- * @property {string | null} [media_url]   - direct media URL (yt-dlp-extractable). Sets kind=media when present under auto.
+ * @property {string | null} [media_url]       - direct media URL (yt-dlp-extractable). Sets kind=media when present under auto.
+ * @property {string | null} [pdf_bytes_b64]   - base64 PDF bytes (file:// only; http(s) PDFs are fetched daemon-side)
  * @property {Cookie[] | null} [cookies]
  */
 

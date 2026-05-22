@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import requests  # type: ignore[import-untyped]
+import requests
 from tenacity import (
     RetryError,
     Retrying,

@@ -122,20 +122,28 @@ async def re_enqueue_pending(queue: WhisperQueue, repo_module: object) -> int:
             await queue.put(WhisperTask(job_id=job_id, url=url, cookies=[]))
             n += 1
         else:
-            # Page and media jobs left in queued/running can't be resumed —
-            # page has no audio + the request body is gone; media doesn't
-            # persist its extracted media_url anywhere (it lives only in
-            # the WhisperTask we're trying to recover from). Mark failed so
-            # the row reflects reality and the user can resubmit from the
-            # extension.
+            # Page / media / pdf jobs left in queued/running can't be
+            # resumed by the queue:
+            #   - page: page_text from the request body is gone
+            #   - media: media_url lives only inside the in-flight WhisperTask
+            #   - pdf:  pdf_bytes (file://) aren't persisted; http URLs
+            #     survive but restart goes through the user clicking
+            #     summarize again, not the queue
+            # Mark failed so the row reflects reality.
             mark_failed = getattr(repo_module, "mark_failed", None)
             if mark_failed is not None:
-                reason = (
-                    "daemon restarted mid-stream; media url not persisted, "
-                    "please re-summarize from the extension"
-                    if kind == "media"
-                    else "daemon restarted; page job not resumable"
-                )
+                reasons = {
+                    "media": (
+                        "daemon restarted mid-stream; media url not persisted, "
+                        "please re-summarize from the extension"
+                    ),
+                    "pdf": (
+                        "daemon restarted mid-stream; PDF not resumable, "
+                        "please re-summarize from the extension"
+                    ),
+                }
+                kind_key = kind if isinstance(kind, str) else ""
+                reason = reasons.get(kind_key, "daemon restarted; job not resumable")
                 try:
                     mark_failed(job_id, error=reason)
                 except Exception:

@@ -91,7 +91,7 @@ AI-stream events use the same shapes regardless of mode (`AIStageEvent`,
 The chain that matters: a state-changing call in `src/storage/repo.py`
 publishes `job_event(...)` itself. So `repo.mark_done(...)` flips the
 DB row AND tells the Library to re-render the row, atomically as far as
-callers are concerned. See conventions.md for the invariant.
+callers are concerned. See [events.md](events.md) for the invariant.
 
 ## Request flows
 
@@ -135,6 +135,40 @@ need to know whether the path was fast or deferred.
 Restart-safe: repo.find_pending_for_restart() re-enqueues queued/running
 rows on daemon startup.
 ```
+
+### Generic media (deferred to Whisper)
+
+`JobKind.MEDIA` covers any audio/video the extension finds in the DOM —
+native `<video>`/`<audio>` or an iframe-embed (whitelist lives in
+`extension/src/content/extract.js`). The pipeline branch is identical to
+YouTube-without-captions minus the caption probe: enqueue a `WhisperTask`,
+runner downloads via yt-dlp, transcribes, summarizes.
+
+Not restart-safe — see [workers.md](workers.md) for why.
+
+### PDF (text-first, vision OCR fallback)
+
+`JobKind.PDF` runs synchronously inside the pipeline (no queue). Daemon
+fetches http(s) URLs itself; for `file://` URLs the extension reads the
+bytes (Chrome `fetch()`) and uploads them as `pdf_bytes_b64`. Then:
+
+```
+workers.pdf.process_pdf:
+  pypdf text extract → if >= 200 chars → return (PDF_TEXT, text)
+                    ↓ else
+  pymupdf render pages → PNG → for each page:
+    LLM chat with image_url content + "transcribe this page" prompt
+                    ↓
+  concat per-page transcriptions → return (PDF_VISION, text)
+```
+
+After extraction the path is identical to PAGE: same
+`_summarize_and_finish` runs `stream_summarize` over the resulting text
+and emits delta events. The `transcript_source` field
+(`pdf_text` vs `pdf_vision`) lets the Library distinguish the two.
+
+Restart-safety: same as PAGE/MEDIA — not resumable, marked failed on
+daemon restart so the user re-submits.
 
 ### Q&A (any time after extraction)
 
