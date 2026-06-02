@@ -60,21 +60,70 @@
   ];
 
   /**
-   * @typedef {{mediaUrl: string}} MediaFinding
+   * @typedef {{mediaUrl: string, kind: "video"|"audio"|"iframe", label: string}} MediaCandidate
+   * @typedef {{primary: MediaCandidate, alternates: MediaCandidate[]}} MediaFinding
    * @returns {MediaFinding | null}
    */
   function findMedia() {
-    return findNativeMedia() || findIframeEmbed();
+    // Native <video>/<audio> wins over iframe embeds when both exist on the
+    // same page (the native one is what the user is actually watching;
+    // iframes are usually supplementary players). But we still surface the
+    // iframe ones as alternates so the user can switch if we guessed wrong.
+    const native = collectNativeMedia();
+    const iframes = collectIframeEmbeds();
+    const all = [...native, ...iframes];
+    if (!all.length) return null;
+    // Filter out chrome ("autoplay ad in sidebar", "related videos panel")
+    // by keeping only candidates that live inside the page's main article
+    // container — when the page has one AND at least one candidate is in
+    // it. trafilatura does similar boilerplate stripping on the daemon
+    // side for text; here we use cheap semantic selectors because we're
+    // running in-page and want the scan fast.
+    const filtered = _filterToMainContent(all);
+    filtered.sort((a, b) => b.score - a.score);
+    // Label disambiguation pass — "Video" → "Video 1", "Video 2" when there
+    // are multiple. Iframes already carry the host name so they're unique.
+    _disambiguateLabels(filtered);
+    const [primary, ...alternates] = filtered.map(({ mediaUrl, kind, label }) => ({
+      mediaUrl,
+      kind,
+      label,
+    }));
+    return { primary, alternates };
   }
 
-  /** @returns {MediaFinding | null} */
-  function findNativeMedia() {
+  /**
+   * Drop candidates outside the page's main article container — that's
+   * where sidebars, recommendation rails, and autoplay ads live. The
+   * filter is conservative: it only kicks in when (a) there's a clear
+   * main container AND (b) at least one candidate is inside it. Pages
+   * without semantic structure (`<article>` / `<main>`), and pages where
+   * every candidate happens to live outside main, keep all candidates —
+   * a heuristic guess is worse than showing everything.
+   *
+   * @template {{el: Element}} T
+   * @param {T[]} candidates
+   * @returns {T[]}
+   */
+  function _filterToMainContent(candidates) {
+    // First semantic selector wins. Order: <article> (most specific) →
+    // <main> → [role=main] (ARIA fallback for layout-only sites).
+    const mainEl = document.querySelector("article, main, [role='main']");
+    if (!mainEl) return candidates;
+    const inside = candidates.filter((c) => mainEl.contains(c.el));
+    return inside.length > 0 ? inside : candidates;
+  }
+
+  /**
+   * @returns {{el: HTMLMediaElement, mediaUrl: string, kind: "video"|"audio",
+   *           label: string, score: number}[]}
+   */
+  function collectNativeMedia() {
     /** @type {HTMLMediaElement[]} */
     const all = [...document.querySelectorAll("video, audio")];
-    // Score: prefer larger visible video, then visible audio, then anything
-    // playable. This filters tiny notification chimes / hidden previews.
-    /** @type {{el: HTMLMediaElement, src: string, score: number}[]} */
-    const candidates = [];
+    const out = [];
+    let videoIdx = 0;
+    let audioIdx = 0;
     for (const el of all) {
       const src = _readSrc(el);
       if (!src) continue;
@@ -86,12 +135,16 @@
       const vw = /** @type {HTMLVideoElement} */ (el).videoWidth || 0;
       const area = rect.width * rect.height;
       if (isVideo && area < 5000 && vw < 100) continue;
-      const score = (isVideo ? 1_000_000 : 100_000) + area;
-      candidates.push({ el, src, score });
+      const idx = isVideo ? ++videoIdx : ++audioIdx;
+      out.push({
+        el,
+        mediaUrl: src,
+        kind: isVideo ? "video" : "audio",
+        label: _labelForElement(el, isVideo ? "video" : "audio", idx),
+        score: (isVideo ? 1_000_000 : 100_000) + area,
+      });
     }
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => b.score - a.score);
-    return { mediaUrl: candidates[0].src };
+    return out;
   }
 
   /**
@@ -120,21 +173,125 @@
     }
   }
 
-  /** @returns {MediaFinding | null} */
-  function findIframeEmbed() {
+  /**
+   * @returns {{el: HTMLIFrameElement, mediaUrl: string, kind: "iframe",
+   *           label: string, score: number}[]}
+   */
+  function collectIframeEmbeds() {
+    const out = [];
     const iframes = [...document.querySelectorAll("iframe[src]")];
     for (const f of iframes) {
       const src = /** @type {HTMLIFrameElement} */ (f).src;
       if (!src) continue;
-      if (IFRAME_WHITELIST.some((re) => re.test(src))) {
-        try {
-          return { mediaUrl: new URL(src).toString() };
-        } catch {
-          // malformed src — skip
-        }
+      if (!IFRAME_WHITELIST.some((re) => re.test(src))) continue;
+      try {
+        const normalised = new URL(src).toString();
+        const rect = f.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        // Iframes score below native video (a real <video> on the page is
+        // almost always the one the user is interacting with), but above
+        // <audio> — embeds usually carry the primary content.
+        out.push({
+          el: /** @type {HTMLIFrameElement} */ (f),
+          mediaUrl: normalised,
+          kind: /** @type {"iframe"} */ ("iframe"),
+          label: _labelForIframe(/** @type {HTMLIFrameElement} */ (f), normalised),
+          score: 500_000 + area,
+        });
+      } catch {
+        // malformed src — skip
       }
     }
-    return null;
+    return out;
+  }
+
+  /**
+   * Best-effort human-readable label for a native media element. Prefers
+   * curated text (title attr, aria-label) over the filename, falling back
+   * to a generic "Video N" / "Audio N" — _disambiguateLabels turns the
+   * generic ones into numbered variants when there are duplicates.
+   *
+   * @param {HTMLMediaElement} el
+   * @param {"video" | "audio"} kind
+   * @param {number} idx  1-based position among elements of the same kind
+   * @returns {string}
+   */
+  function _labelForElement(el, kind, idx) {
+    const t = el.getAttribute("title")?.trim()
+      || el.getAttribute("aria-label")?.trim();
+    if (t) return t;
+    // Look at parent figure caption / preceding heading — often holds the
+    // talk / episode title on lecture / podcast pages.
+    const fig = el.closest("figure")?.querySelector("figcaption")?.textContent?.trim();
+    if (fig && fig.length <= 80) return fig;
+    // Filename from URL — strip query and extension for readability.
+    const fname = _filenameFromUrl(_readSrc(el) ?? "");
+    if (fname) return fname;
+    return kind === "video" ? `Video ${idx}` : `Audio ${idx}`;
+  }
+
+  /**
+   * Label for a whitelisted iframe. We name by the host's recognisable
+   * product (vimeo / dailymotion / twitch / …) plus the embed id when
+   * present, so multiple embeds of the same provider stay distinguishable.
+   *
+   * @param {HTMLIFrameElement} f
+   * @param {string} src
+   * @returns {string}
+   */
+  function _labelForIframe(f, src) {
+    const t = f.getAttribute("title")?.trim()
+      || f.getAttribute("aria-label")?.trim();
+    if (t) return t;
+    try {
+      const u = new URL(src);
+      const host = u.hostname.replace(/^www\./, "");
+      // Extract the embed id from the path tail when it looks like one
+      // (numeric, hash-like). Falls back to just the host.
+      const tail = u.pathname.replace(/\/$/, "").split("/").pop() || "";
+      const id = /^[A-Za-z0-9_-]{4,}$/.test(tail) ? tail : "";
+      return id ? `${host}: ${id}` : host;
+    } catch {
+      return "Embed";
+    }
+  }
+
+  /**
+   * Extract a filename from a URL, stripping query/hash and extension.
+   * Returns null when there's nothing useful (e.g. URL ends with `/`).
+   *
+   * @param {string} url
+   * @returns {string | null}
+   */
+  function _filenameFromUrl(url) {
+    try {
+      const u = new URL(url);
+      const last = u.pathname.split("/").filter(Boolean).pop();
+      if (!last) return null;
+      const noExt = last.replace(/\.[^.]+$/, "");
+      // Skip purely numeric / hash-like filenames — they're not useful as
+      // labels (the user can't tell them apart at a glance).
+      if (/^[0-9a-f]{8,}$/i.test(noExt)) return null;
+      return decodeURIComponent(noExt).slice(0, 60);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Append " 2", " 3", … to labels that repeat. Mutates the array in
+   * place. Keeps the first occurrence un-numbered.
+   *
+   * @param {{label: string}[]} items
+   */
+  function _disambiguateLabels(items) {
+    const seen = new Map();
+    for (const item of items) {
+      const base = item.label;
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      if (n > 1) item.label = `${base} ${n}`;
+    }
   }
 
   // Pick the best human title for the page: prefer og:title (curated by
@@ -158,7 +315,11 @@
       chrome.runtime.sendMessage({
         type: "extracted-media",
         url: location.href,
-        mediaUrl: found.mediaUrl,
+        // Primary (top-scored) drives job creation; alternates surface in
+        // the sidepanel as a "wrong source?" chip so the user can switch
+        // without re-running the whole pipeline.
+        mediaUrl: found.primary.mediaUrl,
+        altCandidates: found.alternates,
         title: extractTitle(),
       });
       return;

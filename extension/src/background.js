@@ -275,7 +275,7 @@ async function handleExtractedPage(msg, sourceTabId) {
  * That covers session cookies for player auth, CDN signing tokens, etc.,
  * without leaking unrelated cookies from sibling subdomains.
  *
- * @param {{url:string, mediaUrl:string, title?:string|null}} msg
+ * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], title?:string|null}} msg
  * @param {number|null} sourceTabId
  */
 async function handleExtractedMedia(msg, sourceTabId) {
@@ -286,11 +286,24 @@ async function handleExtractedMedia(msg, sourceTabId) {
     console.warn("[TLDR] cookies.getAll(url) failed", err);
   }
 
+  // Convert extension-side {mediaUrl, kind, label} to the snake_case shape
+  // the daemon expects. Drop alternates with the same URL as the primary —
+  // happens when the same <video> appears multiple times (e.g. mirrored
+  // mobile/desktop sources).
+  const altCandidates = (msg.altCandidates || [])
+    .filter((c) => c.mediaUrl && c.mediaUrl !== msg.mediaUrl)
+    .map((c) => ({
+      media_url: c.mediaUrl,
+      kind: c.kind,
+      label: c.label,
+    }));
+
   /** @type {JobCreateRequest} */
   const req = {
     url: normalizeUrl(msg.url),
     kind: "media",
     media_url: msg.mediaUrl,
+    alt_media_candidates: altCandidates.length ? altCandidates : null,
     page_title: msg.title || null,
     cookies,
   };
