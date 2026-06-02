@@ -202,12 +202,46 @@ Faster alternatives:
 - Use a beefier backend (a remote vision model, or local Gemma 4 27B
   if your machine fits it) and raise `llm.max_concurrent_calls`.
 
+### Transcript tab shows one `[00:00]` block for a whole hour-long video
+
+Whisper segments + auto-detected language aren't reaching the daemon.
+Upstream `mlx-openai-server` (v1.8.1 at least) drops both in its HTTP
+response even though `mlx_whisper.transcribe()` produces them
+internally. Fix: apply our patch.
+
+```
+bash scripts/mlx.sh patch                          # idempotent
+bash scripts/mlx.sh stop && bash scripts/mlx.sh start
+```
+
+Verify on a fresh job: `Job.transcript_language` should be filled, and
+the Transcript tab shows one line per ~5 seconds rather than one giant
+block. After upgrading `mlx-openai-server` the patch needs to be
+re-applied (the upgrade overwrites the venv files); `task install:mlx`
+does this automatically on the next install/upgrade run. See
+`scripts/mlx-patches/README.md`.
+
+### Translation chip stuck on "running X%" after browser restart
+
+Should self-heal — `re_enqueue_running_on_startup` (in `main.lifespan`)
+re-spawns the translator for any row left in `running` and the
+sidepanel picks up live updates via `/events`. If it stays stuck:
+
+```
+task logs | grep translator                # check the worker error
+docker compose restart daemon              # forces lifespan to re-run
+```
+
+Failed translations show with a red chip; click "Retry failed" in the
+sidepanel's language bar to re-queue all of them at once.
+
 ### Library shows jobs in "queued" forever after restart
 
 Expected for MEDIA jobs — they can't be resumed (`media_url` not
 persisted). Re-submit from the extension by clicking the toolbar button on
 the source page again. YouTube jobs in queued/running are re-enqueued on
-startup automatically. See [workers.md](workers.md).
+startup automatically. Translations are also recoverable (see above).
+See [workers.md](workers.md).
 
 ## Updating components
 

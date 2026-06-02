@@ -14,12 +14,17 @@ tasks:
       - task --list
 
   install:
-    desc: One-time setup — config, daemon image, vendor libs (any OpenAI-compatible backend)
+    desc: "Smart one-time setup — auto-detects hardware via llmfit, picks the right backend + model"
+    cmds:
+      - bash scripts/smart-install.sh
+
+  install:manual:
+    desc: "Manual install — copies config template only; you configure the backend yourself"
     cmds:
       - bash scripts/install.sh
 
   install:mlx:
-    desc: "Optional (macOS arm64): install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
+    desc: "Apple Silicon only: install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
     cmds:
       - bash scripts/install.sh
       - bash scripts/mlx.sh install

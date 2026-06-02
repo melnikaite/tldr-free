@@ -37,6 +37,25 @@ resets on daemon restart.
 consecutive background jobs in both Whisper worker and pipeline tasks —
 useful when running a big backlog overnight on a fanless laptop.
 
+## Transcript translation is its own background task
+
+`workers/translator.py` runs independently of the main pipeline. Each
+`(job_id, language_code)` pair gets a coroutine spawned by `enqueue_translation`
+and held in a module-level `_BACKGROUND_TASKS` set so GC doesn't kill
+it. The HTTP endpoint returns 202 immediately; the worker carries on
+across SSE-subscriber comings-and-goings and across browser restarts.
+
+Restart behaviour is **continue, don't fail**: `re_enqueue_running_on_startup`
+(called from `main.lifespan`) picks up any row stuck in `running` /
+`queued` and respawns the worker. Unlike MEDIA / PDF jobs, translations
+are fully recoverable — `raw_text` is in the DB and the target language
+is on the row, nothing external is needed. Cost: restart-continued
+translations start from chunk 0 (no partial-chunk checkpointing).
+
+Dedup: a second POST for an in-flight `(job_id, lang)` is a no-op —
+the existing row's status is returned. UI binds Enter on the language
+input directly to this endpoint without debouncing.
+
 ## Media and PDF jobs are ephemeral on restart
 
 YouTube jobs are recoverable: `Job.url` is the canonical URL and

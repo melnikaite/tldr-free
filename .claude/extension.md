@@ -43,6 +43,44 @@ extension's job here is minimal:
 Either way: no client-side parsing, no pdf.js, no extra round-trips.
 The side panel just renders the streaming summary like any other job.
 
+## Summary / Transcript tabs
+
+The side panel shows two tabs: **Summary** (always) and **Transcript**
+(only for jobs with a meaningful transcript — `kind in (youtube, media)`,
+hidden for `page` / `pdf`).
+
+`sidepanel/transcript.js` lazy-loads the full `raw_text` via
+`GET /jobs/{id}/transcript` only when the user clicks the tab. The
+payload can be megabytes for hour-long podcasts so it's kept out of
+`JobDetails`. Each `[MM:SS]` line becomes a `<p data-tx-seconds="…">`
+which doubles as the click target for seeking (handled by the same
+`app.js` handler as the summary's timecode links) AND as the anchor
+for live-highlight via binary search.
+
+Live highlight: every 500 ms while the tab is visible + the source
+media is playing, the controller calls `chrome.scripting.executeScript
+({allFrames: true})` to read `<video, audio>.currentTime` from any
+frame (including cross-origin iframes like YouTube embeds — extension's
+host permissions cover those). Binary search picks the matching line,
+applies `tx-line--current`, scrolls into view if media is playing.
+
+`<track>` injection (WebVTT): on language switch, the controller builds
+a VTT body from the displayed text and injects a `<track>` into the
+page's first `<video>` via `executeScript({world: "MAIN"})`. World
+`MAIN` because the blob URL holding the VTT must resolve in the page's
+context; the extension's ISOLATED-world blobs can't be loaded by
+page-context `<video>`. Skipped for `<audio>` (no native captions UI)
+and for iframe-embedded players (we can't inject into their internal
+DOM safely — the sidepanel transcript itself serves as the captions
+surface).
+
+The language switcher is a sticky-positioned bar with chips for cached
+languages (source + each translation) plus a free-form input. Enter
+triggers `POST /jobs/{id}/transcript/translate`. Chips update live via
+the existing `/events` SSE — the translator worker publishes
+`translation_updated` job_events as it progresses. See
+[llm.md](llm.md) → "Transcript translation".
+
 ## Side panel lifecycle of a job
 
 ```

@@ -170,6 +170,30 @@ and emits delta events. The `transcript_source` field
 Restart-safety: same as PAGE/MEDIA — not resumable, marked failed on
 daemon restart so the user re-submits.
 
+### Transcript translation (deferred, behind Transcript tab)
+
+```
+POST /jobs/{id}/transcript/translate {lang}:
+  normalize lang (llm.languages) → reject 400 if unknown
+  if (job, lang) row exists and status in queued/running/done → return its status
+  if status == failed → reset, re-spawn worker
+  else insert row(status=queued), spawn workers.translator._run
+
+(asynchronously)
+workers.translator._run:
+  loop chunks(raw_text) →
+    publish translation_updated(running, progress%) →
+    llm.client.stream_complete with translate prompt (respect_pause=True)
+  write done row + publish translation_updated(done, 100)
+
+GET /jobs/{id}/transcript?lang=…:
+  serves Job.raw_text (no lang or matches source) or cached translation
+```
+
+Restart-safe: `re_enqueue_running_on_startup` (from `main.lifespan`)
+respawns workers for any row left in `running`. `raw_text` is in the
+DB and the language code is on the row — nothing external is needed.
+
 ### Q&A (any time after extraction)
 
 ```
@@ -186,9 +210,9 @@ loads it on every job switch so chats persist across tab changes.
 ## Storage
 
 Single SQLite database under the named docker volume `tldr-data`, mounted
-at `/data/tldr.db`. Tables: `Job`, `Message`, `_migrations`, plus the
-FTS5 virtual table `job_fts` and its AI/AD/AU triggers. FK cascade
-deletes `Message` rows when a Job is removed.
+at `/data/tldr.db`. Tables: `Job`, `Message`, `TranscriptTranslation`,
+`_migrations`. FK cascade deletes `Message` and `TranscriptTranslation`
+rows when a Job is removed.
 
 Pragmas (per connection): `journal_mode=WAL`, `synchronous=NORMAL`,
 `cache_size=-64000`, `mmap_size=268435456`, `temp_store=MEMORY`,

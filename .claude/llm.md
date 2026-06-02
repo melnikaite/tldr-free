@@ -48,6 +48,60 @@ truth for the `[MM:SS]` / `[HH:MM:SS]` format. Both the YouTube fast path
 format is then opaque inside `Job.raw_text` — no separate column, no
 parallel structures, prompts treat the markers as plain text.
 
+Whisper segments require the patched mlx-openai-server. Upstream's handler
+drops the `segments` + `language` fields that `mlx_whisper.transcribe()`
+already produces — `scripts/mlx-patches/apply.py` puts them back. If the
+patch isn't applied, `transcribe.transcribe_audio` falls back to a single
+all-encompassing segment so the pipeline doesn't crash, but `[MM:SS]`
+granularity collapses to one marker per video. See
+`scripts/mlx-patches/README.md`.
+
 The extension's `markdown.js` post-processes those markers into clickable
-YouTube `?t=Ns` links (DOM-walk, skipping text inside `<a>`, `<code>`,
-`<pre>`).
+links (DOM-walk, skipping text inside `<a>`, `<code>`, `<pre>`). Two
+flavours depending on the job:
+
+- **YouTube** → `youtube.com/watch?v=ID&t=Ns`. Side panel click handler
+  finds the open YouTube tab and seeks `<video>.currentTime` directly.
+- **Generic media** (`kind=media`) → `<page-url>#t=Ns` (the page that
+  contained the embedded media — `media_url` itself isn't persisted).
+  Click handler tries to focus that page's tab and seek the first
+  `<video>/<audio>` via `executeScript`; falls back to opening the URL.
+  Iframe-embedded players (Vimeo etc.) won't seek — they're a separate
+  document scope.
+
+Page (HTML) and PDF jobs don't get `[MM:SS]` markers from the LLM in the
+first place, so the post-processing short-circuits naturally for them.
+
+## Transcript translation
+
+`workers/translator.py` translates `Job.raw_text` into a target language,
+caching the result in `transcript_translation` (PK `job_id+language_code`).
+Triggered by `POST /jobs/{id}/transcript/translate {lang}`; dedup is at
+the row level — a second POST for an in-flight `(job_id, lang)` returns
+the existing status without spawning a duplicate worker.
+
+Three invariants:
+
+1. **Chunked**: long transcripts go through `llm.chunking.split_for_summary`
+   so each LLM call fits the context. The translation prompt
+   (`prompts/transcript_translate.txt`) instructs Gemma to keep
+   `[MM:SS]` markers verbatim per line — without that the
+   transcript-tab's binary-search highlight breaks.
+2. **Pause-aware**: between chunks (`_checkpoint_pause_translation`) and
+   inside `stream_complete(respect_pause=True)`. Same pause flag as the
+   summary path.
+3. **Restart-safe**: rows left in `running` at daemon startup get
+   re-enqueued by `re_enqueue_running_on_startup` (called from
+   `main.lifespan`). raw_text is in the DB and the language code is on
+   the row — nothing external is needed. Restart-continued translations
+   start from chunk 0 (no partial-chunk checkpointing); the user "loses"
+   any progress percent shown before the restart but the result is
+   correct.
+
+`en→en` (or whatever the source is) short-circuits — no LLM run, the
+endpoint returns `is_source=true` and the sidepanel switches to display
+the original via `GET /transcript` directly.
+
+Language codes are normalised by `llm.languages.normalize_lang`. Accepts
+ISO-639-1, ISO-639-2, English names, autonyms, and aliases; rejects
+anything unknown with a helpful 400 listing supported codes.
