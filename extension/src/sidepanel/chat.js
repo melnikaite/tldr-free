@@ -7,8 +7,21 @@
 // stored bubbles before any new turn.
 //
 // Token streaming: append plain text to the assistant bubble as it arrives,
-// then re-render via lib/markdown.js once the stream ends so [MM:SS] markers
-// become clickable timecode links (YouTube or generic media).
+// then re-render via lib/markdown.js once the stream ends.
+//
+// Note — timecodes: the QA prompt tells the LLM to echo [MM:SS] markers
+// from the transcript context when they help locate an answer. We render
+// chat bubbles WITHOUT timecode-link injection (renderMarkdown(text, null))
+// so those markers stay as plain text rather than becoming surprise clickable
+// links. The Summary tab renders its content WITH timecode links — that's
+// the intentional UX surface for navigation. If the user wants to jump to a
+// moment, they use the Transcript tab.
+//
+// QA stage badge: because the assistant bubble lives inside #pane-summary
+// (which gets display:none when the user switches to Transcript), the
+// browser pauses CSS animations on the thinking-dots spinner. We mirror
+// the live QA state into #stage-badge (topbar, always visible) so the
+// user knows generation is still in progress even across tab switches.
 
 import { daemon } from "../lib/daemon-client.js";
 import { renderMarkdown } from "../lib/markdown.js";
@@ -39,6 +52,27 @@ export async function getActiveJob() {
 const form = /** @type {HTMLFormElement | null} */ (document.getElementById("chat-form"));
 const input = /** @type {HTMLInputElement | null} */ (document.getElementById("chat-input"));
 const messages = /** @type {HTMLElement | null} */ (document.getElementById("chat-messages"));
+
+// Stage badge in the topbar — always visible regardless of which tab is
+// active. We drive it from here during QA so the user can see that a
+// response is still being generated even when they've switched away from
+// the Summary pane (where the thinking-dots spinner would otherwise be
+// invisible because the pane is display:none and CSS animations pause).
+const _stageBadge = /** @type {HTMLElement | null} */ (
+  document.getElementById("stage-badge")
+);
+
+/** Mirror QA progress into the topbar badge. Pass null to clear. */
+function _setQaStage(label) {
+  if (!_stageBadge) return;
+  if (label) {
+    _stageBadge.textContent = label;
+    _stageBadge.classList.remove("hidden");
+  } else {
+    _stageBadge.textContent = "";
+    _stageBadge.classList.add("hidden");
+  }
+}
 
 if (form) {
   form.addEventListener("submit", (e) => {
@@ -124,34 +158,48 @@ async function _runQaTurn(jobId, question) {
     `<span class="thinking-dots"><span></span><span></span><span></span></span>`;
   scrollMessagesToEnd();
 
+  // Mirror into the topbar badge so the user knows generation is in progress
+  // even when they switch away from the Summary tab (where the spinner pauses).
+  _setQaStage("Thinking…");
+
   /** @type {Text | null} */
   let textNode = null;
   let acc = "";
   try {
     for await (const ev of daemon.aiQa({ job_id: jobId, question })) {
       if (ev.type === "stage") {
-        // Stage signals (e.g. "thinking") arrive before the first delta;
-        // the dots indicator already covers that, no extra UI needed.
+        // Update badge text on stage transitions (thinking → answering).
+        const label = ev.stage === "thinking" ? "Thinking…" : "Answering…";
+        _setQaStage(label);
       } else if (ev.type === "delta") {
         if (textNode === null) {
+          // First token — switch from spinner to streaming text and update badge.
           assistantBubble.innerHTML = "";
           textNode = document.createTextNode("");
           assistantBubble.appendChild(textNode);
+          _setQaStage("Answering…");
         }
         acc += ev.delta;
         textNode.data = acc;
         scrollMessagesToEnd();
       } else if (ev.type === "done") {
         const final = ev.content || acc;
-        assistantBubble.innerHTML = renderMarkdown(final, activeJob);
+        // Render without timecode-link injection: QA answers may echo [MM:SS]
+        // markers from the transcript context but those should stay as plain
+        // text, not surprise navigation links. The Summary tab is the right
+        // place for timecode links; chat is a conversational surface.
+        assistantBubble.innerHTML = renderMarkdown(final, null);
+        _setQaStage(null);
         scrollMessagesToEnd();
       } else if (ev.type === "error") {
+        _setQaStage(null);
         renderErrorBubble(assistantBubble, ev.error || "Error.");
         return;
       }
     }
   } catch (err) {
     console.error("[TLDR] aiStream qa failed", err);
+    _setQaStage(null);
     renderErrorBubble(assistantBubble, err instanceof Error ? err.message : String(err));
   }
 }
@@ -174,7 +222,9 @@ export function renderHistory(items) {
   for (const m of items) {
     const bubble = appendBubble(m.role, "", frag);
     if (m.role === "assistant") {
-      bubble.innerHTML = renderMarkdown(m.content, activeJob);
+      // No timecode-link injection in chat history — same reasoning as
+      // _runQaTurn above. Passing null keeps [MM:SS] as plain text.
+      bubble.innerHTML = renderMarkdown(m.content, null);
     } else {
       bubble.textContent = m.content;
     }
