@@ -11,8 +11,13 @@ When web_search returns results, ground your answer in them and cite the source 
 
 Other rules:
 - Preserve names, numbers, and dates exactly.
-- If the material contains timestamps in [MM:SS] or [HH:MM:SS] format and they help locate the answer — include them in the response in the same format. This lets the user jump to that moment in the video.
-- If the answer spans multiple moments — list them with their timestamps.
+- Timestamps: ONLY include [MM:SS] or [HH:MM:SS] markers when ALL three conditions hold:
+    (a) you answered from the material (not from web_search or general knowledge),
+    (b) the material itself contains those markers,
+    (c) they genuinely help the user locate the relevant moment.
+  If the answer came from web_search or your own knowledge — NEVER add timestamps.
+  There is no video timestamp to jump to in a search result; any marker you invent is a hallucination.
+- If the answer spans multiple moments in the material — list them with their timestamps.
 
 Material title: {title}
 

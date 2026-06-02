@@ -9,13 +9,13 @@
 // Token streaming: append plain text to the assistant bubble as it arrives,
 // then re-render via lib/markdown.js once the stream ends.
 //
-// Note — timecodes: the QA prompt tells the LLM to echo [MM:SS] markers
-// from the transcript context when they help locate an answer. We render
-// chat bubbles WITHOUT timecode-link injection (renderMarkdown(text, null))
-// so those markers stay as plain text rather than becoming surprise clickable
-// links. The Summary tab renders its content WITH timecode links — that's
-// the intentional UX surface for navigation. If the user wants to jump to a
-// moment, they use the Transcript tab.
+// Note — timecodes: qa.txt instructs the LLM to include [MM:SS] markers ONLY
+// when (a) the answer came from the material (not web_search/general knowledge),
+// (b) the material itself has those markers, and (c) they genuinely locate the
+// relevant moment. Answers grounded in web_search must NOT include timestamps
+// — there's no video to jump to and any marker would be a hallucination.
+// Chat bubbles render WITH timecode-link injection (renderMarkdown(text, activeJob))
+// so valid material references become clickable seek links just like in Summary.
 //
 // QA stage badge: because the assistant bubble lives inside #pane-summary
 // (which gets display:none when the user switches to Transcript), the
@@ -184,11 +184,13 @@ async function _runQaTurn(jobId, question) {
         scrollMessagesToEnd();
       } else if (ev.type === "done") {
         const final = ev.content || acc;
-        // Render without timecode-link injection: QA answers may echo [MM:SS]
-        // markers from the transcript context but those should stay as plain
-        // text, not surprise navigation links. The Summary tab is the right
-        // place for timecode links; chat is a conversational surface.
-        assistantBubble.innerHTML = renderMarkdown(final, null);
+        // Render WITH timecode links — the QA prompt now ensures [MM:SS]
+        // markers only appear when the answer came from the material, so any
+        // marker the LLM emits is a real jump target (not a hallucination from
+        // web_search). Passing activeJob enables link injection for youtube/
+        // media jobs; page/pdf jobs short-circuit in renderMarkdown (no videoId
+        // or mediaPageUrl → plain text anyway).
+        assistantBubble.innerHTML = renderMarkdown(final, activeJob);
         _setQaStage(null);
         scrollMessagesToEnd();
       } else if (ev.type === "error") {
@@ -222,9 +224,10 @@ export function renderHistory(items) {
   for (const m of items) {
     const bubble = appendBubble(m.role, "", frag);
     if (m.role === "assistant") {
-      // No timecode-link injection in chat history — same reasoning as
-      // _runQaTurn above. Passing null keeps [MM:SS] as plain text.
-      bubble.innerHTML = renderMarkdown(m.content, null);
+      // Timecode links enabled — qa.txt prompt now guards against hallucinated
+      // timestamps from web_search, so any [MM:SS] in stored answers is a
+      // genuine material reference worth making clickable.
+      bubble.innerHTML = renderMarkdown(m.content, activeJob);
     } else {
       bubble.textContent = m.content;
     }
