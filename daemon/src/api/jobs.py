@@ -15,7 +15,9 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import json
 import logging
+import math
 from datetime import datetime
 from typing import Any
 
@@ -112,10 +114,82 @@ def _to_summary(job: Any) -> JobSummary:
     )
 
 
+def _build_segments_text(raw_segments_json: str | None) -> str | None:
+    """Render fine-grained Whisper segments as ``[MM:SS] text`` lines.
+
+    Returns ``None`` when no usable segments are present (legacy jobs,
+    pre-patch fallbacks). The Transcript UI parses each line back into a
+    cue via the same ``[MM:SS]`` regex it uses for the summary view, so
+    the format is compatible — only the granularity differs.
+    """
+    if not raw_segments_json:
+        return None
+    try:
+        segments = json.loads(raw_segments_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(segments, list) or not segments:
+        return None
+    # Hours-or-minutes marker format decided once for the whole text so
+    # the regex on the client side stays one variant per file.
+    last_start = 0.0
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            last_start = max(last_start, float(seg.get("start", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    use_hours = last_start >= 3600.0
+
+    lines: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            start = float(seg.get("start", 0.0))
+        except (TypeError, ValueError):
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        total = int(math.floor(start))
+        if use_hours:
+            h = total // 3600
+            m = (total % 3600) // 60
+            s = total % 60
+            marker = f"[{h:02d}:{m:02d}:{s:02d}]"
+        else:
+            m = total // 60
+            s = total % 60
+            marker = f"[{m:02d}:{s:02d}]"
+        lines.append(f"{marker} {text}")
+    if not lines:
+        return None
+    return "\n".join(lines) + "\n"
+
+
 def _to_details(job: Any) -> JobDetails:
     # Include in-flight buffer for running jobs so reconnecting clients can
     # replay buffered content without waiting for future delta events.
     partial = get_stream_buffer(job.id) if JobStatus(job.status) == JobStatus.RUNNING else None
+    # Pull cached translations for the transcript-tab language switcher.
+    # Empty list when nobody's translated this job yet; Phase 3 populates
+    # via POST /jobs/{id}/transcript/translate.
+    translations = repo.list_translations(job.id)
+    # Parse the alt-media-candidates JSON blob. Malformed payloads (should
+    # never happen — we wrote it ourselves) get logged and dropped rather
+    # than failing the whole job detail response; the picker just shows
+    # nothing in that case.
+    alt_candidates: list[Any] = []
+    raw_alts = getattr(job, "alt_media_candidates_json", None)
+    if raw_alts:
+        try:
+            parsed = json.loads(raw_alts)
+            if isinstance(parsed, list):
+                alt_candidates = parsed
+        except (ValueError, TypeError):
+            log.warning("api: malformed alt_media_candidates_json for job %s", job.id)
     return JobDetails(
         id=job.id,
         url=job.url,
@@ -134,6 +208,9 @@ def _to_details(job: Any) -> JobDetails:
         error=job.error,
         video_id=job.video_id,
         partial_summary=partial or None,
+        transcript_language=getattr(job, "transcript_language", None),
+        transcript_translations=translations,
+        alt_media_candidates=alt_candidates,
     )
 
 
@@ -213,6 +290,17 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             with contextlib.suppress(ValueError):
                 initial_title = youtube.extract_video_id(req.url)
 
+        # Pre-serialise the alt-media-candidates list so the storage layer
+        # stays Pydantic-free. Empty list and None both stored as NULL —
+        # the picker won't render with either, no need to distinguish.
+        alt_candidates_json: str | None = None
+        if req.alt_media_candidates:
+            alt_candidates_json = json.dumps(
+                [c.model_dump() for c in req.alt_media_candidates],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
         # Single create with progress_stage='extracting' avoids a needless
         # second update_status (and a second job event) right after creation.
         # repo.create_job emits job_event("created") for us.
@@ -221,6 +309,7 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             kind=kind.value,
             title=initial_title,
             progress_stage="extracting",
+            alt_media_candidates_json=alt_candidates_json,
         )
 
     # Spawn outside the lock — pipeline runs for minutes, holding the lock
@@ -285,6 +374,145 @@ def get_job(job_id: str) -> JobDetails:
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
     return _to_details(job)
+
+
+@router.post("/{job_id}/transcript/translate", status_code=202)
+async def translate_transcript(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Enqueue a transcript translation. Returns the current status of the row.
+
+    Body: ``{"lang": "ru"}`` (ISO-639-1 code, ISO-639-2, or English name;
+    see ``llm.languages.normalize_lang``). The call is **dedup**:
+
+    - Existing row in ``queued`` / ``running`` / ``done`` → no new task,
+      return the existing status.
+    - Existing row in ``failed`` → reset, re-spawn task.
+    - No row → insert ``queued``, spawn task.
+
+    Returns ``{language_code, status, progress_percent, is_source}``.
+    ``is_source=true`` means the requested language equals the
+    transcript's source language — we serve the original directly via
+    ``GET /transcript`` without running the LLM.
+    """
+    from src.llm.languages import UnknownLanguageError
+    from src.workers import translator
+
+    lang_input = (body or {}).get("lang")
+    if not isinstance(lang_input, str) or not lang_input.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing 'lang' field")
+
+    try:
+        return await translator.enqueue_translation(job_id, lang_input)
+    except KeyError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    except UnknownLanguageError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/{job_id}/transcript/retry-all", status_code=202)
+async def retry_all_transcript_translations(job_id: str) -> dict[str, Any]:
+    """Re-enqueue every ``failed`` translation row for this job.
+
+    Returns ``{retried: [TranscriptTranslationSummary, ...]}``. Empty
+    list when nothing was failed (idempotent). MUST be async because
+    spawning the translator workers calls ``asyncio.create_task`` under
+    the hood — that requires a running event loop, which a sync FastAPI
+    handler (run on a threadpool) doesn't have.
+    """
+    from src.workers import translator
+    try:
+        retried = await translator.retry_all_failed(job_id)
+    except KeyError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    return {"retried": retried}
+
+
+@router.get("/{job_id}/transcript")
+def get_transcript(job_id: str, lang: str | None = None) -> dict[str, Any]:
+    """Return the full transcript text for a job in the requested language.
+
+    Three response shapes, all ``200``:
+
+    - **Ready** ``{text: "...", language_code, is_original, is_pending: false}``
+      — the text is available, render it.
+    - **Pending** ``{text: null, ..., is_pending: true}`` — job exists but
+      the transcript isn't ready yet (extraction still running for source,
+      or translation in flight for a non-source language). The sidepanel
+      shows a placeholder + refetches on the next ``job_event`` for this
+      job. We do NOT 404 here because the Transcript tab opens as soon as
+      the user clicks it, often before the daemon has finished extraction
+      on a freshly-submitted job.
+    - **No-such-translation** ``404`` — the caller asked for a language
+      that has no row in ``transcript_translation`` at all. UI should
+      POST to ``/translate`` to start one.
+
+    The job itself missing is still a ``404`` (different message).
+
+    Lazy-loaded by the sidepanel's Transcript tab — the raw_text payload
+    can be megabytes for hour-long podcasts, so we keep it off JobDetails
+    and only serve it here when the user opens the tab.
+    """
+    job = repo.get_job(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
+
+    source_lang = getattr(job, "transcript_language", None)
+    requested = (lang or "").strip().lower() or None
+
+    is_original = requested is None or (
+        source_lang is not None and requested == source_lang
+    )
+    if is_original:
+        if not job.raw_text:
+            # Job exists but extraction hasn't finished yet (or failed
+            # before producing text). Return a "pending" sentinel rather
+            # than a 404 — the sidepanel re-asks on the next job event.
+            return {
+                "text": None,
+                "language_code": source_lang,
+                "is_original": True,
+                "is_pending": True,
+            }
+        # Prefer the fine-grained Whisper segments for the Transcript UI
+        # so each line corresponds to a real ~1-5 s utterance rather than
+        # the 30 s buckets ``raw_text`` uses for summary. Falls back to
+        # raw_text for legacy jobs and unpatched-mlx fallbacks where
+        # segments weren't captured.
+        text = _build_segments_text(job.raw_segments_json) or job.raw_text
+        return {
+            "text": text,
+            "language_code": source_lang,  # may be None for PDF / HTML
+            "is_original": True,
+            "is_pending": False,
+        }
+
+    # Cached translation lookup. ``requested`` is non-None by virtue of
+    # the ``is_original`` branch above (None or matching source already
+    # returned). Mypy doesn't track that flow — narrow explicitly.
+    assert requested is not None
+    translation = repo.get_translation(job_id, requested)
+    if translation is None:
+        # No row at all — caller must POST /translate first.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no cached {requested!r} translation for job {job_id}",
+        )
+    if translation.get("status") != "done":
+        # Row exists, work in flight (queued / running / failed). Pending
+        # sentinel so the UI shows a "translating…" placeholder for the
+        # body. Chip status is the canonical source for UI; this response
+        # is just the body for the currently-selected language.
+        return {
+            "text": None,
+            "language_code": requested,
+            "is_original": False,
+            "is_pending": True,
+        }
+    return {
+        "text": translation["text"],
+        "language_code": requested,
+        "is_original": False,
+        "is_pending": False,
+    }
 
 
 @router.delete("/{job_id}", status_code=204)

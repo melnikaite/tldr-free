@@ -8,11 +8,10 @@
 //
 // Token streaming: append plain text to the assistant bubble as it arrives,
 // then re-render via lib/markdown.js once the stream ends so [MM:SS] markers
-// become clickable YouTube links.
+// become clickable timecode links (YouTube or generic media).
 
 import { daemon } from "../lib/daemon-client.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { resolveVideoId } from "../lib/url.js";
 
 /** @import { ChatMessage, JobDetails } from "../lib/api-types.js" */
 
@@ -144,8 +143,7 @@ async function _runQaTurn(jobId, question) {
         scrollMessagesToEnd();
       } else if (ev.type === "done") {
         const final = ev.content || acc;
-        const videoId = resolveVideoId(activeJob);
-        assistantBubble.innerHTML = renderMarkdown(final, videoId);
+        assistantBubble.innerHTML = renderMarkdown(final, activeJob);
         scrollMessagesToEnd();
       } else if (ev.type === "error") {
         renderErrorBubble(assistantBubble, ev.error || "Error.");
@@ -173,11 +171,10 @@ export function renderHistory(items) {
   if (!messages) return;
   messages.innerHTML = "";
   const frag = document.createDocumentFragment();
-  const videoId = resolveVideoId(activeJob);
   for (const m of items) {
     const bubble = appendBubble(m.role, "", frag);
     if (m.role === "assistant") {
-      bubble.innerHTML = renderMarkdown(m.content, videoId);
+      bubble.innerHTML = renderMarkdown(m.content, activeJob);
     } else {
       bubble.textContent = m.content;
     }

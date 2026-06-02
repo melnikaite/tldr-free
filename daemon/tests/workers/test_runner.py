@@ -102,21 +102,20 @@ async def test_runner_processes_one_task_end_to_end(
         download_calls.append({"url": url, "dir": dir})
         return audio_file, 90.0
 
-    progress_calls: list[float] = []
-
-    async def fake_transcribe_stream(
+    async def fake_transcribe_audio(
         audio_path: Path,
         *,
         total_duration: float | None,
-        on_progress: Any,
-    ) -> list[dict[str, Any]]:
+    ):
         assert audio_path == audio_file
         assert total_duration == 90.0
-        if on_progress is not None:
-            for f in (0.33, 0.66, 1.0):
-                on_progress(f)
-                progress_calls.append(f)
-        return fake_segments
+        # Real return shape: TranscribeResult with segments + language.
+        from src.workers.transcribe import TranscribeResult
+        return TranscribeResult(
+            segments=fake_segments,
+            language="en",
+            duration_seconds=total_duration,
+        )
 
     summarize_calls: list[dict[str, Any]] = []
 
@@ -128,7 +127,7 @@ async def test_runner_processes_one_task_end_to_end(
             yield chunk
 
     monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
-    monkeypatch.setattr(runner_mod.transcribe, "transcribe_stream", fake_transcribe_stream)
+    monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
     monkeypatch.setattr(runner_mod.llm_summary, "stream_summarize", fake_stream_summarize)
     # Force the audio dir into tmp_path so we don't write into /data.
     monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
@@ -176,8 +175,8 @@ async def test_runner_processes_one_task_end_to_end(
     # No failure was recorded.
     assert fake_repo.failed_calls == []
 
-    # Progress callback fired for each fake chunk.
-    assert progress_calls == [0.33, 0.66, 1.0]
+    # Detected source language persisted on mark_done.
+    assert done.get("transcript_language") == "en"
 
     # Audio lifecycle: persisted after download, then cleared on success.
     assert len(fake_repo.set_audio_calls) == 2
@@ -243,16 +242,15 @@ async def test_runner_deletes_audio_even_on_transcribe_error(
     ) -> tuple[Path, float | None]:
         return guard.file, 60.0
 
-    async def fake_transcribe_stream(
+    async def fake_transcribe_audio(
         audio_path: Path,
         *,
         total_duration: float | None,
-        on_progress: Any,
-    ) -> list[dict[str, Any]]:
+    ):
         raise RuntimeError("mlx 503")
 
     monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
-    monkeypatch.setattr(runner_mod.transcribe, "transcribe_stream", fake_transcribe_stream)
+    monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
     monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
 
     q = WhisperQueue()

@@ -58,6 +58,32 @@ class Job(SQLModel, table=True):
     summary_md: str | None = None
     transcript_source: str | None = None
     video_id: str | None = None
+    # ISO-639-1 code of the transcript's source language. Filled mid-pipeline
+    # from Whisper's auto-detect (verbose_json) for media/youtube-via-whisper
+    # jobs, or from the YouTube caption track's language for the fast path.
+    # ``None`` for PDF / HTML pages (we don't run language detection on
+    # extracted text — falls back to "Original" in the language switcher).
+    transcript_language: str | None = None
+    # Fine-grained Whisper / YouTube segments as JSON — used by the
+    # Transcript tab UI to render one line per segment (typically 1-5 s
+    # each) with binary-search highlight on playback. ``raw_text`` stays
+    # at the 30-second-bucketed shape for summary / Q&A; this is its
+    # sibling for line-by-line display.
+    #
+    # Shape: ``[{"start": float, "end": float, "text": str}, ...]``,
+    # JSON-encoded as a text column for SQLite simplicity. Null for
+    # legacy jobs created before this column existed and for non-timed
+    # jobs (PAGE / PDF) where there's no segment structure.
+    raw_segments_json: str | None = None
+    # Other playable media sources the extension's scanner discovered on
+    # the page at job-creation time, JSON-encoded as
+    # ``[{"media_url": "...", "kind": "video"|"audio"|"iframe",
+    #    "label": "..."}, ...]``. Surfaced by the sidepanel as a "wrong
+    # source?" picker so the user can switch without re-running the
+    # whole extraction. The daemon never reads these itself — round-trip
+    # storage only. Null for legacy jobs and for pages with one (or
+    # zero) candidates.
+    alt_media_candidates_json: str | None = None
     # Set by the Whisper worker after a successful audio download. Persisted
     # so that a retry of a failed-mid-pipeline job can skip re-downloading.
     # Cleared (with the file unlinked) on mark_done and on delete_job.
@@ -75,6 +101,38 @@ class Message(SQLModel, table=True):
     role: str                                       # "user" | "assistant"
     content: str
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class TranscriptTranslation(SQLModel, table=True):
+    """One cached translation of a job's transcript into a target language.
+
+    The original transcript stays in ``Job.raw_text`` (in
+    ``Job.transcript_language``). Translations live here so they're cheap
+    to look up by ``(job_id, language_code)`` and CASCADE-delete with the
+    parent Job.
+
+    Status flow: ``queued`` → ``running`` → ``done`` | ``failed``.
+    ``text`` is populated only on ``done``; ``error`` only on ``failed``.
+    ``progress_percent`` is updated mid-chunk so the UI shows movement
+    without partial text leaking out (we render a spinner + percent, not
+    the streaming tokens — per the agreed UX).
+
+    Restart-safety: rows left in ``running`` at daemon startup are
+    re-enqueued by ``re_enqueue_pending`` because we have the source
+    ``Job.raw_text`` and the target language code — everything needed to
+    continue from scratch (we don't checkpoint partial output mid-chunk).
+    """
+
+    __tablename__ = "transcript_translation"
+
+    job_id: str = Field(foreign_key="job.id", primary_key=True)
+    language_code: str = Field(primary_key=True)
+    status: str = Field(index=True)
+    text: str | None = None
+    error: str | None = None
+    progress_percent: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

@@ -108,4 +108,42 @@ def build_marked_text(segments: list[dict[str, Any]], window_seconds: int) -> st
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["build_marked_text"]
+def format_segments_as_marked_text(segments: list[dict[str, Any]]) -> str:
+    """Emit one ``[MM:SS] text`` line per segment — no bucketing.
+
+    Sibling of ``build_marked_text`` that preserves the source's native
+    granularity (1-5 s per line for Whisper / yt-captions) rather than
+    grouping into N-second buckets. Used by:
+    - ``api/jobs.py`` ``_build_segments_text`` to serve the Transcript
+      tab's body.
+    - ``workers/translator.py`` to construct the translation source so
+      the translated transcript inherits the same fine granularity as
+      the original (not the coarse 30 s buckets that ``raw_text`` uses
+      for summary / Q&A).
+
+    Returns an empty string when the input is empty or every segment
+    has empty text after stripping.
+    """
+    if not segments:
+        return ""
+
+    max_start = max((_segment_start(s) for s in segments), default=0.0)
+    use_hours = max_start >= 3600.0
+
+    lines: list[str] = []
+    for seg in segments:
+        text = _segment_text(seg)
+        if not text:
+            continue
+        start = _segment_start(seg)
+        if start < 0:
+            start = 0.0
+        marker = _format_marker(int(math.floor(start)), use_hours=use_hours)
+        lines.append(f"[{marker}] {text}")
+
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+__all__ = ["build_marked_text", "format_segments_as_marked_text"]

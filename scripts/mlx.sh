@@ -23,7 +23,11 @@
 # Subcommands:
 #   install               Install mlx-openai-server in ~/.venvs/mlx-server +
 #                         seed ~/.mlx-server/config.yaml + download Gemma 4 E4B + Whisper
-#                         weights (~6 GB)
+#                         weights (~6 GB) + apply TLDR patches
+#   patch                 (Re-)apply TLDR's patches to the installed
+#                         mlx-openai-server. Run after every
+#                         `pip install --upgrade mlx-openai-server`. See
+#                         scripts/mlx-patches/README.md for what we patch.
 #   start                 Start mlx-server in background, write PID to
 #                         ~/.mlx-server/server.pid
 #   start-if-present      Start only if installed; no-op otherwise
@@ -139,6 +143,11 @@ cmd_install() {
     "$VENV/bin/pip" install --quiet mlx-openai-server
     ok "mlx-openai-server installed"
   fi
+
+  hdr "Apply TLDR patches to mlx-openai-server"
+  # Surfaces Whisper segments + language in the OpenAI-compatible response;
+  # required for fine-grained timecodes in the transcript-tab UI. Idempotent.
+  cmd_patch
 
   hdr "Set up $MLX_HOME (config + logs)"
   [ -f "$CONFIG_EXAMPLE" ] || err "$CONFIG_EXAMPLE not found"
@@ -263,6 +272,15 @@ cmd_stop() {
   rm -f "$PID_FILE"
 }
 
+cmd_patch() {
+  if [ ! -d "$VENV" ]; then
+    err "venv $VENV missing — run 'bash scripts/mlx.sh install' first"
+  fi
+  local apply_script="$REPO_ROOT/scripts/mlx-patches/apply.py"
+  [ -f "$apply_script" ] || err "patch script missing at $apply_script"
+  "$VENV/bin/python" "$apply_script" --venv "$VENV" || err "patch failed"
+}
+
 cmd_status() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
@@ -283,6 +301,7 @@ sub="${1:-}"
 shift || true
 case "$sub" in
   install)          cmd_install "$@" ;;
+  patch)            cmd_patch ;;
   start)            cmd_start ;;
   start-if-present) cmd_start_if_present ;;
   stop)             cmd_stop ;;

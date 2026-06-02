@@ -50,6 +50,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         log.exception("workers: re-enqueue on startup failed")
 
+    # Transcript translations left in ``running`` from before the restart.
+    # We have raw_text in the DB and the language code on the row, so we
+    # just spawn the worker again — it restarts the translation from
+    # chunk 0 (no partial-chunk checkpointing). User sees the spinner
+    # continue without having to click Retry.
+    try:
+        from src.workers import translator
+        n = translator.re_enqueue_running_on_startup()
+        if n:
+            log.info("workers: re-enqueued %d in-flight translation(s)", n)
+    except Exception:
+        log.exception("workers: translation re-enqueue on startup failed")
+
     worker_task: asyncio.Task[None] = asyncio.create_task(
         whisper_worker(queue, repo),
         name="whisper-worker",

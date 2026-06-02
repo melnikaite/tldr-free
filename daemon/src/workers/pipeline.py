@@ -26,6 +26,7 @@ Stage names are coordinated with the schema's AIStageEvent docs:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -302,6 +303,25 @@ async def _run_youtube(
         segments,
         window_seconds=cfg.youtube.segment_window_seconds,
     )
+    # Also serialise the fine-grained segments themselves so the Transcript
+    # tab can render one line per ~2-5 s caption cue (vs the 30 s buckets
+    # ``raw_text`` uses for summary). youtube-transcript-api hands us
+    # {start, duration, text}; we normalise into the {start, end, text}
+    # shape ``_build_segments_text`` in api/jobs.py consumes.
+    raw_segments_json: str | None = None
+    if len(segments) > 1:
+        normalised = [
+            {
+                "start": float(s.get("start", 0.0)),
+                "end": float(s.get("start", 0.0))
+                + float(s.get("duration", s.get("end", 0.0) - s.get("start", 0.0))),
+                "text": str(s.get("text") or ""),
+            }
+            for s in segments
+        ]
+        raw_segments_json = json.dumps(
+            normalised, ensure_ascii=False, separators=(",", ":"),
+        )
 
     # Pause checkpoint before another yt-dlp probe (metadata) + persist + summary.
     await _checkpoint_pause(job_id, broker, "extracting")
@@ -315,6 +335,13 @@ async def _run_youtube(
         url=url, cookies=cookies, scratch_dir=_subtitles_dir(),
     )
     title = metadata.get("title") or page_title
+    # yt-dlp's metadata probe already returns the video's primary language
+    # (or original_language for dubbed videos). Use that as the transcript
+    # source language — it's the closest signal we have on the fast path,
+    # because the caption track we picked may differ (e.g. auto-translated
+    # captions in another language). Best-effort only — None falls through
+    # cleanly and the UI shows "Original".
+    transcript_language = _normalise_lang_code(metadata.get("language"))
 
     _persist_extracted(
         job_id,
@@ -322,6 +349,8 @@ async def _run_youtube(
         title=title,
         transcript_source=transcript_source,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
     broker.publish(job_id, stage_event("ready"))
 
@@ -331,6 +360,8 @@ async def _run_youtube(
         title=title,
         transcript_source=transcript_source,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
         cfg=cfg,
     )
 
@@ -444,6 +475,26 @@ async def _run_pdf(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_lang_code(raw: Any) -> str | None:
+    """Lowercase + strip a language code from yt-dlp / whisper output.
+
+    yt-dlp's ``info.get("language")`` sometimes returns ``"en-US"`` or a
+    full name; we keep the value short here (just lowercase + first two
+    chars when it looks like ``xx-YY``) and leave full canonicalisation
+    to the Phase 3 language helper. ``None`` and empty strings come back
+    as ``None`` so the column stays null for "we don't know".
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    # ``en-US`` / ``ru-ru`` style — keep the first segment.
+    if "-" in s and len(s.split("-", 1)[0]) == 2:
+        s = s.split("-", 1)[0]
+    return s
+
+
 def _persist_extracted(
     job_id: str,
     *,
@@ -451,6 +502,8 @@ def _persist_extracted(
     title: str | None,
     transcript_source: TranscriptSource,
     video_id: str | None = None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
 ) -> None:
     """Set raw_text + transcript_source + video_id mid-pipeline (no status change).
 
@@ -465,6 +518,8 @@ def _persist_extracted(
         transcript_source=transcript_source.value,
         title=title,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
 
 
@@ -475,6 +530,8 @@ async def _summarize_and_finish(
     title: str | None,
     transcript_source: TranscriptSource,
     video_id: str | None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
     cfg: Any,
 ) -> None:
     """Run streaming summarization and mark the job done.
@@ -546,6 +603,8 @@ async def _summarize_and_finish(
         transcript_source=transcript_source.value,
         title=title,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
     broker.publish(job_id, done_event(summary_md))
 

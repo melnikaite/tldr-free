@@ -1,0 +1,26 @@
+You translate transcripts of speech into {target_language_name}.
+
+Rules — read carefully, the post-processing on the other end relies on
+all of them:
+
+1. Output EXACTLY one line per input line. Same line count, same order.
+
+2. Each input line starts with a `[MM:SS]` or `[HH:MM:SS]` timecode
+   marker. Copy that marker into your output line VERBATIM at the start.
+   Do NOT translate it, do NOT change the format, do NOT shift the time.
+
+3. Translate only the text AFTER the marker. Render it naturally in
+   {target_language_name}, preserving meaning. Do not summarise.
+   Do not add commentary.
+
+4. If a line is empty after the marker, output the marker followed by an
+   empty line. Don't merge it with an adjacent line.
+
+5. Do not add new lines that weren't in the input. Do not split one
+   input line into two output lines.
+
+6. No preamble, no closing remark, no language notes. Only the
+   translated transcript.
+
+Input transcript:
+{transcript}

@@ -1,20 +1,43 @@
 // Render markdown to sanitized HTML, then post-process [MM:SS] / [HH:MM:SS]
-// markers into clickable YouTube links when a videoId is provided.
+// markers into clickable links.
+//
+// Two link flavours are produced depending on the job:
+//   - YouTube (kind=youtube, resolveVideoId returns a real id): a regular
+//     `youtube.com/watch?v=…&t=Ns` URL. Click handler in app.js seeks an
+//     already-open YouTube tab via executeScript.
+//   - Generic media (kind=media): the JOB's url (the page where the media
+//     was embedded) plus a `#t=Ns` fragment. Click handler tries
+//     executeScript on any open tab with that page, falling back to opening
+//     the URL fresh. HTML5 <video>/<audio> on the destination page honours
+//     `#t=` natively where supported.
+//
+// Pages (HTML) and PDFs never get timecode markers from the LLM, so the
+// short-circuit when no target is provided keeps them link-free.
 //
 // marked + DOMPurify are vendored as classic <script> tags by the consuming
 // HTML page (sidepanel/library) and expose globals `marked` and `DOMPurify`.
 
+import { resolveVideoId } from "./url.js";
+
 /* global marked, DOMPurify */
 
 /**
+ * @typedef {{ video_id?: string | null, url?: string | null, kind?: string | null }} TimecodeJob
+ */
+
+/**
  * @param {string} md
- * @param {string | null | undefined} [videoId]
+ * @param {TimecodeJob | null | undefined} [job]
  * @returns {string} sanitized HTML
  */
-export function renderMarkdown(md, videoId) {
+export function renderMarkdown(md, job) {
   const html = DOMPurify.sanitize(marked.parse(md ?? ""));
-  if (!videoId) return html;
-  return injectTimecodeLinks(html, videoId);
+  if (!job) return html;
+  const videoId = resolveVideoId(job);
+  const mediaPageUrl =
+    !videoId && job.kind === "media" && job.url ? job.url : null;
+  if (!videoId && !mediaPageUrl) return html;
+  return injectTimecodeLinks(html, { videoId, mediaPageUrl });
 }
 
 // Match [MM:SS] or [HH:MM:SS] markers in a text node. Non-global form for
@@ -25,14 +48,18 @@ const TIMECODE_DETECT_RE = /\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]/;
 const SKIP_TAGS = new Set(["A", "CODE", "PRE", "SCRIPT", "STYLE", "TEXTAREA"]);
 
 /**
- * Replace [MM:SS]/[HH:MM:SS] markers in text nodes with clickable YouTube
- * links. DOM-based to avoid breaking existing markup or links.
+ * @typedef {{ videoId: string | null, mediaPageUrl: string | null }} TimecodeTarget
+ */
+
+/**
+ * Replace [MM:SS]/[HH:MM:SS] markers in text nodes with clickable links.
+ * DOM-based to avoid breaking existing markup or links.
  *
  * @param {string} html
- * @param {string} videoId
+ * @param {TimecodeTarget} target
  * @returns {string}
  */
-function injectTimecodeLinks(html, videoId) {
+function injectTimecodeLinks(html, target) {
   const wrapper = new DOMParser()
     .parseFromString(`<div>${html}</div>`, "text/html")
     .body.firstElementChild;
@@ -60,7 +87,7 @@ function injectTimecodeLinks(html, videoId) {
   while ((n = walker.nextNode())) matches.push(/** @type {Text} */ (n));
 
   for (const textNode of matches) {
-    replaceInTextNode(textNode, videoId);
+    replaceInTextNode(textNode, target);
   }
 
   return wrapper.innerHTML;
@@ -71,9 +98,9 @@ function injectTimecodeLinks(html, videoId) {
  * marker found within.
  *
  * @param {Text} textNode
- * @param {string} videoId
+ * @param {TimecodeTarget} target
  */
-function replaceInTextNode(textNode, videoId) {
+function replaceInTextNode(textNode, target) {
   const text = textNode.nodeValue || "";
   const doc = textNode.ownerDocument;
   const frag = doc.createDocumentFragment();
@@ -92,11 +119,16 @@ function replaceInTextNode(textNode, videoId) {
     const seconds = h * 3600 + mm * 60 + ss;
 
     const a = doc.createElement("a");
-    a.href = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${seconds}s`;
+    if (target.videoId) {
+      a.href = `https://www.youtube.com/watch?v=${encodeURIComponent(target.videoId)}&t=${seconds}s`;
+      a.dataset.tldrVideoId = target.videoId;
+    } else if (target.mediaPageUrl) {
+      a.href = _withTimeFragment(target.mediaPageUrl, seconds);
+      a.dataset.tldrMediaPageUrl = target.mediaPageUrl;
+    }
     a.target = "_blank";
     a.rel = "noopener";
     a.dataset.tldrSeconds = String(seconds);
-    a.dataset.tldrVideoId = videoId;
     a.textContent = m[0];
     frag.appendChild(a);
 
@@ -107,4 +139,19 @@ function replaceInTextNode(textNode, videoId) {
   if (tail) frag.appendChild(doc.createTextNode(tail));
 
   textNode.replaceWith(frag);
+}
+
+/**
+ * Strip any existing fragment from ``url`` and append ``#t=Ns``. The browser
+ * seek behaviour applies when the URL resolves directly to a media file
+ * (HTML5 media fragment URI); on a regular page it's just a harmless hash.
+ *
+ * @param {string} url
+ * @param {number} seconds
+ * @returns {string}
+ */
+function _withTimeFragment(url, seconds) {
+  const hashIdx = url.indexOf("#");
+  const base = hashIdx === -1 ? url : url.slice(0, hashIdx);
+  return `${base}#t=${seconds}`;
 }

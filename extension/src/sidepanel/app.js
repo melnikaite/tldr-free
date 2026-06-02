@@ -31,9 +31,47 @@
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { resolveVideoId } from "../lib/url.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
-import { setActiveJob, getActiveJob, renderHistory, clearChat } from "./chat.js";
+import {
+  setActiveJob as _chatSetActiveJob,
+  getActiveJob,
+  renderHistory,
+  clearChat,
+} from "./chat.js";
+import * as transcript from "./transcript.js";
+
+/** Remember the id we last broadcast so we only reset the tab on real switches. */
+let _lastBroadcastJobId = /** @type {string | null} */ (null);
+
+/**
+ * Set the active job everywhere that cares about it: chat (Q&A bubbles,
+ * history rendering) and the transcript tab controller (lazy fetch +
+ * polling lifecycle). Always go through this wrapper rather than calling
+ * the chat-only setter directly — the transcript tab needs to know when
+ * the job changes to reset its cache and stop the currentTime poll.
+ *
+ * When the user actually switches Chrome tabs to a different summarised
+ * job (id A → id B), the visual tab is reset to Summary so they see
+ * the canonical view of the new content. We deliberately do NOT reset
+ * when going from "no job" → "job" (the user just clicked Process from
+ * the Transcript tab; keep them there to watch the transcript stream
+ * in) or for in-place patches (same id, e.g. yt-dlp title fill).
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ */
+function setActiveJob(job) {
+  _chatSetActiveJob(job);
+  transcript.setJob(job);
+  const newId = job?.id ?? null;
+  const wasNoJob = _lastBroadcastJobId == null;
+  if (newId !== _lastBroadcastJobId) {
+    _lastBroadcastJobId = newId;
+    // Only force a summary-tab view when the user actually switched
+    // between two existing jobs. Going from no-job → job is the
+    // "just kicked off processing" path — leave the tab choice alone.
+    if (!wasNoJob && typeof switchTab === "function") switchTab("summary");
+  }
+}
 
 // Sidepanel needs every event type — stage/delta drive the active job's
 // timeline + summary stream, job/workers drive the badge.
@@ -67,22 +105,74 @@ openLibraryBtn?.addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tab switching (Summary | Transcript)
+//
+// Two buttons in #tab-nav, two panes (#pane-summary / #pane-transcript). The
+// Transcript tab button is hidden by transcript.js when the active job's
+// kind doesn't have a meaningful transcript (page / pdf). When the user
+// switches to it the first time for a given job, transcript.js lazy-loads
+// the body via GET /jobs/{id}/transcript.
+// ---------------------------------------------------------------------------
+
+const summaryTabBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("tab-summary"));
+const transcriptTabBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("tab-transcript"));
+const summaryPaneEl = /** @type {HTMLElement | null} */ (document.getElementById("pane-summary"));
+const transcriptPaneEl = /** @type {HTMLElement | null} */ (document.getElementById("pane-transcript"));
+
+/** @param {"summary" | "transcript"} which */
+function switchTab(which) {
+  if (!summaryTabBtn || !transcriptTabBtn || !summaryPaneEl || !transcriptPaneEl) return;
+  const wantSummary = which === "summary";
+  summaryTabBtn.classList.toggle("tab--active", wantSummary);
+  transcriptTabBtn.classList.toggle("tab--active", !wantSummary);
+  summaryTabBtn.setAttribute("aria-selected", String(wantSummary));
+  transcriptTabBtn.setAttribute("aria-selected", String(!wantSummary));
+  summaryPaneEl.classList.toggle("tab-pane--active", wantSummary);
+  transcriptPaneEl.classList.toggle("tab-pane--active", !wantSummary);
+  // Show/hide via the active class — tab-pane is display:none by default.
+  if (wantSummary) {
+    transcript.onTabHide();
+  } else {
+    transcript.onTabShow();
+  }
+}
+
+summaryTabBtn?.addEventListener("click", () => switchTab("summary"));
+transcriptTabBtn?.addEventListener("click", () => switchTab("transcript"));
+
+// ---------------------------------------------------------------------------
 // Timecode link handler — click on a [MM:SS] link in the summary.
-// If the YouTube video is already open in a tab: focus that tab and seek
-// the video element directly (no page reload). Otherwise open a new tab.
+//
+// Two flavours:
+//   - YouTube (data-tldr-video-id): focus the YouTube tab if open, seek the
+//     <video> element directly. Otherwise open a new tab at the timestamped
+//     URL — YouTube's player honours the `t=` query param.
+//   - Generic media (data-tldr-media-page-url): focus the page tab if open,
+//     try to seek the first <video>/<audio> element on the page via
+//     executeScript. Otherwise open the URL with the `#t=Ns` media-fragment
+//     in the href — works for direct media file URLs natively; on regular
+//     pages the user has to scrub manually but they at least land on the
+//     right page.
+//
 // Delegated on summaryEl so it works across dynamic rerenders.
 // ---------------------------------------------------------------------------
 
-summaryEl.addEventListener("click", (ev) => {
+// Delegated on ``document.body`` so it works in BOTH panes: timecode links
+// appear inside the summary (#summary), inside chat bubbles (#chat-messages),
+// AND inside the transcript view (#pane-transcript). A handler bound to
+// summaryEl misses the latter and the click falls through to the generic
+// external-link handler — which opens a fresh tab instead of seeking the
+// already-open one.
+document.body.addEventListener("click", (ev) => {
   const a = /** @type {HTMLElement} */ (ev.target).closest("a[data-tldr-seconds]");
-  // Only intercept plain left-clicks — let ctrl/cmd/middle-click fall through
-  // to the browser's native "open in new tab" behaviour.
   if (!a || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
   ev.preventDefault();
-  const seconds = Number(/** @type {HTMLElement} */ (a).dataset.tldrSeconds);
-  const videoId = /** @type {HTMLElement} */ (a).dataset.tldrVideoId || "";
+  const el = /** @type {HTMLElement} */ (a);
+  const seconds = Number(el.dataset.tldrSeconds);
+  const videoId = el.dataset.tldrVideoId || "";
+  const mediaPageUrl = el.dataset.tldrMediaPageUrl || "";
   const fallbackUrl = /** @type {HTMLAnchorElement} */ (a).href;
-  _openTimecode(videoId, seconds, fallbackUrl).catch((err) =>
+  _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }).catch((err) =>
     console.warn("[TLDR] timecode open failed:", err),
   );
 });
@@ -90,8 +180,9 @@ summaryEl.addEventListener("click", (ev) => {
 /**
  * Find an already-open tab for ``url``.
  * YouTube URLs are matched by video ID so extra query params (&t=, &autoplay=,
- * etc.) on the open tab don't prevent the match.  All other URLs are matched
- * by exact string equality.
+ * etc.) on the open tab don't prevent the match. Other URLs are matched by
+ * canonical form (fragment stripped on both sides), so a timecode anchor
+ * like ``…/podcast#t=754`` matches the live tab at ``…/podcast``.
  * Returns the first matching Tab, or ``undefined`` if none is open.
  *
  * @param {string} url
@@ -111,8 +202,19 @@ async function _findTab(url) {
         }
       });
     }
+    parsed.hash = "";
+    const canonical = parsed.toString();
     const tabs = await chrome.tabs.query({});
-    return tabs.find((t) => t.url === url);
+    return tabs.find((t) => {
+      if (!t.url) return false;
+      try {
+        const tabUrl = new URL(t.url);
+        tabUrl.hash = "";
+        return tabUrl.toString() === canonical;
+      } catch {
+        return t.url === url;
+      }
+    });
   } catch {
     return undefined;
   }
@@ -131,22 +233,30 @@ async function _focusTab(tab) {
 }
 
 /**
- * Focus an existing YouTube tab playing this video and seek to ``seconds``,
- * or open a new tab if none is found.
+ * Seek to ``seconds`` on the source page if it's open, else open a new tab.
  *
- * @param {string} videoId
- * @param {number} seconds
- * @param {string} fallbackUrl
+ * For YouTube: lookup is by video id (handled inside ``_findTab``), seek
+ * targets ``video`` only.
+ * For generic media: lookup is by canonical page URL, seek targets the first
+ * ``video, audio`` element — covers HTML5 audio players, podcast pages,
+ * direct .mp4/.webm files. Iframe-embedded players (YouTube-in-iframe,
+ * Vimeo, etc.) won't seek because the iframe is a separate document scope;
+ * we don't try to message-pass into them.
+ *
+ * @param {{ videoId: string, mediaPageUrl: string, seconds: number, fallbackUrl: string }} opts
  */
-async function _openTimecode(videoId, seconds, fallbackUrl) {
-  const existing = await _findTab(fallbackUrl);
+async function _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }) {
+  const lookupUrl = videoId ? fallbackUrl : mediaPageUrl || fallbackUrl;
+  const existing = await _findTab(lookupUrl);
   if (existing?.id !== undefined) {
     await _focusTab(existing);
     await chrome.scripting.executeScript({
       target: { tabId: existing.id },
       func: (t) => {
-        const video = document.querySelector("video");
-        if (video) video.currentTime = t;
+        const media = /** @type {HTMLMediaElement | null} */ (
+          document.querySelector("video, audio")
+        );
+        if (media) media.currentTime = t;
       },
       args: [seconds],
     });
@@ -285,6 +395,13 @@ eventStream.subscribe((event) => {
 function handleJobEvent(event) {
   const j = event.job;
   if (!j?.id) return;
+  // Translation-progress pings are NOT job-state mutations — they piggyback
+  // on the job-event channel for fan-out but their payload describes the
+  // translation row (kind="transcript_translation", status="running", …).
+  // Merging those fields into the Job would clobber kind and status,
+  // hiding the Transcript tab and confusing the summary view. transcript.js
+  // owns chip updates; the badge / patch logic here ignores them.
+  if (event.action === "translation_updated") return;
   if (event.action === "deleted") {
     activeJobIds.delete(j.id);
     streamAccCache.delete(j.id);
@@ -602,7 +719,7 @@ function renderState(state) {
 
     case "done": {
       const titleHtml = _titleHtml(state.job);
-      const html = renderMarkdown(state.content || "_(empty summary)_", resolveVideoId(state.job));
+      const html = renderMarkdown(state.content || "_(empty summary)_", state.job);
       summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
       setStage(null);
       syncChatEnabled(true);
@@ -641,7 +758,44 @@ function _titleHtml(job) {
   if (!job?.title) return "";
   const safeUrl = escapeHtml(job.url);
   const safeTitle = escapeHtml(job.title);
-  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>`;
+  const altHtml = _altSourcesHtml(job);
+  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>${altHtml}`;
+}
+
+/**
+ * "Wrong source?" chip for media jobs with multiple candidates on the
+ * source page. Read-only for now — clicking expands a list of the other
+ * candidates with their labels + URLs so the user can SEE we picked
+ * something else, but switching requires manual "Process this page" on
+ * another tab (Phase 2 wires actual one-click switch + old-job delete).
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ * @returns {string}
+ */
+function _altSourcesHtml(job) {
+  const alts = job?.alt_media_candidates || [];
+  if (alts.length === 0) return "";
+  const items = alts
+    .map((c) => {
+      const label = escapeHtml(c.label || c.media_url);
+      const kind = escapeHtml(c.kind || "media");
+      const url = escapeHtml(c.media_url);
+      return `<li class="alt-source-item">
+        <span class="alt-source-kind">${kind}</span>
+        <span class="alt-source-label">${label}</span>
+        <code class="alt-source-url">${url}</code>
+      </li>`;
+    })
+    .join("");
+  const count = alts.length;
+  const word = count === 1 ? "source" : "sources";
+  return `<details class="alt-sources">
+    <summary>Wrong source? ${count} other ${word} on this page</summary>
+    <ul class="alt-source-list">${items}</ul>
+    <p class="alt-sources-hint muted small">
+      Picker coming next — for now: open the right one in its own tab and re-run.
+    </p>
+  </details>`;
 }
 
 function _bindSummarizeButton() {
@@ -695,7 +849,6 @@ function _bindRetryButton(job) {
 function _attachStreamSubscription(job) {
   const timelineEl = /** @type {HTMLElement} */ (document.getElementById("phase-timeline"));
   const streamEl = /** @type {HTMLElement} */ (document.getElementById("summary-stream"));
-  const videoId = resolveVideoId(job);
   const initialStage = job.progress_stage || "queued";
 
   /** @type {Array<{stage:string, detail:(string|undefined), status:"active"|"done"|"failed", error?:string}>} */
@@ -715,7 +868,7 @@ function _attachStreamSubscription(job) {
 
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
-    streamEl.innerHTML = renderMarkdown(acc, videoId);
+    streamEl.innerHTML = renderMarkdown(acc, job);
   }
 
   // rAF throttle: multiple delta events in the same JS task batch collapse
@@ -724,7 +877,7 @@ function _attachStreamSubscription(job) {
     if (rafId !== null) return;
     rafId = requestAnimationFrame(() => {
       rafId = null;
-      if (acc) streamEl.innerHTML = renderMarkdown(acc, videoId);
+      if (acc) streamEl.innerHTML = renderMarkdown(acc, job);
     });
   };
   const cancelRender = () => {

@@ -167,6 +167,49 @@ export const daemon = {
   retryJob: (id) => request(`/jobs/${id}/retry`, { method: "POST" }),
 
   /**
+   * Fetch the full transcript text for a job in the requested language.
+   * Lazy — the sidepanel only calls this when the Transcript tab opens.
+   *
+   * Omit ``lang`` to get the original (Job.raw_text). Pass a language
+   * code to get a cached translation — 404 if not cached.
+   *
+   * @param {string} id
+   * @param {string} [lang]
+   * @returns {Promise<import("./api-types.js").TranscriptResponse>}
+   */
+  getTranscript: (id, lang) => {
+    const qs = lang ? `?lang=${encodeURIComponent(lang)}` : "";
+    return request(`/jobs/${id}/transcript${qs}`);
+  },
+
+  /**
+   * Enqueue a transcript translation. Dedup: a second call for an
+   * already in-flight or completed translation is a no-op (returns the
+   * existing status). The sidepanel uses /events to learn when the
+   * translation finishes — no need to poll this endpoint.
+   *
+   * @param {string} id
+   * @param {string} lang  - ISO-639-1 code, ISO-639-2, or English name
+   * @returns {Promise<{language_code: string, status: string, progress_percent: number, is_source?: boolean}>}
+   */
+  translateTranscript: (id, lang) =>
+    request(`/jobs/${id}/transcript/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang }),
+    }),
+
+  /**
+   * Re-enqueue every failed translation for this job. Idempotent (no-op
+   * when nothing is failed).
+   *
+   * @param {string} id
+   * @returns {Promise<{retried: import("./api-types.js").TranscriptTranslationSummary[]}>}
+   */
+  retryAllTranslations: (id) =>
+    request(`/jobs/${id}/transcript/retry-all`, { method: "POST" }),
+
+  /**
    * Background workers control: a single global pause covers both the
    * Whisper queue and the per-job pipeline (so it works regardless of
    * which LLM/Whisper backend is configured). In-flight work finishes;

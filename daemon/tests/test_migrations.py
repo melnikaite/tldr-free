@@ -44,10 +44,10 @@ def _trigger_names(engine) -> set[str]:
 def test_migrations_create_core_tables(fresh_engine) -> None:
     """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1, 2]
+    assert applied == [1, 2, 3, 4, 5]
 
     tables = _table_names(fresh_engine)
-    for required in ("job", "message", "_migrations"):
+    for required in ("job", "message", "transcript_translation", "_migrations"):
         assert required in tables, f"missing table {required!r}; got {tables}"
 
     # v2 dropped FTS5 infrastructure
@@ -55,15 +55,29 @@ def test_migrations_create_core_tables(fresh_engine) -> None:
     triggers = _trigger_names(fresh_engine)
     assert not {"job_ai", "job_ad", "job_au"} & triggers
 
+    # v3 added the language column; v4 added raw_segments_json;
+    # v5 added alt_media_candidates_json
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "transcript_language" in cols
+    assert "raw_segments_json" in cols
+    assert "alt_media_candidates_json" in cols
+
 
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1, 2]
+    assert first == [1, 2, 3, 4, 5]
     assert second == []  # nothing new to apply
 
     tables = _table_names(fresh_engine)
     assert "job" in tables
+    assert "transcript_translation" in tables
     assert "job_fts" not in tables
 
 

@@ -270,6 +270,189 @@ def test_get_job_404(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+def test_get_transcript_serves_original_text(client: TestClient) -> None:
+    """Without ``?lang=`` the endpoint returns Job.raw_text directly."""
+    create = client.post(
+        "/jobs",
+        json={"url": "https://x/transcript", "kind": "page", "page_text": "hello world"},
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.get(f"/jobs/{create['id']}/transcript")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_original"] is True
+    assert "hello" in body["text"].lower()
+
+
+def test_get_transcript_404_for_unknown_job(client: TestClient) -> None:
+    r = client.get("/jobs/does-not-exist/transcript")
+    assert r.status_code == 404
+
+
+def test_get_transcript_unknown_language_404(client: TestClient) -> None:
+    """No cached translation row at all → 404; the caller is expected to POST
+    the translate endpoint to start one. In-flight translations come back as
+    ``is_pending: true`` (see ``test_get_transcript_pending_when_translating``
+    over in the translator tests)."""
+    create = client.post(
+        "/jobs",
+        json={"url": "https://x/tx-ru", "kind": "page", "page_text": "english body"},
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.get(f"/jobs/{create['id']}/transcript", params={"lang": "ru"})
+    assert r.status_code == 404
+
+
+def test_get_transcript_serves_segments_when_available(client: TestClient) -> None:
+    """When ``Job.raw_segments_json`` is populated (Whisper / YouTube fast
+    path with our v4 schema), the endpoint serves fine-grained text — one
+    line per segment — instead of the 30 s buckets in ``raw_text``. This is
+    the key payoff of Fix C / Fix I; without it the Transcript tab would
+    show coarse buckets even when the data is finer."""
+    from src.storage import repo as repo_module
+
+    create = client.post(
+        "/jobs",
+        json={"url": "https://x/finesegs", "kind": "page", "page_text": "x"},
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    # Force a fine-grained segments payload onto the row + set source lang.
+    import json as _json
+    segments = [
+        {"start": 0.0, "end": 1.5, "text": "first"},
+        {"start": 1.5, "end": 3.0, "text": "second"},
+        {"start": 3.0, "end": 4.5, "text": "third"},
+    ]
+    repo_module.set_extracted(
+        create["id"],
+        raw_text="[00:00] coarse bucket\n",
+        transcript_source="whisper",
+        transcript_language="en",
+        raw_segments_json=_json.dumps(segments),
+    )
+
+    r = client.get(f"/jobs/{create['id']}/transcript")
+    assert r.status_code == 200
+    body = r.json()
+    # The fine-grained text won the source preference.
+    assert "first" in body["text"]
+    assert "second" in body["text"]
+    assert "third" in body["text"]
+    # Three lines from three segments — not one coarse line.
+    lines = [ln for ln in body["text"].splitlines() if ln.strip()]
+    assert len(lines) == 3
+
+
+def test_get_transcript_falls_back_to_raw_text_without_segments(client: TestClient) -> None:
+    """Legacy jobs and PAGE/PDF jobs have no raw_segments_json — the
+    endpoint must still serve raw_text rather than 404."""
+    create = client.post(
+        "/jobs",
+        json={"url": "https://x/legacy", "kind": "page", "page_text": "body content"},
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.get(f"/jobs/{create['id']}/transcript")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_original"] is True
+    assert body["is_pending"] is False
+    # PAGE jobs have raw_text equal to the input text — verify we got it.
+    assert "body content" in body["text"].lower() or body["text"]
+
+
+def test_get_transcript_pending_when_raw_text_missing(client: TestClient) -> None:
+    """Job exists but raw_text not yet saved → 200 with is_pending=true so
+    the Transcript tab shows a placeholder instead of an error toast."""
+    # Submit a YouTube job that defers to Whisper (no page_text). The
+    # background pipeline will go into "queued" / "running" without
+    # raw_text immediately. We don't wait for it to finish — we hit the
+    # endpoint while raw_text is still empty.
+    from src.storage import repo as repo_module
+
+    job = repo_module.create_job(
+        url="https://example.com/pending",
+        kind="page",
+        title="Pending",
+    )
+    # ``create_job`` leaves raw_text=None — perfect for this test.
+
+    r = client.get(f"/jobs/{job.id}/transcript")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_pending"] is True
+    assert body["text"] is None
+    assert body["is_original"] is True
+
+
+def test_post_jobs_persists_alt_media_candidates(client: TestClient) -> None:
+    """When the extension finds multiple media sources on a page (lecture
+    page with 3 talks, news article with promo + main video, etc.) the
+    primary one is used as ``media_url`` and the rest ride along on the
+    job. GET /jobs/{id} surfaces them under ``alt_media_candidates`` so
+    the sidepanel can render the "wrong source?" picker."""
+    from unittest.mock import patch
+
+    # Don't actually run yt-dlp — we only care that POST/GET round-trips
+    # the alt-candidates list. The pipeline can fail; the field is
+    # written before the pipeline ever starts.
+    with patch(
+        "src.workers.pipeline.run_pipeline",
+        new=lambda *a, **kw: __import__("asyncio").sleep(0),
+    ):
+        r = client.post(
+            "/jobs",
+            json={
+                "url": "https://lecture.example/talks",
+                "kind": "media",
+                "media_url": "https://lecture.example/talk-1.mp4",
+                "alt_media_candidates": [
+                    {
+                        "media_url": "https://lecture.example/talk-2.mp4",
+                        "kind": "video",
+                        "label": "Talk 2",
+                    },
+                    {
+                        "media_url": "https://lecture.example/talk-3.mp4",
+                        "kind": "video",
+                        "label": "Talk 3",
+                    },
+                ],
+            },
+        )
+        assert r.status_code == 202, r.text
+        job_id = r.json()["id"]
+
+        detail = client.get(f"/jobs/{job_id}").json()
+        assert "alt_media_candidates" in detail
+        alts = detail["alt_media_candidates"]
+        assert len(alts) == 2
+        assert {a["media_url"] for a in alts} == {
+            "https://lecture.example/talk-2.mp4",
+            "https://lecture.example/talk-3.mp4",
+        }
+        assert all(a["kind"] == "video" for a in alts)
+        assert {a["label"] for a in alts} == {"Talk 2", "Talk 3"}
+
+
+def test_get_job_returns_empty_alt_media_for_legacy_rows(client: TestClient) -> None:
+    """Jobs created before v5 (or jobs from pages with a single source)
+    must return an empty list — not null — so the sidepanel can rely on
+    ``.length`` without an extra null check."""
+    r = client.post(
+        "/jobs",
+        json={"url": "https://example.com/single", "kind": "page", "page_text": "hi"},
+    )
+    job_id = r.json()["id"]
+    _wait_until_done(client, job_id)
+
+    detail = client.get(f"/jobs/{job_id}").json()
+    assert detail["alt_media_candidates"] == []
+
+
 def test_list_filters_by_exact_url(client: TestClient) -> None:
     """Extension uses ?url= to find the cached job for the current tab."""
     target = "https://example.com/article-x"
