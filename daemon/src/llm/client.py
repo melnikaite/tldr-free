@@ -136,12 +136,19 @@ async def complete_with_messages(
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
     max_tokens: int = 1500,
     temperature: float = 0.3,
     respect_pause: bool = False,
 ) -> Any:
     """Non-streaming chat completion from a messages list. Returns the raw
-    OpenAI ``ChatCompletion`` object so the caller can inspect tool_calls."""
+    OpenAI ``ChatCompletion`` object so the caller can inspect tool_calls.
+
+    ``tool_choice`` mirrors the OpenAI API field:
+    - None / not set → "auto" when tools are provided (default)
+    - "required" → the model MUST call one of the tools
+    - {"type": "function", "function": {"name": "…"}} → force a specific tool
+    """
     await _acquire_llm_slot(respect_pause)
     try:
         kwargs: dict[str, Any] = dict(
@@ -153,7 +160,7 @@ async def complete_with_messages(
         )
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
         return await _client().chat.completions.create(**kwargs)
     finally:
         _llm_lock().release()
