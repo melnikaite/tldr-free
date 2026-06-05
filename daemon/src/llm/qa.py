@@ -5,31 +5,30 @@ Public surface:
         -> AsyncIterator[str | dict[str, Any]]
 
         Builds context = job.raw_text if it fits, else job.summary_md.
-        Offers a ``web_search`` tool to the LLM. If invoked, fetches real
-        page content (trafilatura-cleaned), injects into conversation, then
-        streams the final answer.
 
-        Two extra reliability layers on top of the basic tool-use flow:
+        Routing is language-agnostic and decided by the model itself, not
+        by keyword matching. We offer TWO tools and require the model to
+        pick exactly one (tool_choice="required"):
 
-        1. Forced search for explicit user intent: when the question
-           contains clear search-request words ("поищи", "найди", "ищи",
-           "search", "find", "look up", …) we set tool_choice="required"
-           so the LLM *must* call the tool rather than answering from
-           general knowledge or ignoring the request.
+          - web_search(query): the answer is NOT in the material, OR the
+            user wants external / current / online information, OR the user
+            asked to search / look up / find something (in ANY language).
+          - answer_from_material(): the answer IS in the provided material.
 
-        2. Auto-retry on refusal: after a no-tool-call response, we scan
-           the content for refusal patterns ("материал не содержит",
-           "не нашёл", "not found", "cannot find", …). When detected we
-           immediately retry with tool_choice="required" and the original
-           question as the query. This catches cases where Gemma answers
-           "I couldn't find it" without actually calling the tool.
+        Because the model must choose a tool, it can't "forget" to search
+        or refuse with "the material doesn't contain that" — the decision
+        is structural, not dependent on the model volunteering a tool call
+        on tool_choice="auto" (which small models like Gemma 4 do unreliably).
+
+        web_search path fetches real page content (trafilatura-cleaned) in
+        parallel, not just DDG snippets.
 
         Yields:
           - str — token delta for the final answer
           - dict — stage event, e.g. {"type":"stage","stage":"searching","detail":"<query>"}
 
         Graceful degradation: if the backend doesn't support tool calling
-        (raises on the first call), falls back to plain stream_complete.
+        (or tool_choice="required"), falls back to a plain stream_complete.
 
 Called from api/ai.py POST /ai/qa.
 """
@@ -55,25 +54,26 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # Reserve room for the prompt scaffolding, tool results, and the answer.
 _PROMPT_OVERHEAD_TOKENS = 4000
 
-# Tool definition sent to the LLM on every QA call.
-#
-# Wording matters for small models (Gemma 4 E4B in particular). Be explicit
-# about WHEN to call: the model will not invoke this unless triggers are
-# spelled out concretely.
+# Two-tool router. The model MUST pick exactly one (tool_choice="required"),
+# so the search-vs-material decision is structural rather than relying on the
+# model to volunteer a web_search call on its own. The descriptions are
+# phrased around USER INTENT so the model maps requests in any language to the
+# right tool — no keyword lists, no per-language maintenance.
 _WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "web_search",
         "description": (
-            "Search the web via DuckDuckGo and retrieve full page content. "
-            "Call this tool whenever the answer to the user's question is not "
-            "plainly stated in the material provided to you. This is the default "
-            "fallback — do NOT respond with 'the material does not contain that' "
-            "without first trying a web_search. Also call this tool for any "
-            "current/recent information (news, prices, weather, releases, status) "
-            "and whenever the user asks to search, look up, find, google, or check "
-            "something. The ONLY time to skip the tool is when the answer is "
-            "already clearly in the provided material."
+            "Search the web (DuckDuckGo) and read the resulting pages. Choose "
+            "this when ANY of the following is true, regardless of the language "
+            "the user writes in:\n"
+            "- the answer is NOT clearly present in the provided material;\n"
+            "- the user asks for current, recent, or external information "
+            "(news, prices, reviews, what other people say, status, releases);\n"
+            "- the user asks you to search, look up, find, google, or check "
+            "something online.\n"
+            "When in doubt between this and answer_from_material, prefer "
+            "web_search — it is the safe fallback."
         ),
         "parameters": {
             "type": "object",
@@ -81,8 +81,8 @@ _WEB_SEARCH_TOOL: dict[str, Any] = {
                 "query": {
                     "type": "string",
                     "description": (
-                        "Concise search query in the user's language. "
-                        "Include the topic from the material if it adds context."
+                        "Concise search query in the user's language. Include "
+                        "the topic from the material if it adds useful context."
                     ),
                 },
             },
@@ -91,32 +91,21 @@ _WEB_SEARCH_TOOL: dict[str, Any] = {
     },
 }
 
-# Words / phrases in the user's question that signal an explicit intent to
-# search the web. When present, we use tool_choice="required" so the model
-# must call the tool instead of answering from memory or the material.
-# Covers common patterns in Russian and English.
-_EXPLICIT_SEARCH_PATTERNS: tuple[str, ...] = (
-    # Russian
-    "поищи", "поиск", "найди", "найти", "ищи", "искать",
-    "загугли", "погугли", "проверь", "узнай в интернете",
-    "ищи в интернете", "найди в интернете", "поищи в интернете",
-    # English
-    "search", "look up", "look it up", "find online", "google",
-    "check online", "search the web", "search online",
-)
+_ANSWER_FROM_MATERIAL_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "answer_from_material",
+        "description": (
+            "Answer directly from the material that was provided to you, with no "
+            "web search. Choose this ONLY when the material clearly contains the "
+            "answer to the user's question and no external or current information "
+            "is needed."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
 
-# Patterns in the model's response that indicate it refused to search even
-# though it probably should have. Used by the auto-retry logic.
-_REFUSAL_PATTERNS: tuple[str, ...] = (
-    # Russian
-    "не содержит", "нет информации", "не нашёл", "не смог найти",
-    "не могу найти", "отсутствует", "не упоминается",
-    "в материале нет", "нет данных",
-    # English
-    "does not contain", "not found in", "cannot find", "couldn't find",
-    "no information", "not mentioned", "not available in",
-    "the material does not",
-)
+_TOOLS = [_WEB_SEARCH_TOOL, _ANSWER_FROM_MATERIAL_TOOL]
 
 
 @lru_cache(maxsize=1)
@@ -150,36 +139,32 @@ def _build_messages(
     return [{"role": "user", "content": prompt}]
 
 
-def _wants_search(question: str) -> bool:
-    """Return True when the question contains an explicit search-request word."""
-    lower = question.lower()
-    return any(pat in lower for pat in _EXPLICIT_SEARCH_PATTERNS)
+def _assistant_tool_call_msg(tc: Any) -> dict[str, Any]:
+    """Build the assistant message echoing a single tool call for history."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+        ],
+    }
 
 
-def _looks_like_refusal(content: str) -> bool:
-    """Return True when the model's answer looks like a search refusal."""
-    lower = content.lower()
-    return any(pat in lower for pat in _REFUSAL_PATTERNS)
-
-
-async def _run_search_and_append(
-    query: str,
-    tool_call_id: str,
-    messages: list[dict[str, Any]],
-) -> None:
-    """Execute DDG search with full page fetching and append results to messages."""
-    log.info("web_search tool called: %r", query)
-
-    # Use enriched search (fetches real page content, not just snippets).
-    results = await _search.ddg_search_with_content(query)
-    content = _search.format_results(results, full_content=True)
-    messages.append(
-        {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": content,
-        }
-    )
+def _pick_tool_call(tool_calls: list[Any]) -> Any | None:
+    """Return the chosen tool call. web_search wins if the model emits both."""
+    if not tool_calls:
+        return None
+    for tc in tool_calls:
+        if tc.function.name == "web_search":
+            return tc
+    return tool_calls[0]
 
 
 async def stream_answer(
@@ -191,16 +176,12 @@ async def stream_answer(
     """Yield token deltas (str) or stage dicts (dict) for a QA turn.
 
     Flow:
-    1. Non-streaming call with web_search tool offered.
-       - If question contains explicit search intent → tool_choice="required"
-         (forces the model to call the tool, no refusal possible).
-       - Otherwise → tool_choice="auto" (model decides).
-    2a. Tool called → emit ``searching`` stage, run DDG + fetch pages,
-        inject cleaned content, stream final answer.
-    2b. No tool call, but answer looks like a refusal → auto-retry with
-        tool_choice="required" using the original question as the query.
-    2c. No tool call, answer looks fine → yield content directly.
-    3. Fallback: if step 1 raises (backend unsupported), stream without tools.
+    1. Non-streaming call with both tools + tool_choice="required" — the model
+       must pick web_search or answer_from_material (language-agnostic routing).
+    2a. web_search → emit ``searching`` stage, fetch + clean pages, stream answer.
+    2b. answer_from_material → stream the answer grounded in the material.
+    3. Fallback: if the tool call raises (backend lacks tool support /
+       "required"), stream a plain completion from the base prompt.
     """
     context = _select_context(job)
     title = getattr(job, "title", None) or ""
@@ -211,27 +192,19 @@ async def stream_answer(
         question=question,
     )
 
-    # Determine tool_choice before the first call.
-    force_search = _wants_search(question)
-    tool_choice: str | dict[str, Any] = (
-        {"type": "function", "function": {"name": "web_search"}}
-        if force_search
-        else "auto"
-    )
-    if force_search:
-        log.info("qa: explicit search intent detected — tool_choice=required")
-
-    # Step 1: non-streaming call to detect/trigger tool use.
+    # Step 1: forced tool choice — the model routes the request itself.
     try:
         response = await llm_client.complete_with_messages(
             messages,
-            tools=[_WEB_SEARCH_TOOL],
-            tool_choice=tool_choice,
-            max_tokens=2000,
+            tools=_TOOLS,
+            tool_choice="required",
+            max_tokens=500,
             temperature=0.3,
         )
     except Exception:
-        log.warning("tool-capable request failed; falling back to plain stream", exc_info=True)
+        log.warning(
+            "tool-capable request failed; falling back to plain stream", exc_info=True
+        )
         async for delta in llm_client.stream_complete(
             messages[0]["content"],
             max_tokens=2000,
@@ -242,83 +215,51 @@ async def stream_answer(
         return
 
     choice = response.choices[0]
-    tool_calls = choice.message.tool_calls
-    direct_content = choice.message.content or ""
+    chosen = _pick_tool_call(choice.message.tool_calls or [])
 
-    # Step 2b: no tool call but response looks like a refusal → auto-retry.
-    if not tool_calls and _looks_like_refusal(direct_content):
-        log.info(
-            "qa: model refused without searching; auto-retrying with forced search. "
-            "Refusal snippet: %r",
-            direct_content[:120],
-        )
-        yield {"type": "stage", "stage": "searching", "detail": question}
-
-        # Build a synthetic tool call so _run_search_and_append can append results.
-        fake_tool_id = "auto_retry_0"
-        messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": fake_tool_id,
-                        "type": "function",
-                        "function": {"name": "web_search", "arguments": json.dumps({"query": question})},
-                    }
-                ],
-            }
-        )
-        await _run_search_and_append(question, fake_tool_id, messages)
-
-        async for delta in llm_client.stream_with_messages(
-            messages, max_tokens=2000, temperature=0.3
-        ):
-            yield delta
+    # Defensive: some backends honour "required" loosely and may return content
+    # with no tool call. If so, just yield whatever the model said.
+    if chosen is None:
+        content = choice.message.content or ""
+        if content:
+            yield content
         return
 
-    if tool_calls:
-        # Append the assistant message (with tool_calls) to the history.
+    messages.append(_assistant_tool_call_msg(chosen))
+
+    if chosen.function.name == "web_search":
+        try:
+            args = json.loads(chosen.function.arguments)
+            query = args.get("query") or question
+        except (json.JSONDecodeError, KeyError):
+            query = question
+
+        yield {"type": "stage", "stage": "searching", "detail": query}
+
+        # Enriched search: fetch + trafilatura-clean the actual pages.
+        results = await _search.ddg_search_with_content(query)
         messages.append(
             {
-                "role": "assistant",
-                "content": choice.message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in tool_calls
-                ],
+                "role": "tool",
+                "tool_call_id": chosen.id,
+                "content": _search.format_results(results, full_content=True),
+            }
+        )
+    else:
+        # answer_from_material — acknowledge the tool and ask for the answer.
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": chosen.id,
+                "content": "Now answer the user's question using the material above.",
             }
         )
 
-        for tc in tool_calls:
-            if tc.function.name != "web_search":
-                continue
-            try:
-                args = json.loads(tc.function.arguments)
-                query = args.get("query") or question
-            except (json.JSONDecodeError, KeyError):
-                query = question
-
-            yield {"type": "stage", "stage": "searching", "detail": query}
-            await _run_search_and_append(query, tc.id, messages)
-
-        # Step 2a: stream the grounded final answer.
-        async for delta in llm_client.stream_with_messages(
-            messages, max_tokens=2000, temperature=0.3
-        ):
-            yield delta
-
-    else:
-        # Step 2c: model answered directly from material — yield as-is.
-        if direct_content:
-            yield direct_content
+    # Step 2: stream the grounded final answer (no tools this turn).
+    async for delta in llm_client.stream_with_messages(
+        messages, max_tokens=2000, temperature=0.3
+    ):
+        yield delta
 
 
 __all__ = ["stream_answer"]
