@@ -17,11 +17,24 @@
 // Chat bubbles render WITH timecode-link injection (renderMarkdown(text, activeJob))
 // so valid material references become clickable seek links just like in Summary.
 //
-// QA stage badge: because the assistant bubble lives inside #pane-summary
-// (which gets display:none when the user switches to Transcript), the
-// browser pauses CSS animations on the thinking-dots spinner. We mirror
-// the live QA state into #stage-badge (topbar, always visible) so the
-// user knows generation is still in progress even across tab switches.
+// QA progress indicator strategy:
+//   Problem A — spinner pauses: the assistant bubble lives inside #pane-summary
+//     (display:none when Transcript tab is active), so CSS animations pause.
+//   Problem B — badge conflict: #stage-badge is also owned by app.js; any
+//     SSE job-update event calls setStage(null) and silently clears our QA state.
+//   Problem C — repaint throttle: Chrome throttles repaints for sidepanels
+//     that don't have focus; textNode.data updates happen but don't paint
+//     until the panel regains focus.
+//
+// Solution:
+//   - Toggle .tab--qa-active on the Summary TAB BUTTON (always visible,
+//     even from the Transcript pane). The CSS adds a pulsing dot. No conflict
+//     with app.js (which only toggles .tab--active).
+//   - Keep module-level refs to the live text node + accumulated string so a
+//     window.focus / visibilitychange listener can re-touch the node and
+//     force Chrome to repaint the streaming text immediately.
+//   - On answer done, scroll the bubble start into view (not the end) so the
+//     user reads from the top, not the bottom of a long response.
 
 import { daemon } from "../lib/daemon-client.js";
 import { renderMarkdown } from "../lib/markdown.js";
@@ -53,26 +66,44 @@ const form = /** @type {HTMLFormElement | null} */ (document.getElementById("cha
 const input = /** @type {HTMLInputElement | null} */ (document.getElementById("chat-input"));
 const messages = /** @type {HTMLElement | null} */ (document.getElementById("chat-messages"));
 
-// Stage badge in the topbar — always visible regardless of which tab is
-// active. We drive it from here during QA so the user can see that a
-// response is still being generated even when they've switched away from
-// the Summary pane (where the thinking-dots spinner would otherwise be
-// invisible because the pane is display:none and CSS animations pause).
-const _stageBadge = /** @type {HTMLElement | null} */ (
-  document.getElementById("stage-badge")
+// Summary tab button — we toggle .tab--qa-active on it while QA is in flight.
+// This adds a pulsing dot via CSS that is visible regardless of which pane is
+// active (the tab nav is always rendered above both panes).
+// We deliberately do NOT touch #stage-badge (owned by app.js / setStage) to
+// avoid the conflict where any SSE job-update clears our indicator.
+const _summaryTabBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("tab-summary")
 );
 
-/** Mirror QA progress into the topbar badge. Pass null to clear. */
-function _setQaStage(label) {
-  if (!_stageBadge) return;
-  if (label) {
-    _stageBadge.textContent = label;
-    _stageBadge.classList.remove("hidden");
-  } else {
-    _stageBadge.textContent = "";
-    _stageBadge.classList.add("hidden");
+// Summary pane element — consulted at answer-done time to decide whether to
+// scroll to the bubble start (only when the pane is actually visible).
+const _summaryPaneEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("pane-summary")
+);
+
+// Live streaming state — module-level so the focus-recovery listener can
+// re-touch the text node and force Chrome to repaint throttled updates.
+/** @type {Text | null} */
+let _liveTextNode = null;
+let _liveAcc = "";
+
+/** Toggle the pulsing-dot indicator on the Summary tab button. */
+function _setQaActive(active) {
+  _summaryTabBtn?.classList.toggle("tab--qa-active", active);
+}
+
+// When the sidepanel regains window focus or document visibility, Chrome's
+// paint throttle lifts. Re-set the text node data to flush any accumulated
+// tokens that were written but not painted while the panel was backgrounded.
+function _repaintIfStreaming() {
+  if (_liveTextNode !== null) {
+    _liveTextNode.data = _liveAcc; // re-assign triggers a repaint
   }
 }
+window.addEventListener("focus", _repaintIfStreaming);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") _repaintIfStreaming();
+});
 
 if (form) {
   form.addEventListener("submit", (e) => {
@@ -154,54 +185,65 @@ async function handleAsk(question) {
  */
 async function _runQaTurn(jobId, question) {
   const assistantBubble = appendBubble("assistant", "");
+  const assistantWrap = /** @type {HTMLElement | null} */ (
+    assistantBubble.closest(".chat-bubble")
+  );
   assistantBubble.innerHTML =
     `<span class="thinking-dots"><span></span><span></span><span></span></span>`;
   scrollMessagesToEnd();
 
-  // Mirror into the topbar badge so the user knows generation is in progress
-  // even when they switch away from the Summary tab (where the spinner pauses).
-  _setQaStage("Thinking…");
+  // Activate the pulsing-dot on the Summary tab button. Visible from any
+  // pane — critical because the thinking-dots spinner inside #pane-summary
+  // is invisible (and its CSS animation paused) when the Transcript tab is active.
+  _setQaActive(true);
+  // Reset module-level streaming state.
+  _liveTextNode = null;
+  _liveAcc = "";
 
-  /** @type {Text | null} */
-  let textNode = null;
-  let acc = "";
   try {
     for await (const ev of daemon.aiQa({ job_id: jobId, question })) {
       if (ev.type === "stage") {
-        // Update badge text on stage transitions (thinking → answering).
-        const label = ev.stage === "thinking" ? "Thinking…" : "Answering…";
-        _setQaStage(label);
+        // Stage events (e.g. "thinking") arrive before first delta — the
+        // pulsing dot already covers the "in progress" signal; no extra UI needed.
       } else if (ev.type === "delta") {
-        if (textNode === null) {
-          // First token — switch from spinner to streaming text and update badge.
+        if (_liveTextNode === null) {
+          // First token — replace spinner with streaming text.
           assistantBubble.innerHTML = "";
-          textNode = document.createTextNode("");
-          assistantBubble.appendChild(textNode);
-          _setQaStage("Answering…");
+          _liveTextNode = document.createTextNode("");
+          assistantBubble.appendChild(_liveTextNode);
         }
-        acc += ev.delta;
-        textNode.data = acc;
+        _liveAcc += ev.delta;
+        _liveTextNode.data = _liveAcc;
         scrollMessagesToEnd();
       } else if (ev.type === "done") {
-        const final = ev.content || acc;
+        _liveTextNode = null;
+        _liveAcc = "";
+        const final = ev.content || "";
         // Render WITH timecode links — the QA prompt now ensures [MM:SS]
         // markers only appear when the answer came from the material, so any
-        // marker the LLM emits is a real jump target (not a hallucination from
-        // web_search). Passing activeJob enables link injection for youtube/
-        // media jobs; page/pdf jobs short-circuit in renderMarkdown (no videoId
-        // or mediaPageUrl → plain text anyway).
+        // marker the LLM emits is a real jump target (not a web_search hallucination).
         assistantBubble.innerHTML = renderMarkdown(final, activeJob);
-        _setQaStage(null);
-        scrollMessagesToEnd();
+        _setQaActive(false);
+        // Scroll to the START of the assistant bubble so the user reads from
+        // the top, not the bottom of a potentially long answer. Only scroll
+        // when Summary pane is visible — don't yank the user away from Transcript.
+        if (_summaryPaneEl?.classList.contains("tab-pane--active") && assistantWrap) {
+          assistantWrap.scrollIntoView({ block: "start", behavior: "smooth" });
+        }
+        return;
       } else if (ev.type === "error") {
-        _setQaStage(null);
+        _liveTextNode = null;
+        _liveAcc = "";
+        _setQaActive(false);
         renderErrorBubble(assistantBubble, ev.error || "Error.");
         return;
       }
     }
   } catch (err) {
+    _liveTextNode = null;
+    _liveAcc = "";
+    _setQaActive(false);
     console.error("[TLDR] aiStream qa failed", err);
-    _setQaStage(null);
     renderErrorBubble(assistantBubble, err instanceof Error ? err.message : String(err));
   }
 }

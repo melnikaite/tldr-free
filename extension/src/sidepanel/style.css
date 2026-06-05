@@ -430,6 +430,27 @@ body {
 }
 .tab.hidden { display: none; }
 
+/* Pulsing dot on a tab button while QA generation is in flight.
+   Toggled by chat.js (.tab--qa-active) — deliberately separate from
+   .tab--active (owned by app.js) to avoid conflicts. Visible regardless
+   of which pane is currently shown so the user knows an answer is coming
+   even while reading the Transcript tab. */
+.tab--qa-active::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 5px;
+  vertical-align: middle;
+  animation: qa-dot-pulse 1.2s ease-in-out infinite;
+}
+@keyframes qa-dot-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%       { opacity: 0.3; transform: scale(0.65); }
+}
+
 .tab-pane { display: none; }
 .tab-pane--active { display: block; }
 
