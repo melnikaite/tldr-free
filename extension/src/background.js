@@ -8,6 +8,7 @@ import { daemon } from "./lib/daemon-client.js";
 import { getCookiesForDomain, getCookiesForUrl } from "./lib/cookies.js";
 import { normalizeUrl } from "./lib/url.js";
 import { stringifyError } from "./lib/utils.js";
+import { setPanelBehavior, openSidePanel } from "./lib/browser-compat.js";
 
 /** @import {
  *   JobCreateRequest,
@@ -38,9 +39,8 @@ const MAX_LOCAL_PDF_BYTES = 50 * 1024 * 1024;
 chrome.runtime.onInstalled.addListener(() => {
   // Keep openPanelOnActionClick=false so chrome.action.onClicked fires for our
   // custom flow. We open the panel ourselves inside the click handler.
-  chrome.sidePanel
-    .setPanelBehavior({ openPanelOnActionClick: false })
-    .catch(console.error);
+  // (No-op on Firefox — see lib/browser-compat.js.)
+  setPanelBehavior().catch(console.error);
 });
 
 // ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   // Open side panel up-front so the user sees an immediate response. This
   // must happen inside the user gesture; awaits afterwards are fine.
   try {
-    await chrome.sidePanel.open({ tabId: tab.id });
+    await openSidePanel({ tabId: tab.id });
   } catch (err) {
     console.warn("[TLDR] sidePanel.open failed", err);
   }
