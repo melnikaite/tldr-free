@@ -243,6 +243,58 @@ the source page again. YouTube jobs in queued/running are re-enqueued on
 startup automatically. Translations are also recoverable (see above).
 See [workers.md](workers.md).
 
+## Native (uv) mode
+
+Alternative to Docker: the daemon installed as a uv tool, running directly
+on the host with a user-level autostart service.
+
+- **Install / uninstall**: `task install:uv` / `task uninstall:uv` (routers
+  to `scripts/install-uv.sh` / `scripts/uninstall-uv.sh`). Manual:
+  `uv tool install ./daemon`, then `tldr-daemon service install`.
+- **Run by hand**: `tldr-daemon` (uvicorn on 127.0.0.1:8765). One-off:
+  `uvx --from ./daemon tldr-daemon`.
+- **Config**: auto-created from the packaged template on first run at
+  `~/Library/Application Support/tldr/tldr.yaml` (macOS) /
+  `$XDG_CONFIG_HOME/tldr/tldr.yaml` (Linux). `TLDR_CONFIG` overrides as
+  usual. Backend URLs are rewritten to `127.0.0.1` (no
+  `host.docker.internal` natively).
+- **Data**: `~/Library/Application Support/tldr/data` (macOS) /
+  `$XDG_DATA_HOME/tldr` (Linux). A configured `data_dir: /data` is
+  auto-substituted when `/data` doesn't exist (i.e. outside the container).
+- **Code reload**: no `--reload` here either — restart the process
+  (`tldr-daemon service uninstall && tldr-daemon service install`, or
+  Ctrl-C + rerun for a foreground run). Code changes also need
+  `uv tool install --force ./daemon` since the tool venv has its own copy.
+- **Service commands**: `tldr-daemon service install|uninstall|status` —
+  launchd LaunchAgent on macOS, hardened systemd user unit on Linux,
+  experimental schtasks logon task on Windows. `status` reports unit
+  presence + `/health`.
+- **yt-dlp self-heal**: on every server start the CLI upgrades yt-dlp +
+  youtube-transcript-api in its own venv (`src/selfupdate.py`; uv if
+  available, else pip; 60s timeout, non-fatal offline). Skip with
+  `TLDR_SKIP_PKG_UPDATE=1` — the Docker entrypoint sets this since it
+  upgrades on its own. uv is located via PATH and, failing that, well-known
+  install dirs (`~/.local/bin`, `~/.cargo/bin`, Homebrew) — a launchd/systemd
+  service inherits a thin PATH that omits them, and a uv-tool venv has no pip
+  to fall back on.
+- **ffmpeg**: needed by yt-dlp's audio postprocessing (and absent from the
+  thin service PATH). Resolved by `src/workers/ffmpeg.py`: a system
+  ffmpeg+ffprobe wins (PATH or known dirs like `/opt/homebrew/bin`),
+  otherwise a static build is fetched once via the `static-ffmpeg` dependency
+  and cached under `<data_dir>/ffmpeg` (cross-platform, no brew/apt; warmed in
+  a background thread at startup). The path is passed to yt-dlp via
+  `ffmpeg_location`, so the daemon's PATH is irrelevant.
+- **deno** (JS runtime for YouTube's "n"/sig challenge — needed to download
+  audio for caption-less videos): `src/workers/jsruntime.py`, same pattern as
+  ffmpeg. System `deno` wins (PATH / known dirs / venv scripts dir), else a
+  static binary (deno ≥ 2.3.0) is downloaded once from GitHub releases and
+  cached under `<data_dir>/deno` (pin with `TLDR_DENO_VERSION`, else latest).
+  Passed to yt-dlp as `js_runtimes: ["deno:<path>"]`. The solver code itself
+  ships in the `yt-dlp-ejs` dependency (no live GitHub fetch). Captioned videos
+  don't need any of this — they go through the youtube-transcript-api fast
+  path. No prebuilt deno for Windows-arm64 → that one platform degrades to
+  yt-dlp's JS-less clients.
+
 ## Updating components
 
 ### yt-dlp / youtube-transcript-api

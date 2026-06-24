@@ -57,9 +57,18 @@ whisper:
 # pages and videos will be silently truncated.
 # Check the active context: lms ps  (shows CONTEXT column for the loaded model)
 #
-# reasoning_effort: "low" keeps Gemma 4 thinking hidden in reasoning_content
-# (our code ignores it) and outputs a clean answer in content. Remove for
-# non-thinking models or if your LM Studio version doesn't support the field.
+# reasoning_effort controls Gemma 4 thinking; the right value depends on the
+# backend (the daemon adds it to every chat call):
+#   mlx-openai-server / mlx_vlm: "low" — thinking stays hidden in
+#     reasoning_content (our code ignores it), content arrives clean.
+#   LocalAI / llama.cpp (gallery GGUF, jinja template): thinking is ADAPTIVE —
+#     it fires nondeterministically on "hard" prompts, delaying or (with a
+#     small max_tokens) entirely consuming the answer. "low" does NOT fully
+#     suppress it (measured 1/6 runs); use "none" (0/6, faster median).
+#     chat_template_kwargs {enable_thinking: false} is unreliable — don't.
+#   Real OpenAI API: "none" is rejected — remove the field entirely.
+# Note: LocalAI responses carry "reasoning": null in message; harmless for
+# the bundled client, but beware strict response-schema validation.
 # ---------------------------------------------------------------------------
 # llm:
 #   base_url: http://host.docker.internal:1234/v1
