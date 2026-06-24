@@ -38,6 +38,7 @@ from src.api.schemas import (
     TranscriptSource,
 )
 from src.config import get_config
+from src.llm import languages
 from src.llm import summary as llm_summary
 from src.storage import repo
 from src.workers import page, timecodes, youtube
@@ -342,6 +343,9 @@ async def _run_youtube(
     # captions in another language). Best-effort only — None falls through
     # cleanly and the UI shows "Original".
     transcript_language = _normalise_lang_code(metadata.get("language"))
+    # Last resort when metadata carries no language: guess from the captions.
+    if transcript_language is None:
+        transcript_language = languages.detect_language(raw_text)
 
     _persist_extracted(
         job_id,

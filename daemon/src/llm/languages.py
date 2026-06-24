@@ -17,7 +17,11 @@ misspellings) go in ``_ALIASES``. No need to touch any other file.
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 class UnknownLanguageError(ValueError):
@@ -137,9 +141,46 @@ def supported_codes() -> list[str]:
     return [lang.code for lang in _LANGUAGES]
 
 
+# Drop ``[MM:SS]`` / ``[HH:MM:SS]`` markers before language detection — they're
+# noise that biases the detector toward nothing useful.
+_MARKER_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
+# Below this many characters of actual content, detection is a coin flip — skip.
+_MIN_DETECT_CHARS = 24
+
+
+def detect_language(text: str | None) -> str | None:
+    """Best-effort ISO-639-1 guess for ``text``, or ``None``.
+
+    A last-resort fallback for when neither the Whisper backend nor the source
+    metadata reports a language (e.g. LocalAI returns ``language: null``). Uses
+    ``langdetect`` (deterministic via a fixed seed) on the marker-stripped text.
+    Never raises — any failure, missing dependency, or too-short input returns
+    ``None`` so callers fall through to the "Original" label.
+    """
+    if not text:
+        return None
+    stripped = _MARKER_RE.sub(" ", text).strip()
+    if len(stripped) < _MIN_DETECT_CHARS:
+        return None
+    try:
+        from langdetect import DetectorFactory, detect
+
+        DetectorFactory.seed = 0  # deterministic output across runs
+        code = detect(stripped)
+    except Exception as exc:  # noqa: BLE001 — detection is strictly best-effort
+        log.debug("language detection failed: %s", exc)
+        return None
+    # langdetect emits e.g. ``zh-cn`` / ``zh-tw``; collapse to the 2-letter base.
+    code = code.strip().lower()
+    if "-" in code:
+        code = code.split("-", 1)[0]
+    return code or None
+
+
 __all__ = [
     "Language",
     "UnknownLanguageError",
+    "detect_language",
     "normalize_lang",
     "supported_codes",
 ]

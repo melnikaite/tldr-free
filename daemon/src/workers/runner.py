@@ -28,6 +28,7 @@ from typing import Any
 
 from src.api.schemas import JobStatus, TranscriptSource
 from src.config import get_config
+from src.llm import languages
 from src.llm import summary as llm_summary
 from src.workers import timecodes, transcribe, youtube
 from src.workers.broker import (
@@ -193,6 +194,10 @@ async def _process_one(
             title = meta_title.strip()
         if whisper_language is None:
             whisper_language = _normalise_lang_code(metadata.get("language"))
+        # Last resort: guess from the transcript text itself (LocalAI Whisper
+        # returns no language, and some videos carry no metadata language).
+        if whisper_language is None:
+            whisper_language = languages.detect_language(raw_text)
 
         # Serialize the fine-grained Whisper segments so the Transcript tab
         # can render one line per ~1-5 s instead of the 30 s buckets
