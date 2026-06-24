@@ -41,7 +41,13 @@ label.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import math
+import os
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,30 +86,118 @@ async def transcribe_audio(
     *,
     total_duration: float | None,
 ) -> TranscribeResult:
-    """POST the audio file, return parsed segments + language.
+    """Transcribe the audio, splitting it first if it exceeds the upload cap.
 
-    Raises ``httpx.HTTPStatusError`` on server-side failure (caller turns
-    that into a friendly error). Returns an empty-segments result when the
-    server reports success but didn't transcribe anything (e.g. silent
-    audio) — caller can treat that as a soft failure.
+    Most Whisper backends reject large bodies (LocalAI ~15 MB, OpenAI 25 MB).
+    For audio over ``whisper.max_upload_mb`` we split it into time-based chunks
+    with ffmpeg, transcribe each, and stitch the segments back together with
+    their original timestamps. Small audio takes the single-request path.
+
+    Raises ``httpx.HTTPStatusError`` on server-side failure (caller turns that
+    into a friendly error). Returns an empty-segments result when the server
+    reports success but didn't transcribe anything (e.g. silent audio).
     """
     cfg = get_config().whisper
-    base_url = cfg.base_url.rstrip("/")
-    endpoint = f"{base_url}/audio/transcriptions"
+    max_bytes = max(1, cfg.max_upload_mb) * 1024 * 1024
+    size = audio_path.stat().st_size
 
+    if size <= max_bytes:
+        payload = await _post_audio(audio_path)
+        return _parse_payload(payload, total_duration=total_duration)
+
+    return await _transcribe_chunked(
+        audio_path, total_duration=total_duration, max_bytes=max_bytes
+    )
+
+
+async def _transcribe_chunked(
+    audio_path: Path,
+    *,
+    total_duration: float | None,
+    max_bytes: int,
+) -> TranscribeResult:
+    """Split oversized audio with ffmpeg, transcribe parts, merge segments."""
+    duration = total_duration if total_duration and total_duration > 0 else None
+    if duration is None:
+        duration = await asyncio.to_thread(_probe_duration, audio_path)
+    if duration is None or duration <= 0:
+        # Can't time-slice without a duration — fall back to one shot and let
+        # the backend's own error surface if it really is too big.
+        log.warning("transcribe: unknown duration, cannot chunk; trying single upload")
+        payload = await _post_audio(audio_path)
+        return _parse_payload(payload, total_duration=total_duration)
+
+    size = audio_path.stat().st_size
+    # Target 90% of the cap for VBR headroom; at least 2 chunks since we're here.
+    target = max(1, int(max_bytes * 0.9))
+    num_chunks = max(2, math.ceil(size / target))
+    chunk_seconds = duration / num_chunks
+    log.info(
+        "transcribe: audio %.1f MB > cap → %d chunks of ~%.0f s",
+        size / 1024 / 1024,
+        num_chunks,
+        chunk_seconds,
+    )
+
+    chunks = await asyncio.to_thread(
+        _split_audio, audio_path, num_chunks, chunk_seconds
+    )
+    if not chunks:
+        log.warning("transcribe: ffmpeg split produced nothing; trying single upload")
+        payload = await _post_audio(audio_path)
+        return _parse_payload(payload, total_duration=total_duration)
+
+    all_segments: list[dict[str, Any]] = []
+    language: str | None = None
+    try:
+        for idx, (chunk_path, offset) in enumerate(chunks):
+            payload = await _post_audio(chunk_path)
+            part = _parse_payload(payload, total_duration=chunk_seconds)
+            for seg in part.segments:
+                all_segments.append(
+                    {
+                        "start": seg["start"] + offset,
+                        "end": seg["end"] + offset,
+                        "text": seg["text"],
+                    }
+                )
+            if language is None:
+                language = part.language
+            log.info("transcribe: chunk %d/%d done", idx + 1, len(chunks))
+    finally:
+        for chunk_path, _ in chunks:
+            chunk_path.unlink(missing_ok=True)
+        # chunks share one mkdtemp dir; remove it once emptied.
+        with contextlib.suppress(OSError):
+            chunks[0][0].parent.rmdir()
+
+    return TranscribeResult(
+        segments=all_segments,
+        language=language,
+        duration_seconds=duration,
+    )
+
+
+async def _post_audio(audio_path: Path) -> dict[str, Any]:
+    """POST one audio file to the transcription endpoint, return parsed JSON."""
+    cfg = get_config().whisper
+    endpoint = f"{cfg.base_url.rstrip('/')}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {cfg.api_key}"}
 
     with audio_path.open("rb") as fh:
         files = {"file": (audio_path.name, fh, "application/octet-stream")}
-        data = {
-            "model": cfg.model,
-            "response_format": "verbose_json",
-        }
+        data = {"model": cfg.model, "response_format": "verbose_json"}
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(endpoint, headers=headers, data=data, files=files)
             r.raise_for_status()
-            payload = r.json()
+            result: dict[str, Any] = r.json()
+            return result
 
+
+def _parse_payload(
+    payload: dict[str, Any], *, total_duration: float | None
+) -> TranscribeResult:
+    """Turn one transcription response into a TranscribeResult."""
     segments = _normalise_segments(payload.get("segments"))
     if not segments:
         # Unpatched server, or model returned text only. Construct a
@@ -115,8 +209,7 @@ async def transcribe_audio(
             segments = [{"start": 0.0, "end": end, "text": full_text}]
             log.warning(
                 "transcribe: server returned no segments — using one-bucket "
-                "fallback. Whisper segments require the mlx-server patch "
-                "(see scripts/mlx-patches/).",
+                "fallback (no per-segment timing from this backend).",
             )
 
     raw_lang = payload.get("language")
@@ -139,6 +232,74 @@ async def transcribe_audio(
         language=language,
         duration_seconds=duration_seconds,
     )
+
+
+def _ffmpeg_bin(name: str) -> str | None:
+    """Path to ffmpeg/ffprobe from the resolver, or None if unavailable."""
+    from src.workers.ffmpeg import resolve_ffmpeg_dir
+
+    directory = resolve_ffmpeg_dir()
+    if not directory:
+        return None
+    exe = f"{name}.exe" if os.name == "nt" else name
+    candidate = Path(directory) / exe
+    return str(candidate) if candidate.is_file() else None
+
+
+def _probe_duration(audio_path: Path) -> float | None:
+    """Audio duration in seconds via ffprobe, or None if it can't be read."""
+    ffprobe = _ffmpeg_bin("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(audio_path),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        log.warning("transcribe: ffprobe duration failed (%s)", exc)
+        return None
+
+
+def _split_audio(
+    audio_path: Path, num_chunks: int, chunk_seconds: float
+) -> list[tuple[Path, float]]:
+    """Cut ``audio_path`` into ``num_chunks`` time slices, codec-copied.
+
+    Returns ``[(chunk_path, start_offset_seconds), ...]``. Chunks land in a
+    temp dir next to the source; the caller unlinks them. Returns ``[]`` when
+    ffmpeg is unavailable or every cut fails.
+    """
+    ffmpeg = _ffmpeg_bin("ffmpeg")
+    if not ffmpeg:
+        log.warning("transcribe: no ffmpeg to split audio")
+        return []
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tldr-chunks-", dir=audio_path.parent))
+    suffix = audio_path.suffix or ".opus"
+    chunks: list[tuple[Path, float]] = []
+    for i in range(num_chunks):
+        offset = i * chunk_seconds
+        out = tmp_dir / f"chunk{i:03d}{suffix}"
+        try:
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-loglevel", "error",
+                    "-ss", f"{offset:.3f}", "-t", f"{chunk_seconds:.3f}",
+                    "-i", str(audio_path), "-c", "copy", str(out),
+                ],
+                check=True, capture_output=True,
+            )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            log.warning("transcribe: ffmpeg chunk %d failed (%s)", i, exc)
+            continue
+        if out.is_file() and out.stat().st_size > 0:
+            chunks.append((out, offset))
+    return chunks
 
 
 def _normalise_segments(raw: Any) -> list[dict[str, Any]]:
