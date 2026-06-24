@@ -155,6 +155,70 @@ def format_segments_as_marked_text(segments: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Phantom phrases Whisper invents over trailing silence / outro music — it has
+# no audio to transcribe so it emits boilerplate it saw a lot in training. We
+# strip these ONLY from the tail of the text fed to the summariser (the stored
+# transcript keeps them); a phrase mid-text is left alone (could be real).
+_TAIL_NOISE_PHRASES = (
+    "продолжение следует",
+    "спасибо за просмотр",
+    "спасибо за внимание",
+    "подписывайтесь",
+    "ставьте лайк",
+    "субтитры",
+    "редактор субтитров",
+    "до новых встреч",
+    "до встречи",
+    "всем пока",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "subscribe to",
+    "subtitles by",
+    "see you next time",
+    "transcribed by",
+    "amara.org",
+)
+# How many trailing lines to even consider — bounds the damage if a real line
+# happens to contain a phrase.
+_TAIL_SCAN_LINES = 4
+
+
+def _is_tail_noise(line: str) -> bool:
+    # Drop a leading ``[MM:SS]`` / ``[HH:MM:SS]`` marker, lowercase, strip
+    # punctuation/space so "Продолжение следует..." matches.
+    body = re.sub(r"^\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*", "", line)
+    body = body.strip().lower().strip(" .,!?…\"'»«-—")
+    if not body:
+        return False
+    return any(p in body for p in _TAIL_NOISE_PHRASES)
+
+
+def strip_transcript_tail_noise(text: str) -> str:
+    """Remove Whisper's trailing hallucinated boilerplate from summary input.
+
+    Operates on the LAST few lines only: walks up from the end dropping lines
+    that are pure phantom phrases ("Продолжение следует…", "Thanks for
+    watching"), stopping at the first real line. Pure (same in → same out) and
+    conservative — never touches the middle of the transcript.
+    """
+    if not text:
+        return text
+    lines = text.rstrip("\n").split("\n")
+    scanned = 0
+    while lines and scanned < _TAIL_SCAN_LINES:
+        if not lines[-1].strip():
+            lines.pop()
+            continue
+        if _is_tail_noise(lines[-1]):
+            lines.pop()
+            scanned += 1
+            continue
+        break
+    cleaned = "\n".join(lines)
+    return cleaned + "\n" if text.endswith("\n") and cleaned else cleaned
+
+
 def strip_timecode_placeholders(text: str) -> str:
     """Remove empty bracket markers the LLM left where no timecode exists.
 
@@ -190,4 +254,5 @@ __all__ = [
     "build_marked_text",
     "format_segments_as_marked_text",
     "strip_timecode_placeholders",
+    "strip_transcript_tail_noise",
 ]

@@ -523,6 +523,17 @@ def _persist_extracted(
     )
 
 
+# Sources whose text comes from speech (so it may contain ASR artefacts the
+# summariser should clean up). Page/PDF sources are excluded.
+_AUDIO_TRANSCRIPT_SOURCES = frozenset(
+    {
+        TranscriptSource.WHISPER,
+        TranscriptSource.YOUTUBE_AUTO_CAPTIONS,
+        TranscriptSource.YOUTUBE_API,
+    }
+)
+
+
 async def _summarize_and_finish(
     job_id: str,
     *,
@@ -569,11 +580,19 @@ async def _summarize_and_finish(
         buf.clear()
         last_flush = asyncio.get_event_loop().time()
 
+    # Transcript-derived sources (Whisper / captions) may carry speech-to-text
+    # artefacts: trailing outro hallucinations and misheard terms. Feed the
+    # summariser a tail-cleaned copy and flag the source so it corrects obvious
+    # ASR errors. The stored transcript (`text` → mark_done) is untouched.
+    from_audio = transcript_source in _AUDIO_TRANSCRIPT_SOURCES
+    summary_input = timecodes.strip_transcript_tail_noise(text) if from_audio else text
+
     try:
         async for delta in llm_summary.stream_summarize(
-            text,
+            summary_input,
             title=title,
             output_language=cfg.output.language_name,
+            from_audio_transcript=from_audio,
         ):
             parts.append(delta)
             buf.append(delta)

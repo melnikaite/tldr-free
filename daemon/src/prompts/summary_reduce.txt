@@ -1,5 +1,7 @@
 You are given concise summaries of consecutive chunks of the same material. Combine them into a single coherent summary in: {output_language}.
 
+{source_note}
+
 Final summary structure:
 
 ## Overview
@@ -8,7 +10,7 @@ Final summary structure:
 
 ## Key points
 
-5–10 bullet points with the most important content.
+The most important content as bullet points — as many as the material genuinely warrants (up to ~10), not a fixed count. Merge duplicates from adjacent chunks; synthesise rather than restate.
 
 Rules:
 - Always respond in: {output_language}.

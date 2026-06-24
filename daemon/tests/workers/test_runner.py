@@ -119,7 +119,9 @@ async def test_runner_processes_one_task_end_to_end(
 
     summarize_calls: list[dict[str, Any]] = []
 
-    async def fake_stream_summarize(text: str, *, title: Any, output_language: str):
+    async def fake_stream_summarize(
+        text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
+    ):
         summarize_calls.append(
             {"text": text, "title": title, "output_language": output_language}
         )

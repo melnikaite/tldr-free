@@ -25,6 +25,18 @@ from src.llm.tokens import count_tokens
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
+# Injected into the summary prompts when the source is a speech-to-text
+# transcript (Whisper / auto-captions). Gives the model licence to fix obvious
+# recognition errors instead of faithfully echoing garbled terms (e.g. a
+# German "GSM-R" heard as "ГСМР … геометрия").
+_TRANSCRIPT_SOURCE_NOTE = (
+    "The text below is an automatic speech-to-text transcription of audio. It "
+    "may contain recognition errors — misheard proper names, foreign words, "
+    "and acronyms (an acronym may be spelled phonetically or split apart). Use "
+    "context and general knowledge to silently correct obvious such errors in "
+    "your summary; do not invent facts the text does not support."
+)
+
 
 @lru_cache(maxsize=8)
 def _load_prompt(name: str) -> str:
@@ -37,14 +49,19 @@ def _safe_title(title: str | None) -> str:
     return title.strip() if title and title.strip() else ""
 
 
+def _source_note(*, from_audio_transcript: bool) -> str:
+    return _TRANSCRIPT_SOURCE_NOTE if from_audio_transcript else ""
+
+
 def _build_single_pass_prompt(
-    text: str, *, title: str | None, output_language: str
+    text: str, *, title: str | None, output_language: str, source_note: str
 ) -> str:
     template = _load_prompt("summary_single.txt")
     return template.format(
         output_language=output_language,
         title=_safe_title(title),
         text=text,
+        source_note=source_note,
     )
 
 
@@ -53,9 +70,10 @@ async def _stream_single_pass(
     *,
     title: str | None,
     output_language: str,
+    source_note: str,
 ) -> AsyncIterator[str]:
     prompt = _build_single_pass_prompt(
-        text, title=title, output_language=output_language
+        text, title=title, output_language=output_language, source_note=source_note
     )
     async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
         yield delta
@@ -66,6 +84,7 @@ async def _summarize_chunk(
     *,
     title: str | None,
     output_language: str,
+    source_note: str,
     n: int,
     total: int,
 ) -> str:
@@ -76,6 +95,7 @@ async def _summarize_chunk(
         chunk=chunk,
         n=n,
         total=total,
+        source_note=source_note,
     )
     return (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
 
@@ -85,6 +105,7 @@ async def _stream_reduce(
     *,
     title: str | None,
     output_language: str,
+    source_note: str,
 ) -> AsyncIterator[str]:
     combined = "\n\n---\n\n".join(partials)
     template = _load_prompt("summary_reduce.txt")
@@ -92,6 +113,7 @@ async def _stream_reduce(
         output_language=output_language,
         title=_safe_title(title),
         combined=combined,
+        source_note=source_note,
     )
     async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
         yield delta
@@ -102,6 +124,7 @@ async def stream_summarize(
     *,
     title: str | None,
     output_language: str,
+    from_audio_transcript: bool = False,
 ) -> AsyncIterator[str]:
     """Stream a summary of ``text`` token by token.
 
@@ -110,14 +133,18 @@ async def stream_summarize(
     map phase runs silently (chunks are summarised one at a time — streaming
     each would interleave nonsense, and ``llm.client._llm_lock()`` serialises
     every call anyway), then the reduce phase streams its output to the caller.
+
+    ``from_audio_transcript`` adds a note telling the model the source is a
+    speech-to-text transcript that may contain recognition errors to correct.
     """
     if not text or not text.strip():
         return
 
+    note = _source_note(from_audio_transcript=from_audio_transcript)
     threshold = get_config().llm.single_pass_token_limit
     if count_tokens(text) < threshold:
         async for delta in _stream_single_pass(
-            text, title=title, output_language=output_language
+            text, title=title, output_language=output_language, source_note=note
         ):
             yield delta
         return
@@ -128,7 +155,7 @@ async def stream_summarize(
         return
     if len(chunks) == 1:
         async for delta in _stream_single_pass(
-            chunks[0], title=title, output_language=output_language
+            chunks[0], title=title, output_language=output_language, source_note=note
         ):
             yield delta
         return
@@ -143,12 +170,13 @@ async def stream_summarize(
                 c,
                 title=title,
                 output_language=output_language,
+                source_note=note,
                 n=i + 1,
                 total=total,
             )
         )
     async for delta in _stream_reduce(
-        list(partials), title=title, output_language=output_language
+        list(partials), title=title, output_language=output_language, source_note=note
     ):
         yield delta
 

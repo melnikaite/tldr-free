@@ -18,6 +18,7 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "output_language": "English",
         "title": "Sample title",
         "text": "Some text body.",
+        "source_note": "",
     },
     "summary_chunk.txt": {
         "output_language": "English",
@@ -25,11 +26,13 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "chunk": "Chunk body.",
         "n": 1,
         "total": 3,
+        "source_note": "",
     },
     "summary_reduce.txt": {
         "output_language": "English",
         "title": "Sample title",
         "combined": "Partial 1\n\n---\n\nPartial 2",
+        "source_note": "",
     },
     "qa.txt": {
         "output_language": "English",

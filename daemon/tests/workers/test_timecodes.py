@@ -6,6 +6,7 @@ from src.workers.timecodes import (
     build_marked_text,
     format_segments_as_marked_text,
     strip_timecode_placeholders,
+    strip_transcript_tail_noise,
 )
 
 
@@ -218,3 +219,40 @@ def test_strip_mixed_lines() -> None:
         strip_timecode_placeholders(text)
         == "- has time [00:30]\n- no time\n- link [x](y)"
     )
+
+
+# --- strip_transcript_tail_noise --------------------------------------------
+
+
+def test_tail_noise_drops_trailing_hallucination() -> None:
+    text = "[00:00] Real content here\n[02:28] Продолжение следует...\n"
+    assert strip_transcript_tail_noise(text) == "[00:00] Real content here\n"
+
+
+def test_tail_noise_drops_multiple_trailing() -> None:
+    text = (
+        "[00:00] Real\n"
+        "[09:50] Спасибо за просмотр!\n"
+        "[09:55] Подписывайтесь на канал\n"
+    )
+    assert strip_transcript_tail_noise(text) == "[00:00] Real\n"
+
+
+def test_tail_noise_keeps_real_middle_content() -> None:
+    # A phrase in the MIDDLE is left alone — only the tail is scanned.
+    text = "[00:00] Спасибо за просмотр, говорит ведущий\n[00:30] Real ending\n"
+    assert strip_transcript_tail_noise(text) == text
+
+
+def test_tail_noise_english_phantoms() -> None:
+    text = "[00:00] Actual talk\n[10:00] Thanks for watching!\n"
+    assert strip_transcript_tail_noise(text) == "[00:00] Actual talk\n"
+
+
+def test_tail_noise_noop_when_clean() -> None:
+    text = "[00:00] line one\n[00:30] line two\n"
+    assert strip_transcript_tail_noise(text) == text
+
+
+def test_tail_noise_empty() -> None:
+    assert strip_transcript_tail_noise("") == ""

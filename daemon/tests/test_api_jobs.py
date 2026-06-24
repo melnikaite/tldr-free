@@ -47,7 +47,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from src.llm import summary as llm_summary
 
     async def _fake_stream_summarize(
-        text: str, *, title: Any, output_language: str
+        text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
     ) -> AsyncIterator[str]:
         yield f"## summary\n\nfor {len(text)} chars in {output_language}"
 

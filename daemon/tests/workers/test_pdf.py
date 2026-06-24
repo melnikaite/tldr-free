@@ -20,7 +20,6 @@ import pytest
 from src.api.schemas import TranscriptSource
 from src.workers import pdf as pdf_worker
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

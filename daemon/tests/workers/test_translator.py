@@ -276,6 +276,7 @@ async def test_translator_prefers_raw_segments_json_over_raw_text(
     invariant Fix L put in; without it RU translation came out in 30 s
     buckets even when EN was fine-grained."""
     import json as _json
+
     from src.storage import repo as repo_module
 
     job = repo.create_job(url="https://x/segs-pref", kind="media", title="t")

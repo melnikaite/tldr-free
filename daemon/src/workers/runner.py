@@ -231,11 +231,15 @@ async def _process_one(
         )
         broker.publish(task_job_id, stage_event("summarizing"))
 
+        # Summarise a tail-cleaned copy (drops Whisper's "Продолжение
+        # следует…" outro hallucinations) — the stored transcript keeps them.
+        summary_input = timecodes.strip_transcript_tail_noise(raw_text)
         parts: list[str] = []
         async for delta in llm_summary.stream_summarize(
-            raw_text,
+            summary_input,
             title=title,
             output_language=cfg.output.language_name,
+            from_audio_transcript=True,
         ):
             parts.append(delta)
             broker.publish(task_job_id, delta_event(delta))
