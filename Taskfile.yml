@@ -29,6 +29,16 @@ tasks:
       - bash scripts/install.sh
       - bash scripts/mlx.sh install
 
+  install:uv:
+    desc: "Native (no Docker) install — uv tool install + user autostart service"
+    cmds:
+      - sh scripts/install-uv.sh
+
+  uninstall:uv:
+    desc: "Remove the native (uv) install — service, tool, and (with confirmation) data"
+    cmds:
+      - sh scripts/uninstall-uv.sh
+
   up:
     desc: Start the daemon (and mlx-server if installed via task install:mlx)
     cmds:

@@ -1,0 +1,176 @@
+# Daemon configuration. Loaded at startup by daemon/src/config.py.
+# Environment variables prefixed with TLDR__ override individual fields,
+# e.g. TLDR__OUTPUT__LANGUAGE=English
+#
+# llm.base_url and whisper.base_url are INDEPENDENT — they can point at the
+# same server (e.g. mlx-openai-server serves both) or different ones
+# (e.g. LM Studio for LLM + whisper.cpp server for Whisper).
+#
+# Whisper is only needed as a last resort for YouTube videos that have no
+# official transcripts and no auto-generated captions. If you skip it those
+# videos will error at the transcription step rather than falling back.
+
+# ---------------------------------------------------------------------------
+# Backend: Ollama (any OS, easiest setup) — default
+# Install: https://ollama.com/download
+# Then: ollama pull gemma4:e4b && ollama serve
+#
+# IMPORTANT — Ollama uses a tiny context window by default (often 2048).
+# Gemma 4 E4B supports 128K. Expand it once with a Modelfile:
+#
+#   printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile
+#   ollama create gemma4:e4b-128k -f Modelfile
+#
+# Then set model: gemma4:e4b-128k below and context_length: 131072.
+# Without this, long pages and videos will be silently truncated.
+# ---------------------------------------------------------------------------
+llm:
+  base_url: http://host.docker.internal:11434/v1
+  api_key: ollama
+  model: gemma4:e4b-128k                           # see note above; use gemma4:e4b if you skip the Modelfile step
+  context_length: 131072
+  single_pass_token_limit: 80000                   # above this → map-reduce (~60% of context_length)
+  # Cap on simultaneous LLM calls. 1 is safe on most local setups;
+  # bump to 2-3 on a beefy GPU server or a hosted backend.
+  max_concurrent_calls: 1
+
+whisper:
+  # Whisper is only used as a last-resort fallback for YouTube videos with no
+  # captions. Most videos have auto-generated captions — you can leave this
+  # block pointing at a non-existent server and the daemon will skip Whisper
+  # gracefully. To enable it, pick a backend:
+  #
+  #   macOS Apple Silicon:  task install:mlx  (port 18000)
+  #   Any OS (Docker):      docker run -p 8000:8000 fedirz/faster-whisper-server
+  #   Any OS (brew):        brew install whisper-cpp && whisper-server -m ggml-large-v3.bin
+  base_url: http://host.docker.internal:18000/v1
+  api_key: dummy
+  model: whisper                                   # served_model_name in ~/.mlx-server/config.yaml
+
+# ---------------------------------------------------------------------------
+# Backend: LM Studio (LLM) + mlx-openai-server (Whisper)
+# LM Studio: https://lmstudio.ai — GUI app, enable local server on port 1234.
+# Load any GGUF model (e.g. lmstudio-community/gemma-4-E4B-it-GGUF Q4_K_M).
+#
+# IMPORTANT — LM Studio defaults to a small context window. After loading the
+# model, open its settings and set Context Length to 131072 — otherwise long
+# pages and videos will be silently truncated.
+# Check the active context: lms ps  (shows CONTEXT column for the loaded model)
+#
+# reasoning_effort controls Gemma 4 thinking; the right value depends on the
+# backend (the daemon adds it to every chat call):
+#   mlx-openai-server / mlx_vlm: "low" — thinking stays hidden in
+#     reasoning_content (our code ignores it), content arrives clean.
+#   LocalAI / llama.cpp (gallery GGUF, jinja template): thinking is ADAPTIVE —
+#     it fires nondeterministically on "hard" prompts, delaying or (with a
+#     small max_tokens) entirely consuming the answer. "low" does NOT fully
+#     suppress it (measured 1/6 runs); use "none" (0/6, faster median).
+#     chat_template_kwargs {enable_thinking: false} is unreliable — don't.
+#   Real OpenAI API: "none" is rejected — remove the field entirely.
+# Note: LocalAI responses carry "reasoning": null in message; harmless for
+# the bundled client, but beware strict response-schema validation.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:1234/v1
+#   api_key: lm-studio                             # LM Studio doesn't check it
+#   model: google/gemma-4-e4b                      # model ID shown by LM Studio API
+#   context_length: 131072                         # match `lms ps` CONTEXT column
+#   single_pass_token_limit: 80000                 # ~60% of context_length
+#   max_concurrent_calls: 1
+#   reasoning_effort: "low"                        # keep Gemma 4 thinking hidden; omit for non-thinking models
+#
+# whisper:
+#   base_url: http://host.docker.internal:18000/v1
+#   api_key: dummy
+#   model: whisper
+
+# ---------------------------------------------------------------------------
+# Backend: mlx-openai-server — Apple Silicon, LLM + Whisper in one server
+# Install with: task install:mlx  (sets up ~/.mlx-server/config.yaml)
+# Fastest local option; uses Metal GPU natively.
+#
+# NOTE: mlx-openai-server support for Gemma 4 is pending a stable release.
+# If it doesn't load, edit ~/.mlx-server/config.yaml and switch to
+# mlx-community/gemma-3-12b-it-4bit (served_model_name: gemma3) until fixed.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:18000/v1
+#   api_key: dummy
+#   model: gemma4                                  # served_model_name in ~/.mlx-server/config.yaml
+#   context_length: 131072                         # must match context_length in ~/.mlx-server/config.yaml
+#   single_pass_token_limit: 80000                 # ~60% of context_length
+#   max_concurrent_calls: 1
+#
+# whisper:
+#   base_url: http://host.docker.internal:18000/v1
+#   api_key: dummy
+#   model: whisper
+
+# ---------------------------------------------------------------------------
+# Backend: llama-server (LLM) + whisper-server (Whisper) — cross-platform
+# `brew install llama.cpp whisper-cpp`
+# llama-server: llama-server -m model.gguf --port 8080 -ngl 99 -c 131072
+# whisper-server: whisper-server -m ggml-large-v3.bin --port 8081
+#
+# The -c flag sets the context window. context_length here must match -c.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:8080/v1
+#   api_key: dummy
+#   model: ""                                      # llama-server ignores model name
+#   context_length: 131072                         # must match -c flag passed to llama-server
+#   single_pass_token_limit: 80000                 # ~60% of context_length
+#   max_concurrent_calls: 1
+#
+# whisper:
+#   base_url: http://host.docker.internal:8081/v1
+#   api_key: dummy
+#   model: whisper-1                               # whisper-server ignores model name
+
+# ---------------------------------------------------------------------------
+# Backend: LLM only — no Whisper fallback
+# Use any LLM server above. Omit the whisper block or point it at a
+# non-existent URL — YouTube jobs that reach the Whisper step will error.
+# Web-page jobs are unaffected (no Whisper needed).
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: http://host.docker.internal:11434/v1
+#   api_key: ollama
+#   model: gemma4:e4b
+#   context_length: 131072
+#   single_pass_token_limit: 80000
+#   max_concurrent_calls: 1
+
+# ---------------------------------------------------------------------------
+# Output language. Use an ISO 639-1 code: en, ru, de, fr, es, it, pt, ja, …
+# (the daemon expands it to the full name when prompting the LLM, which
+# helps smaller models stick to the language). Anything else is passed
+# through verbatim, so you can also write "Brazilian Portuguese" if needed.
+# ---------------------------------------------------------------------------
+output:
+  language: en
+
+youtube:
+  fast_path_max_attempts: 4
+  fast_path_backoff_seconds: [1, 4, 16, 60]
+  segment_window_seconds: 30        # aggregate transcript segments into [MM:SS]-marked windows
+  audio_format: opus
+  audio_bitrate_max: 64
+  ytdlp_sleep_interval: [3, 8]      # min, max seconds between yt-dlp requests
+  # When the youtube-transcript-api fast path fails, yt-dlp tries to grab
+  # auto-generated captions before falling back to Whisper. The original
+  # video language is always tried first; this list adds further preferences.
+  subtitle_lang_preferences: ["en", "ru"]
+
+storage:
+  data_dir: /data                   # mounted volume in the container
+  db_filename: tldr.db
+  retention_days: 365               # daemon deletes jobs older than this; 0 disables
+
+workers:
+  # Sleep this long between consecutive background jobs (Whisper queue and
+  # streaming summaries) to let the CPU/GPU cool down. 0 = back-to-back.
+  cooldown_seconds: 0
+
+logging:
+  level: INFO

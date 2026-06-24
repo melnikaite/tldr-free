@@ -325,6 +325,14 @@ def _download_audio_sync(
         "sleep_interval": sleep_min,
         "max_sleep_interval": sleep_max,
         "postprocessors": postprocessors,
+        # ffmpeg/ffprobe location for FFmpegExtractAudio — system binary if on
+        # PATH, else a bundled static build (see workers.ffmpeg). Omitted when
+        # neither is available so yt-dlp emits its own clear error.
+        **_ffmpeg_opt(),
+        # Deno runtime for the YouTube "n"/sig challenge solver — system binary
+        # or a bundled static download (see workers.jsruntime). Critical for
+        # caption-less videos whose audio we feed to Whisper.
+        **_jsruntime_opt(),
         # Allow yt-dlp to auto-fetch the EJS challenge solver from GitHub on
         # first need (paired with the deno runtime baked into the image).
         # Without this YouTube's "n" challenge cannot be solved and some
@@ -401,6 +409,30 @@ async def download_audio(
 # ---------------------------------------------------------------------------
 
 
+def _ffmpeg_opt() -> dict[str, str]:
+    """``{"ffmpeg_location": dir}`` when ffmpeg is resolvable, else ``{}``.
+
+    Spread into ydl_opts so any path that postprocesses audio (or merges
+    formats) finds ffmpeg without relying on the daemon's PATH — which under
+    launchd/systemd often excludes Homebrew/static builds.
+    """
+    from src.workers.ffmpeg import resolve_ffmpeg_dir
+
+    location = resolve_ffmpeg_dir()
+    return {"ffmpeg_location": location} if location else {}
+
+
+def _jsruntime_opt() -> dict[str, dict[str, dict[str, str]]]:
+    """``{"js_runtimes": {"deno": {"path": <path>}}}`` when deno is resolvable.
+
+    Lets yt-dlp solve YouTube's "n"/sig challenge without depending on the
+    daemon's PATH. Empty → yt-dlp's default (deno looked up on PATH).
+    """
+    from src.workers.jsruntime import deno_runtime_opt
+
+    return deno_runtime_opt()
+
+
 def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
     """Common yt-dlp opts for our YouTube callers (deno + EJS solver, quiet)."""
     opts: dict[str, Any] = {
@@ -408,8 +440,11 @@ def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
         "no_warnings": True,
         "noprogress": True,
         # Auto-fetch the EJS challenge solver so YouTube's "n" challenge can be
-        # solved by the bundled deno runtime.
+        # solved by the bundled deno runtime. The yt-dlp-ejs package ships the
+        # solver locally too; this stays as a fallback for deno's npm libs.
         "remote_components": ["ejs:github"],
+        **_ffmpeg_opt(),
+        **_jsruntime_opt(),
     }
     if cookie_path is not None:
         opts["cookiefile"] = str(cookie_path)

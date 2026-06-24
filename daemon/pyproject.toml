@@ -8,6 +8,8 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "yt-dlp>=2024.4.9",
     "youtube-transcript-api>=0.6.2",
+    "static-ffmpeg>=2.5",
+    "yt-dlp-ejs>=0.8",
     "openai>=1.50",
     "sqlmodel>=0.0.16",
     "trafilatura>=1.12",
@@ -22,6 +24,9 @@ dependencies = [
     "PyYAML>=6.0",
     "ddgs>=1.0",
 ]
+
+[project.scripts]
+tldr-daemon = "src.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -40,6 +45,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+# Non-.py files that must ship in the wheel for native (uv) installs:
+# LLM prompt templates and the config template auto-created on first run.
+[tool.setuptools.package-data]
+"src.prompts" = ["*.txt"]
+"src.assets" = ["*.example"]
 
 [tool.ruff]
 line-length = 100

@@ -26,6 +26,30 @@ reach the network, the entrypoint falls back to whatever the image bundled.
 This is the answer to "Google broke YouTube again" — `task down && task up`,
 restart pulls the latest fix, no rebuild.
 
+## Native (uv) mode invariants
+
+The daemon also installs as a uv tool (`task install:uv` →
+`scripts/install-uv.sh`; entrypoint `tldr-daemon` in `daemon/src/cli.py`).
+Invariants the native path must keep:
+
+- **Docker behavior unchanged.** Container detection is structural: if
+  `/app/config/tldr.yaml` / `/data` exist (compose mounts), they win.
+  Platform paths (`daemon/src/paths.py`) only apply when they don't.
+- **Config auto-create only at the default path.** An explicit `TLDR_CONFIG`
+  pointing at a missing file still raises; the packaged template
+  (`daemon/src/assets/tldr.yaml.example`, kept in sync with
+  `config/tldr.yaml.example`) is only used for the platform default path,
+  with `host.docker.internal` rewritten to `127.0.0.1`.
+- **One upgrade per start.** `src/selfupdate.py` refreshes yt-dlp +
+  youtube-transcript-api at CLI startup; `docker-entrypoint.sh` exports
+  `TLDR_SKIP_PKG_UPDATE=1` because it already upgrades itself. Pytest is
+  always skipped.
+- **Service registration shells out via `service._run`.** Tests monkeypatch
+  it and assert on generated plist/systemd content — never run
+  launchctl/systemctl in tests. systemd unit keeps the hardening block
+  (NoNewPrivileges, ProtectSystem=strict, ProtectHome=read-only,
+  ReadWritePaths=<data dir>, PrivateTmp).
+
 ## Taskfile is a router, not a shell
 
 `Taskfile.yml` keeps every `cmd:` block as a one-liner that delegates to a
