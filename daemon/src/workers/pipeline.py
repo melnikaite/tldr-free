@@ -590,7 +590,7 @@ async def _summarize_and_finish(
         broker.publish(job_id, error_event(f"summarization failed: {exc}"))
         return
 
-    summary_md = "".join(parts).strip()
+    summary_md = timecodes.strip_timecode_placeholders("".join(parts).strip())
     if not summary_md:
         repo.mark_failed(job_id, error="LLM returned empty summary")
         broker.publish(job_id, error_event("LLM returned empty summary"))

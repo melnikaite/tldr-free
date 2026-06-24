@@ -34,8 +34,17 @@ The output is deterministic and pure: same input → same output.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
+
+# A bracketed inline marker the LLM emits where a timecode *would* go but none
+# exists in the source — e.g. "[Не указано]", "[Not specified]", "[N/A]",
+# "[—]". The only legitimate bracket markers in a summary are timecodes
+# ([MM:SS] / [HH:MM:SS]), which always contain digits; a bracket with no digit
+# is therefore a placeholder. We skip markdown links ("[text](url)") via the
+# negative lookahead so genuine links survive untouched.
+_PLACEHOLDER_BRACKET = re.compile(r"\[[^\]\d]*\](?!\()")
 
 # Format strings for ``str.format(...)`` so callers / tests can refer to the
 # exact formatting without parsing f-strings out of the source.
@@ -146,4 +155,39 @@ def format_segments_as_marked_text(segments: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["build_marked_text", "format_segments_as_marked_text"]
+def strip_timecode_placeholders(text: str) -> str:
+    """Remove empty bracket markers the LLM left where no timecode exists.
+
+    Belt-and-suspenders for the summary prompts (which already forbid such
+    placeholders): even instructed, a small local model occasionally writes
+    "[Не указано]" / "[N/A]" next to a key point that has no timestamp. We
+    strip those brackets, then tidy the leftover whitespace (a dangling space,
+    a doubled space, or a now-orphaned " — "/"-" separator the model put
+    between the text and the marker).
+
+    Pure: same input → same output. Markdown links and real [MM:SS] markers
+    are preserved (see ``_PLACEHOLDER_BRACKET``).
+    """
+    if not text or "[" not in text:
+        return text
+
+    cleaned = _PLACEHOLDER_BRACKET.sub("", text)
+    if cleaned == text:
+        return text
+
+    out_lines: list[str] = []
+    for line in cleaned.split("\n"):
+        # Collapse runs of spaces/tabs created by the removal.
+        line = re.sub(r"[ \t]{2,}", " ", line)
+        # Drop a separator the model left dangling before the removed marker,
+        # e.g. "key point — " or "key point -".
+        line = re.sub(r"[ \t]*[—–-][ \t]*$", "", line)
+        out_lines.append(line.rstrip())
+    return "\n".join(out_lines)
+
+
+__all__ = [
+    "build_marked_text",
+    "format_segments_as_marked_text",
+    "strip_timecode_placeholders",
+]

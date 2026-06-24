@@ -126,8 +126,12 @@ async def test_runner_processes_one_task_end_to_end(
         for chunk in ("## Summary\n\n", "Seen ", "[00:00] [00:30] [01:00]."):
             yield chunk
 
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+        return {"title": "Canonical Title", "language": "en"}
+
     monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
     monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(runner_mod.youtube, "fetch_video_metadata", fake_metadata)
     monkeypatch.setattr(runner_mod.llm_summary, "stream_summarize", fake_stream_summarize)
     # Force the audio dir into tmp_path so we don't write into /data.
     monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
@@ -148,7 +152,8 @@ async def test_runner_processes_one_task_end_to_end(
     # Verify the chain.
     assert len(download_calls) == 1
     assert len(summarize_calls) == 1
-    assert summarize_calls[0]["title"] == "Test Title"
+    # Authoritative title from yt-dlp metadata overrides the DB row's scrape.
+    assert summarize_calls[0]["title"] == "Canonical Title"
 
     assert len(fake_repo.done_calls) == 1, "mark_done should have been called once"
     done = fake_repo.done_calls[0]

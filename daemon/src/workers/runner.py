@@ -50,6 +50,22 @@ def _audio_dir() -> Path:
     return p
 
 
+def _normalise_lang_code(raw: object) -> str | None:
+    """Lowercase a yt-dlp language code, collapsing ``en-US`` → ``en``.
+
+    Mirrors the pipeline's fast-path normaliser; ``None``/empty → ``None`` so
+    the column stays null when we don't know.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    if "-" in s and len(s.split("-", 1)[0]) == 2:
+        s = s.split("-", 1)[0]
+    return s
+
+
 async def _checkpoint_pause(
     job_id: str, repo_module: object, on_resume_stage: str,
 ) -> None:
@@ -159,10 +175,24 @@ async def _process_one(
             whisper_result.segments,
             window_seconds=cfg.youtube.segment_window_seconds,
         )
-        # Whisper's auto-detect. ``None`` if mlx-server isn't patched
-        # (see scripts/mlx-patches/) — the language column on Job stays
-        # null and the UI falls back to "Original" with no chip code.
+        # Whisper's auto-detect. ``None`` if the backend doesn't report it
+        # (e.g. LocalAI returns ``language: null``); we backfill from yt-dlp
+        # metadata below, else the column stays null and the UI shows
+        # "Original".
         whisper_language = whisper_result.language
+
+        # The DB row's title is whatever the extension scraped from a possibly
+        # stale SPA DOM — often just the video id. Fetch YouTube's own title
+        # (and language as a fallback), the same probe the caption fast path
+        # uses. Best-effort: a metadata hiccup must not break the summary.
+        metadata = await youtube.fetch_video_metadata(
+            url=task_url, cookies=task_cookies, scratch_dir=_audio_dir(),
+        )
+        meta_title = metadata.get("title")
+        if isinstance(meta_title, str) and meta_title.strip():
+            title = meta_title.strip()
+        if whisper_language is None:
+            whisper_language = _normalise_lang_code(metadata.get("language"))
 
         # Serialize the fine-grained Whisper segments so the Transcript tab
         # can render one line per ~1-5 s instead of the 30 s buckets
@@ -209,7 +239,7 @@ async def _process_one(
         ):
             parts.append(delta)
             broker.publish(task_job_id, delta_event(delta))
-        summary = "".join(parts).strip()
+        summary = timecodes.strip_timecode_placeholders("".join(parts).strip())
 
         if not summary:
             broker.publish(task_job_id, error_event("LLM returned empty summary"))

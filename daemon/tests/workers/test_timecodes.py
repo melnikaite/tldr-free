@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from src.workers.timecodes import build_marked_text, format_segments_as_marked_text
+from src.workers.timecodes import (
+    build_marked_text,
+    format_segments_as_marked_text,
+    strip_timecode_placeholders,
+)
 
 
 def test_empty_segments_returns_empty_string() -> None:
@@ -165,3 +169,52 @@ def test_format_segments_preserves_input_order_per_segment() -> None:
     ]
     out = format_segments_as_marked_text(segs)
     assert out == "[00:00] a\n[00:00] b\n[00:01] c\n"
+
+
+# --- strip_timecode_placeholders --------------------------------------------
+
+
+def test_strip_removes_russian_placeholder() -> None:
+    assert (
+        strip_timecode_placeholders("- Главный вывод [Не указано]")
+        == "- Главный вывод"
+    )
+
+
+def test_strip_removes_various_placeholders() -> None:
+    for ph in ("[Not specified]", "[N/A]", "[—]", "[ ]", "[-]"):
+        assert strip_timecode_placeholders(f"point {ph}") == "point"
+
+
+def test_strip_keeps_real_timecodes() -> None:
+    text = "- Key point [12:34]\n- Another [1:02:03]"
+    assert strip_timecode_placeholders(text) == text
+
+
+def test_strip_keeps_markdown_links() -> None:
+    text = "See [the docs](https://example.com) for details"
+    assert strip_timecode_placeholders(text) == text
+
+
+def test_strip_drops_dangling_separator() -> None:
+    assert strip_timecode_placeholders("Key point — [Не указано]") == "Key point"
+    assert strip_timecode_placeholders("Key point - [N/A]") == "Key point"
+
+
+def test_strip_collapses_inner_double_space() -> None:
+    assert (
+        strip_timecode_placeholders("before [Не указано] after") == "before after"
+    )
+
+
+def test_strip_noop_without_brackets() -> None:
+    text = "plain summary with no markers"
+    assert strip_timecode_placeholders(text) is text
+
+
+def test_strip_mixed_lines() -> None:
+    text = "- has time [00:30]\n- no time [Не указано]\n- link [x](y)"
+    assert (
+        strip_timecode_placeholders(text)
+        == "- has time [00:30]\n- no time\n- link [x](y)"
+    )
