@@ -26,6 +26,7 @@ Stage names are coordinated with the schema's AIStageEvent docs:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -40,6 +41,7 @@ from src.config import get_config
 from src.llm import summary as llm_summary
 from src.storage import repo
 from src.workers import page, timecodes, youtube
+from src.workers import pdf as pdf_worker
 from src.workers.broker import (
     delta_event,
     done_event,
@@ -97,6 +99,8 @@ async def run_pipeline(
     url: str,
     page_text: str | None,
     page_title: str | None,
+    media_url: str | None,
+    pdf_bytes: bytes | None,
     cookies: list[Any],
 ) -> None:
     """Top-level pipeline runner. Decides the path based on kind + extraction.
@@ -108,6 +112,28 @@ async def run_pipeline(
     try:
         if kind == JobKind.PAGE:
             await _run_page(job_id, url=url, page_text=page_text, page_title=page_title)
+        elif kind == JobKind.MEDIA:
+            if not media_url:
+                # Defensive: api/jobs validates this upstream, but the
+                # invariant lives here too so callers don't accidentally
+                # call us with kind=MEDIA + no URL and get a silent hang.
+                repo.mark_failed(job_id, error="media kind requires media_url")
+                broker.publish(job_id, error_event("media kind requires media_url"))
+                return
+            await _run_media(
+                job_id,
+                media_url=media_url,
+                page_title=page_title,
+                cookies=cookies,
+            )
+        elif kind == JobKind.PDF:
+            await _run_pdf(
+                job_id,
+                url=url,
+                pdf_bytes=pdf_bytes,
+                page_title=page_title,
+                cookies=cookies,
+            )
         else:
             await _run_youtube(job_id, url=url, page_title=page_title, cookies=cookies)
     except Exception as exc:
@@ -277,6 +303,25 @@ async def _run_youtube(
         segments,
         window_seconds=cfg.youtube.segment_window_seconds,
     )
+    # Also serialise the fine-grained segments themselves so the Transcript
+    # tab can render one line per ~2-5 s caption cue (vs the 30 s buckets
+    # ``raw_text`` uses for summary). youtube-transcript-api hands us
+    # {start, duration, text}; we normalise into the {start, end, text}
+    # shape ``_build_segments_text`` in api/jobs.py consumes.
+    raw_segments_json: str | None = None
+    if len(segments) > 1:
+        normalised = [
+            {
+                "start": float(s.get("start", 0.0)),
+                "end": float(s.get("start", 0.0))
+                + float(s.get("duration", s.get("end", 0.0) - s.get("start", 0.0))),
+                "text": str(s.get("text") or ""),
+            }
+            for s in segments
+        ]
+        raw_segments_json = json.dumps(
+            normalised, ensure_ascii=False, separators=(",", ":"),
+        )
 
     # Pause checkpoint before another yt-dlp probe (metadata) + persist + summary.
     await _checkpoint_pause(job_id, broker, "extracting")
@@ -290,6 +335,13 @@ async def _run_youtube(
         url=url, cookies=cookies, scratch_dir=_subtitles_dir(),
     )
     title = metadata.get("title") or page_title
+    # yt-dlp's metadata probe already returns the video's primary language
+    # (or original_language for dubbed videos). Use that as the transcript
+    # source language — it's the closest signal we have on the fast path,
+    # because the caption track we picked may differ (e.g. auto-translated
+    # captions in another language). Best-effort only — None falls through
+    # cleanly and the UI shows "Original".
+    transcript_language = _normalise_lang_code(metadata.get("language"))
 
     _persist_extracted(
         job_id,
@@ -297,6 +349,8 @@ async def _run_youtube(
         title=title,
         transcript_source=transcript_source,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
     broker.publish(job_id, stage_event("ready"))
 
@@ -306,6 +360,112 @@ async def _run_youtube(
         title=title,
         transcript_source=transcript_source,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
+        cfg=cfg,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Generic media path (non-YouTube): direct mp4/webm, HLS/DASH, iframe embeds
+# Vimeo/Dailymotion/Twitch/Bunny/Brightcove/JW/Wistia/Streamable/SoundCloud/…
+#
+# No subtitle fast path (most non-YouTube sites don't expose machine-readable
+# captions). Drop straight onto the Whisper queue, which already handles
+# yt-dlp audio download → transcribe → summarize for any URL yt-dlp can
+# extract from. The runner is URL-agnostic — ``WhisperTask.url`` becomes the
+# argument to ``youtube.download_audio`` regardless of the original kind.
+# ---------------------------------------------------------------------------
+
+
+async def _run_media(
+    job_id: str,
+    *,
+    media_url: str,
+    page_title: str | None,  # noqa: ARG001  — title is read from the DB row by the worker
+    cookies: list[Any],
+) -> None:
+    broker = get_broker()
+    try:
+        await get_queue().put(
+            WhisperTask(job_id=job_id, url=media_url, cookies=cookies)
+        )
+    except Exception as exc:
+        log.exception("failed to enqueue media job %s", job_id)
+        repo.mark_failed(job_id, error=f"queue error: {exc}")
+        broker.publish(job_id, error_event(f"queue error: {exc}"))
+        return
+
+    repo.update_status(
+        job_id,
+        status=JobStatus.QUEUED.value,
+        progress_stage="queued",
+    )
+    broker.publish(job_id, stage_event("queued"))
+
+
+# ---------------------------------------------------------------------------
+# PDF path — text via pypdf (fast path), vision OCR fallback for scanned PDFs
+# ---------------------------------------------------------------------------
+
+
+async def _run_pdf(
+    job_id: str,
+    *,
+    url: str,
+    pdf_bytes: bytes | None,
+    page_title: str | None,
+    cookies: list[Any],
+) -> None:
+    broker = get_broker()
+    cfg = get_config()
+
+    repo.update_status(job_id, status=JobStatus.RUNNING.value, progress_stage="extracting")
+    broker.publish(job_id, stage_event("extracting"))
+
+    await _checkpoint_pause(job_id, broker, "extracting")
+
+    try:
+        text, transcript_source = await pdf_worker.process_pdf(
+            job_id=job_id, url=url, pdf_bytes=pdf_bytes, cookies=cookies,
+        )
+    except Exception as exc:
+        log.exception("pdf extraction failed for %s", job_id)
+        repo.mark_failed(job_id, error=f"pdf extraction failed: {exc}")
+        broker.publish(job_id, error_event(f"pdf extraction failed: {exc}"))
+        return
+    finally:
+        # Release the raw PDF bytes (tens of MB for big files) before the
+        # LLM summary step starts — extraction is the only step that needs
+        # them. Without this, a 30 MB PDF stays resident through minutes
+        # of streaming summary, multiplied by every concurrent job.
+        pdf_bytes = None
+
+    text = text.strip()
+    if not text:
+        repo.mark_failed(
+            job_id,
+            error="pdf produced no extractable text (try OCRing it first)",
+        )
+        broker.publish(job_id, error_event("pdf produced no extractable text"))
+        return
+
+    await _checkpoint_pause(job_id, broker, "extracting")
+
+    _persist_extracted(
+        job_id,
+        raw_text=text,
+        title=page_title,
+        transcript_source=transcript_source,
+    )
+    broker.publish(job_id, stage_event("ready"))
+
+    await _summarize_and_finish(
+        job_id,
+        text=text,
+        title=page_title,
+        transcript_source=transcript_source,
+        video_id=None,
         cfg=cfg,
     )
 
@@ -315,6 +475,26 @@ async def _run_youtube(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_lang_code(raw: Any) -> str | None:
+    """Lowercase + strip a language code from yt-dlp / whisper output.
+
+    yt-dlp's ``info.get("language")`` sometimes returns ``"en-US"`` or a
+    full name; we keep the value short here (just lowercase + first two
+    chars when it looks like ``xx-YY``) and leave full canonicalisation
+    to the Phase 3 language helper. ``None`` and empty strings come back
+    as ``None`` so the column stays null for "we don't know".
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    # ``en-US`` / ``ru-ru`` style — keep the first segment.
+    if "-" in s and len(s.split("-", 1)[0]) == 2:
+        s = s.split("-", 1)[0]
+    return s
+
+
 def _persist_extracted(
     job_id: str,
     *,
@@ -322,6 +502,8 @@ def _persist_extracted(
     title: str | None,
     transcript_source: TranscriptSource,
     video_id: str | None = None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
 ) -> None:
     """Set raw_text + transcript_source + video_id mid-pipeline (no status change).
 
@@ -336,6 +518,8 @@ def _persist_extracted(
         transcript_source=transcript_source.value,
         title=title,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
 
 
@@ -346,6 +530,8 @@ async def _summarize_and_finish(
     title: str | None,
     transcript_source: TranscriptSource,
     video_id: str | None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
     cfg: Any,
 ) -> None:
     """Run streaming summarization and mark the job done.
@@ -404,7 +590,7 @@ async def _summarize_and_finish(
         broker.publish(job_id, error_event(f"summarization failed: {exc}"))
         return
 
-    summary_md = "".join(parts).strip()
+    summary_md = timecodes.strip_timecode_placeholders("".join(parts).strip())
     if not summary_md:
         repo.mark_failed(job_id, error="LLM returned empty summary")
         broker.publish(job_id, error_event("LLM returned empty summary"))
@@ -417,6 +603,8 @@ async def _summarize_and_finish(
         transcript_source=transcript_source.value,
         title=title,
         video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
     )
     broker.publish(job_id, done_event(summary_md))
 
@@ -454,11 +642,38 @@ _YOUTUBE_HOSTS = {
 }
 
 
-def infer_kind(url: str, declared: str) -> JobKind:
-    """Map ``kind="auto"`` to the concrete enum based on the URL host."""
-    if declared in (JobKind.PAGE.value, JobKind.YOUTUBE.value):
+def infer_kind(
+    url: str,
+    declared: str,
+    media_url: str | None = None,
+    *,
+    pdf_bytes_present: bool = False,
+) -> JobKind:
+    """Map ``kind="auto"`` to the concrete enum based on the URL + hints.
+
+    Resolution order for ``declared == "auto"``:
+      1. ``media_url`` set → ``MEDIA`` (extension found a transcribable
+         media element on the page; takes priority over host inference so
+         a YouTube *embed* on a third-party site still flows through the
+         generic media path with the iframe URL, not through the YouTube
+         fast path on the page URL).
+      2. ``pdf_bytes_present`` or URL path ends in ``.pdf`` → ``PDF``.
+      3. URL host in ``_YOUTUBE_HOSTS`` → ``YOUTUBE``.
+      4. Otherwise → ``PAGE``.
+    """
+    if declared in (
+        JobKind.PAGE.value,
+        JobKind.YOUTUBE.value,
+        JobKind.MEDIA.value,
+        JobKind.PDF.value,
+    ):
         return JobKind(declared)
-    host = (urlparse(url).hostname or "").lower()
+    if media_url:
+        return JobKind.MEDIA
+    parsed = urlparse(url)
+    if pdf_bytes_present or (parsed.path or "").lower().endswith(".pdf"):
+        return JobKind.PDF
+    host = (parsed.hostname or "").lower()
     if host in _YOUTUBE_HOSTS:
         return JobKind.YOUTUBE
     return JobKind.PAGE

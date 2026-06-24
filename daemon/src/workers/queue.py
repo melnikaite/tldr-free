@@ -122,14 +122,32 @@ async def re_enqueue_pending(queue: WhisperQueue, repo_module: object) -> int:
             await queue.put(WhisperTask(job_id=job_id, url=url, cookies=[]))
             n += 1
         else:
-            # A page job left in queued/running can't be resumed (no audio,
-            # the request body is gone). Mark failed so the row reflects reality.
+            # Page / media / pdf jobs left in queued/running can't be
+            # resumed by the queue:
+            #   - page: page_text from the request body is gone
+            #   - media: media_url lives only inside the in-flight WhisperTask
+            #   - pdf:  pdf_bytes (file://) aren't persisted; http URLs
+            #     survive but restart goes through the user clicking
+            #     summarize again, not the queue
+            # Mark failed so the row reflects reality.
             mark_failed = getattr(repo_module, "mark_failed", None)
             if mark_failed is not None:
+                reasons = {
+                    "media": (
+                        "daemon restarted mid-stream; media url not persisted, "
+                        "please re-summarize from the extension"
+                    ),
+                    "pdf": (
+                        "daemon restarted mid-stream; PDF not resumable, "
+                        "please re-summarize from the extension"
+                    ),
+                }
+                kind_key = kind if isinstance(kind, str) else ""
+                reason = reasons.get(kind_key, "daemon restarted; job not resumable")
                 try:
-                    mark_failed(job_id, error="daemon restarted; page job not resumable")
+                    mark_failed(job_id, error=reason)
                 except Exception:
-                    log.exception("failed to mark stale page job %s as failed", job_id)
+                    log.exception("failed to mark stale %s job %s as failed", kind, job_id)
     if n:
         log.info("queue: re-enqueued %d pending youtube job(s) on startup", n)
     return n

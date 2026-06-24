@@ -14,15 +14,30 @@ tasks:
       - task --list
 
   install:
-    desc: One-time setup — config, daemon image, vendor libs (any OpenAI-compatible backend)
+    desc: "Smart one-time setup — auto-detects hardware via llmfit, picks the right backend + model"
+    cmds:
+      - bash scripts/smart-install.sh
+
+  install:manual:
+    desc: "Manual install — copies config template only; you configure the backend yourself"
     cmds:
       - bash scripts/install.sh
 
   install:mlx:
-    desc: "Optional (macOS arm64): install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
+    desc: "Apple Silicon only: install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
     cmds:
       - bash scripts/install.sh
       - bash scripts/mlx.sh install
+
+  install:uv:
+    desc: "Native (no Docker) install — uv tool install + user autostart service"
+    cmds:
+      - sh scripts/install-uv.sh
+
+  uninstall:uv:
+    desc: "Remove the native (uv) install — service, tool, and (with confirmation) data"
+    cmds:
+      - sh scripts/uninstall-uv.sh
 
   up:
     desc: Start the daemon (and mlx-server if installed via task install:mlx)

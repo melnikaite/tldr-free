@@ -9,11 +9,11 @@
 // Enums (string literal unions in JSDoc-land)
 // ---------------------------------------------------------------------------
 
-/** @typedef {"page" | "youtube"} JobKind */
+/** @typedef {"page" | "youtube" | "media" | "pdf"} JobKind */
 
 /** @typedef {"queued" | "running" | "done" | "failed"} JobStatus */
 
-/** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura"} TranscriptSource */
+/** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura" | "pdf_text" | "pdf_vision"} TranscriptSource */
 
 // ---------------------------------------------------------------------------
 // Cookie (forwarded from chrome.cookies.getAll)
@@ -30,6 +30,18 @@
  * @property {number | null} expires
  */
 
+/**
+ * One playable media source discovered by extract.js. The top-scored one
+ * drives ``media_url`` of the job; the rest ride along as
+ * ``alt_media_candidates`` so the sidepanel can render a "wrong source?"
+ * picker without re-running the page scanner.
+ *
+ * @typedef {object} MediaCandidate
+ * @property {string} media_url
+ * @property {"video" | "audio" | "iframe"} kind
+ * @property {string} label   - Human-readable: <title> attr / aria-label / filename / "Video 2"
+ */
+
 // ---------------------------------------------------------------------------
 // POST /jobs (always async — 202 Accepted; client subscribes via /ai/stream)
 // ---------------------------------------------------------------------------
@@ -37,9 +49,12 @@
 /**
  * @typedef {object} JobCreateRequest
  * @property {string} url
- * @property {"page" | "youtube" | "auto"} kind
+ * @property {"page" | "youtube" | "media" | "pdf" | "auto"} kind
  * @property {string | null} [page_text]
  * @property {string | null} [page_title]
+ * @property {string | null} [media_url]       - direct media URL (yt-dlp-extractable). Sets kind=media when present under auto.
+ * @property {MediaCandidate[] | null} [alt_media_candidates]  - other playable sources on the same page; populates JobDetails.alt_media_candidates for the "wrong source?" picker
+ * @property {string | null} [pdf_bytes_b64]   - base64 PDF bytes (file:// only; http(s) PDFs are fetched daemon-side)
  * @property {Cookie[] | null} [cookies]
  */
 
@@ -70,11 +85,37 @@
  */
 
 /**
+ * @typedef {object} TranscriptTranslationSummary
+ * @property {string} language_code
+ * @property {"queued" | "running" | "done" | "failed"} status
+ * @property {number} progress_percent
+ * @property {string | null} [error]
+ */
+
+/**
+ * Response of GET /jobs/{id}/transcript?lang=…
+ *
+ * When ``is_pending`` is true, ``text`` is null and the UI should show a
+ * placeholder + refetch on the next job_event. ``404`` is reserved for
+ * "no such job" and "no such translation row" — in-flight transcripts /
+ * translations return 200 with ``is_pending: true``.
+ *
+ * @typedef {object} TranscriptResponse
+ * @property {string | null} text          - full raw_text (or translated text); null when is_pending
+ * @property {string | null} language_code - ISO-639-1; null for PDF/HTML jobs
+ * @property {boolean} is_original         - true when serving Job.raw_text
+ * @property {boolean} [is_pending]        - true when work is still in flight
+ */
+
+/**
  * @typedef {JobSummary & {
  *   summary_md: string | null,
  *   error: string | null,
  *   video_id: string | null,
- *   partial_summary: string | null
+ *   partial_summary: string | null,
+ *   transcript_language: string | null,
+ *   transcript_translations: TranscriptTranslationSummary[],
+ *   alt_media_candidates: MediaCandidate[]
  * }} JobDetails
  */
 

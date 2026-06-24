@@ -14,16 +14,53 @@
       <button id="open-library">Library</button>
     </header>
 
-    <main id="summary">
-      <p class="placeholder">Click the toolbar button on a page or YouTube video.</p>
-    </main>
+    <!-- Tab nav. Transcript tab is hidden until the active job is a kind
+         that has a meaningful transcript (youtube / media). Summary is
+         always available. -->
+    <nav id="tab-nav" class="tab-nav" role="tablist">
+      <button
+        id="tab-summary"
+        type="button"
+        role="tab"
+        aria-selected="true"
+        class="tab tab--active"
+        data-tab="summary"
+      >Summary</button>
+      <button
+        id="tab-transcript"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        class="tab hidden"
+        data-tab="transcript"
+      >Transcript</button>
+    </nav>
 
-    <div id="chat-messages"></div>
+    <!-- Summary tab pane (existing UX: timeline + summary stream + chat). -->
+    <section id="pane-summary" class="tab-pane tab-pane--active" role="tabpanel">
+      <main id="summary">
+        <p class="placeholder">Click the toolbar button on a page or YouTube video.</p>
+      </main>
 
-    <form id="chat-form">
-      <input id="chat-input" type="text" placeholder="Ask about this material..." disabled />
-      <button type="submit" disabled>Ask</button>
-    </form>
+      <div id="chat-messages"></div>
+
+      <form id="chat-form">
+        <input id="chat-input" type="text" placeholder="Ask about this material..." disabled />
+        <button type="submit" disabled>Ask</button>
+      </form>
+    </section>
+
+    <!-- Transcript tab pane. Lazy-populated on first show — transcript.js
+         calls daemon.getTranscript only when the user clicks the tab.
+         Sticky language bar floats over the scrolling transcript content. -->
+    <section id="pane-transcript" class="tab-pane hidden" role="tabpanel">
+      <div id="lang-bar" class="lang-bar">
+        <!-- chips + input rendered by transcript.js -->
+      </div>
+      <div id="transcript-body" class="transcript-body">
+        <p class="placeholder">Open this tab to load the transcript.</p>
+      </div>
+    </section>
 
     <!-- Vendored libs (classic scripts, expose globals: marked, DOMPurify) -->
     <script src="../../vendor/marked.min.js"></script>

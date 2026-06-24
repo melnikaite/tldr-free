@@ -3,18 +3,55 @@
 </p>
 
 <p align="center">
-  <strong>Local summaries and Q&amp;A for web pages and YouTube videos.</strong><br/>
-  Open source. No API keys. Nothing leaves your machine.
+  <strong>Local summaries, transcripts and Q&amp;A for web pages, PDFs, YouTube —
+  and any audio or video your browser can see.</strong><br/>
+  Clickable timecodes. Persistent library. Open source. No API keys.
+  Nothing leaves your machine.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
+  <img src="https://img.shields.io/badge/Chrome-MV3%20side%20panel-ffce44.svg" alt="Chrome MV3 side panel">
+  <a href="CLAUDE.md"><img src="https://img.shields.io/badge/AI%20agent-ready%20docs-8A2BE2.svg" alt="AI-agent-ready docs"></a>
 </p>
 
 ---
 
 TLDR is a Chrome side-panel extension plus a small FastAPI daemon. Click the
-toolbar button on any page or YouTube video and you get a streaming summary
-with clickable `[MM:SS]` timecodes, plus a chat box to ask follow-up questions
-about the same material. The daemon stores everything locally in SQLite and
-talks to a LLM/Whisper backend over the **OpenAI-compatible HTTP API** — pick
-whatever runner you like.
+toolbar button on any page, PDF, YouTube video or podcast embed and you get a
+streaming summary with clickable `[MM:SS]` timecodes, plus a chat box to ask
+follow-up questions about the same material. Everything you process lands in
+a local library (SQLite on your disk) you can come back to any time. The
+daemon talks to an LLM/Whisper backend over the **OpenAI-compatible HTTP
+API** — pick whatever runner you like.
+
+<!-- TODO: 30-second demo GIF here (toolbar click → streaming summary →
+     timecode click seeks the video → Q&A). See distribution-plan.md §4. -->
+
+## Why TLDR, not yet another summarizer?
+
+Browsers are growing built-in page summaries, and cloud summarizer extensions
+are a dime a dozen. TLDR aims at what those don't do:
+
+- **Any audio or video, not just pages.** If yt-dlp can extract it — a
+  YouTube video, a podcast embed, a raw `<video>` tag — TLDR gets a
+  transcript (official captions → auto-captions → local Whisper) and
+  summarises it.
+- **Clickable `[MM:SS]` timecodes** in the summary, in Q&A answers and in
+  the full transcript. Click one and the player seeks right there.
+- **A persistent local library.** Summaries, transcripts, translations and
+  per-item chat history live in SQLite on your machine, survive restarts
+  and never expire unless you say so.
+- **Your model, your context window.** Any OpenAI-compatible backend, up to
+  128K context — a two-hour podcast summarised in one pass, not snippets
+  fed to a tiny built-in model.
+- **Transcripts are first-class.** Read the full text, translate it into
+  your language on demand, navigate by timecode.
+
+If all you need is "shorten this article", built-in browser AI is fine. TLDR
+is for *"I have 40 tabs, three lectures and a podcast backlog — condense all
+of it, keep it, and keep it private."*
 
 ## Features
 
@@ -26,6 +63,14 @@ whatever runner you like.
 - **Two paths for YouTube transcripts.** First the official transcript API,
   then yt-dlp's auto-captions, then Whisper as a last resort. Timecodes
   preserved on the first two paths.
+- **Beyond YouTube: any media on the page.** Native `<video>`/`<audio>` tags
+  and whitelisted embeds are detected and transcribed through the same chain;
+  if several candidates are found you pick which one to process.
+- **Transcript tab with translation.** The full transcript lives next to the
+  summary, translated on demand into any language, navigable by timecode.
+- **PDFs work too.** http(s) or local `file://` PDFs are parsed in the
+  side panel via pdf.js and summarised like any other page. (Image-only
+  scans need OCR first — not built in.)
 - **Persistent chat per job.** Q&A history is stored in SQLite, survives tab
   switches and browser restarts.
 - **Pause/resume all background ML** when you need the machine for foreground
@@ -195,10 +240,9 @@ worker waits that many seconds between consecutive jobs.
         └───────────────────────────────────────────┘
 ```
 
-More detail in [`.claude/architecture.md`](.claude/architecture.md). For
-contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
-[`.claude/extension.md`](.claude/extension.md) and
-[`.claude/conventions.md`](.claude/conventions.md).
+More detail in [`.claude/architecture.md`](.claude/architecture.md), plus
+topic-specific docs under [`.claude/`](.claude/) — see
+[`CLAUDE.md`](CLAUDE.md) for the full map.
 
 ## Repository layout
 
@@ -206,7 +250,7 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
 .
 ├── README.md
 ├── CLAUDE.md                     # orientation for code agents (links to .claude/*.md)
-├── .claude/                      # architecture / daemon / extension / conventions
+├── .claude/                      # topic-named contributor docs (see CLAUDE.md for the map)
 ├── Taskfile.yml                  # all dev commands
 ├── docker-compose.yml
 ├── scripts/
@@ -236,6 +280,27 @@ contributors there are also [`.claude/daemon.md`](.claude/daemon.md),
 - **Chrome 116+** (Manifest V3 side panel).
 - **Apple Silicon, optional**: only if you want the bundled mlx setup (`task install:mlx`).
   ~6 GB disk for Gemma 4 E4B (4-bit) + Whisper large-v3 weights.
+
+## Roadmap
+
+Near-term, roughly in order:
+
+- [ ] Chrome Web Store listing (signed, auto-updating install)
+- [ ] Daemon install without Docker (`pipx install` / single binary)
+- [ ] Zero-config pairing with an already-running Ollama
+- [ ] Full-text search across the library
+- [ ] Firefox port
+- [ ] Export to Markdown / Obsidian
+
+Opinions and PRs welcome — open an issue.
+
+## Contributing
+
+The codebase ships orientation docs for humans and AI agents alike: start at
+[CLAUDE.md](CLAUDE.md), which maps the topic docs in [.claude/](.claude/) —
+architecture, event model, worker invariants, dev runbook. `task test` runs
+ruff + mypy + pytest in the daemon container; the extension has no build
+step at all.
 
 ## License
 

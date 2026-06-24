@@ -9,9 +9,14 @@
 //     or from Library on retry/open): if shouldSwitch=true, switch to the
 //     new job. This is the primary path; storage.onChanged is a backup
 //     (same-value sets aren't guaranteed to notify).
-//   - On `tab-changed` broadcast (background.js noticed the active tab
+//   - On `set-active-tab` broadcast (background.js noticed the active tab
 //     changed): switch the panel to that tab's cached job, or render
-//     "no summary yet" if it has none.
+//     "no summary yet" if it has none. The message arrives twice per
+//     switch — once before listJobs (jobId omitted) so the panel can
+//     blank to a spinner, and once after (jobId resolved) so it can
+//     render the final state. A monotonic `version` discards stale
+//     phase-2 messages when the user switches again before listJobs
+//     for the previous tab finishes.
 //   - Chat history persists in SQLite (per job). On job switch we GET
 //     /jobs/{id}/messages and render the saved bubbles before any new
 //     question.
@@ -27,7 +32,46 @@ import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
-import { setActiveJob, getActiveJob, renderHistory, clearChat } from "./chat.js";
+import {
+  setActiveJob as _chatSetActiveJob,
+  getActiveJob,
+  renderHistory,
+  clearChat,
+} from "./chat.js";
+import * as transcript from "./transcript.js";
+
+/** Remember the id we last broadcast so we only reset the tab on real switches. */
+let _lastBroadcastJobId = /** @type {string | null} */ (null);
+
+/**
+ * Set the active job everywhere that cares about it: chat (Q&A bubbles,
+ * history rendering) and the transcript tab controller (lazy fetch +
+ * polling lifecycle). Always go through this wrapper rather than calling
+ * the chat-only setter directly — the transcript tab needs to know when
+ * the job changes to reset its cache and stop the currentTime poll.
+ *
+ * When the user actually switches Chrome tabs to a different summarised
+ * job (id A → id B), the visual tab is reset to Summary so they see
+ * the canonical view of the new content. We deliberately do NOT reset
+ * when going from "no job" → "job" (the user just clicked Process from
+ * the Transcript tab; keep them there to watch the transcript stream
+ * in) or for in-place patches (same id, e.g. yt-dlp title fill).
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ */
+function setActiveJob(job) {
+  _chatSetActiveJob(job);
+  transcript.setJob(job);
+  const newId = job?.id ?? null;
+  const wasNoJob = _lastBroadcastJobId == null;
+  if (newId !== _lastBroadcastJobId) {
+    _lastBroadcastJobId = newId;
+    // Only force a summary-tab view when the user actually switched
+    // between two existing jobs. Going from no-job → job is the
+    // "just kicked off processing" path — leave the tab choice alone.
+    if (!wasNoJob && typeof switchTab === "function") switchTab("summary");
+  }
+}
 
 // Sidepanel needs every event type — stage/delta drive the active job's
 // timeline + summary stream, job/workers drive the badge.
@@ -61,22 +105,74 @@ openLibraryBtn?.addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tab switching (Summary | Transcript)
+//
+// Two buttons in #tab-nav, two panes (#pane-summary / #pane-transcript). The
+// Transcript tab button is hidden by transcript.js when the active job's
+// kind doesn't have a meaningful transcript (page / pdf). When the user
+// switches to it the first time for a given job, transcript.js lazy-loads
+// the body via GET /jobs/{id}/transcript.
+// ---------------------------------------------------------------------------
+
+const summaryTabBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("tab-summary"));
+const transcriptTabBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("tab-transcript"));
+const summaryPaneEl = /** @type {HTMLElement | null} */ (document.getElementById("pane-summary"));
+const transcriptPaneEl = /** @type {HTMLElement | null} */ (document.getElementById("pane-transcript"));
+
+/** @param {"summary" | "transcript"} which */
+function switchTab(which) {
+  if (!summaryTabBtn || !transcriptTabBtn || !summaryPaneEl || !transcriptPaneEl) return;
+  const wantSummary = which === "summary";
+  summaryTabBtn.classList.toggle("tab--active", wantSummary);
+  transcriptTabBtn.classList.toggle("tab--active", !wantSummary);
+  summaryTabBtn.setAttribute("aria-selected", String(wantSummary));
+  transcriptTabBtn.setAttribute("aria-selected", String(!wantSummary));
+  summaryPaneEl.classList.toggle("tab-pane--active", wantSummary);
+  transcriptPaneEl.classList.toggle("tab-pane--active", !wantSummary);
+  // Show/hide via the active class — tab-pane is display:none by default.
+  if (wantSummary) {
+    transcript.onTabHide();
+  } else {
+    transcript.onTabShow();
+  }
+}
+
+summaryTabBtn?.addEventListener("click", () => switchTab("summary"));
+transcriptTabBtn?.addEventListener("click", () => switchTab("transcript"));
+
+// ---------------------------------------------------------------------------
 // Timecode link handler — click on a [MM:SS] link in the summary.
-// If the YouTube video is already open in a tab: focus that tab and seek
-// the video element directly (no page reload). Otherwise open a new tab.
+//
+// Two flavours:
+//   - YouTube (data-tldr-video-id): focus the YouTube tab if open, seek the
+//     <video> element directly. Otherwise open a new tab at the timestamped
+//     URL — YouTube's player honours the `t=` query param.
+//   - Generic media (data-tldr-media-page-url): focus the page tab if open,
+//     try to seek the first <video>/<audio> element on the page via
+//     executeScript. Otherwise open the URL with the `#t=Ns` media-fragment
+//     in the href — works for direct media file URLs natively; on regular
+//     pages the user has to scrub manually but they at least land on the
+//     right page.
+//
 // Delegated on summaryEl so it works across dynamic rerenders.
 // ---------------------------------------------------------------------------
 
-summaryEl.addEventListener("click", (ev) => {
+// Delegated on ``document.body`` so it works in BOTH panes: timecode links
+// appear inside the summary (#summary), inside chat bubbles (#chat-messages),
+// AND inside the transcript view (#pane-transcript). A handler bound to
+// summaryEl misses the latter and the click falls through to the generic
+// external-link handler — which opens a fresh tab instead of seeking the
+// already-open one.
+document.body.addEventListener("click", (ev) => {
   const a = /** @type {HTMLElement} */ (ev.target).closest("a[data-tldr-seconds]");
-  // Only intercept plain left-clicks — let ctrl/cmd/middle-click fall through
-  // to the browser's native "open in new tab" behaviour.
   if (!a || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
   ev.preventDefault();
-  const seconds = Number(/** @type {HTMLElement} */ (a).dataset.tldrSeconds);
-  const videoId = /** @type {HTMLElement} */ (a).dataset.tldrVideoId || "";
+  const el = /** @type {HTMLElement} */ (a);
+  const seconds = Number(el.dataset.tldrSeconds);
+  const videoId = el.dataset.tldrVideoId || "";
+  const mediaPageUrl = el.dataset.tldrMediaPageUrl || "";
   const fallbackUrl = /** @type {HTMLAnchorElement} */ (a).href;
-  _openTimecode(videoId, seconds, fallbackUrl).catch((err) =>
+  _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }).catch((err) =>
     console.warn("[TLDR] timecode open failed:", err),
   );
 });
@@ -84,8 +180,9 @@ summaryEl.addEventListener("click", (ev) => {
 /**
  * Find an already-open tab for ``url``.
  * YouTube URLs are matched by video ID so extra query params (&t=, &autoplay=,
- * etc.) on the open tab don't prevent the match.  All other URLs are matched
- * by exact string equality.
+ * etc.) on the open tab don't prevent the match. Other URLs are matched by
+ * canonical form (fragment stripped on both sides), so a timecode anchor
+ * like ``…/podcast#t=754`` matches the live tab at ``…/podcast``.
  * Returns the first matching Tab, or ``undefined`` if none is open.
  *
  * @param {string} url
@@ -105,8 +202,19 @@ async function _findTab(url) {
         }
       });
     }
+    parsed.hash = "";
+    const canonical = parsed.toString();
     const tabs = await chrome.tabs.query({});
-    return tabs.find((t) => t.url === url);
+    return tabs.find((t) => {
+      if (!t.url) return false;
+      try {
+        const tabUrl = new URL(t.url);
+        tabUrl.hash = "";
+        return tabUrl.toString() === canonical;
+      } catch {
+        return t.url === url;
+      }
+    });
   } catch {
     return undefined;
   }
@@ -125,22 +233,30 @@ async function _focusTab(tab) {
 }
 
 /**
- * Focus an existing YouTube tab playing this video and seek to ``seconds``,
- * or open a new tab if none is found.
+ * Seek to ``seconds`` on the source page if it's open, else open a new tab.
  *
- * @param {string} videoId
- * @param {number} seconds
- * @param {string} fallbackUrl
+ * For YouTube: lookup is by video id (handled inside ``_findTab``), seek
+ * targets ``video`` only.
+ * For generic media: lookup is by canonical page URL, seek targets the first
+ * ``video, audio`` element — covers HTML5 audio players, podcast pages,
+ * direct .mp4/.webm files. Iframe-embedded players (YouTube-in-iframe,
+ * Vimeo, etc.) won't seek because the iframe is a separate document scope;
+ * we don't try to message-pass into them.
+ *
+ * @param {{ videoId: string, mediaPageUrl: string, seconds: number, fallbackUrl: string }} opts
  */
-async function _openTimecode(videoId, seconds, fallbackUrl) {
-  const existing = await _findTab(fallbackUrl);
+async function _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }) {
+  const lookupUrl = videoId ? fallbackUrl : mediaPageUrl || fallbackUrl;
+  const existing = await _findTab(lookupUrl);
   if (existing?.id !== undefined) {
     await _focusTab(existing);
     await chrome.scripting.executeScript({
       target: { tabId: existing.id },
       func: (t) => {
-        const video = document.querySelector("video");
-        if (video) video.currentTime = t;
+        const media = /** @type {HTMLMediaElement | null} */ (
+          document.querySelector("video, audio")
+        );
+        if (media) media.currentTime = t;
       },
       args: [seconds],
     });
@@ -168,6 +284,45 @@ summaryEl.addEventListener("click", (ev) => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Generic external-link handler — catches every `<a href>` anywhere in the
+// side panel that isn't a timecode marker or the job-title link (those have
+// their own handlers above with custom focus/seek logic).
+//
+// Why this exists: links produced by `marked` (both in the summary body and
+// in assistant chat bubbles) have no `target` attribute, and Chrome side
+// panels can't navigate top-level, so a plain anchor click is a silent no-op
+// in the side panel iframe. We translate every click into
+// `chrome.tabs.create()` so external URLs reliably open in a new browser tab.
+//
+// Attached to ``document.body`` so the handler covers BOTH ``#summary`` and
+// ``#chat-messages`` — markdown rendering happens in both surfaces.
+//
+// Skips ``javascript:``, ``#``-only, and empty hrefs — those are not
+// external navigation and shouldn't be hijacked.
+// ---------------------------------------------------------------------------
+
+document.body.addEventListener("click", (ev) => {
+  const target = /** @type {HTMLElement} */ (ev.target);
+  const a = /** @type {HTMLAnchorElement | null} */ (target.closest("a[href]"));
+  if (!a) return;
+  // Skip anchors that the timecode / title handlers already own.
+  if (a.dataset.tldrSeconds !== undefined) return;
+  if (a.closest(".job-title")) return;
+  // Honour modifier keys / non-left clicks — browser default already DTRT.
+  if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+
+  const raw = a.getAttribute("href") || "";
+  // In-page anchors and javascript: shouldn't open a new tab.
+  if (!raw || raw.startsWith("#") || raw.startsWith("javascript:")) return;
+  const href = a.href;  // resolved absolute URL
+  if (!href) return;
+  ev.preventDefault();
+  chrome.tabs.create({ url: href }).catch((err) =>
+    console.warn("[TLDR] external link open failed:", err),
+  );
+});
+
 /**
  * Focus an existing tab already showing ``url``, or open a new tab.
  *
@@ -182,23 +337,26 @@ async function _openUrl(url) {
   chrome.tabs.create({ url });
 }
 
+// Monotonic version of the latest tab switch the side panel has acknowledged.
+// background.js increments its counter on every syncSidepanelForTab; we drop
+// any message with an older version so out-of-order listJobs completions
+// can't act on a tab the user has already left.
+let lastTabVersion = 0;
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
-  if (msg.type === "tab-switching") {
-    // The active tab is changing. Abort any in-flight stream immediately so a
-    // `done` event from the previous job can't render stale content while we
-    // wait for `tab-changed` (which arrives after listJobs completes).
-    abortActiveStream();
-  } else if (msg.type === "tab-changed") {
-    handleTabChanged(msg.url, msg.jobId).catch((e) =>
-      console.error("[TLDR] tab-changed", e),
+  if (msg.type === "set-active-tab") {
+    if (typeof msg.version === "number" && msg.version < lastTabVersion) return;
+    if (typeof msg.version === "number") lastTabVersion = msg.version;
+    handleSetActiveTab(msg).catch((e) =>
+      console.error("[TLDR] set-active-tab", e),
     );
   } else if (msg.type === "job-created") {
     handleJobCreated(msg).catch((e) =>
       console.error("[TLDR] job-created", e),
     );
   } else if (msg.type === "extraction-error") {
-    renderError(msg.error || "Failed to extract page content.");
+    renderState({ mode: "error", message: msg.error || "Failed to extract page content." });
   }
 });
 
@@ -237,6 +395,13 @@ eventStream.subscribe((event) => {
 function handleJobEvent(event) {
   const j = event.job;
   if (!j?.id) return;
+  // Translation-progress pings are NOT job-state mutations — they piggyback
+  // on the job-event channel for fan-out but their payload describes the
+  // translation row (kind="transcript_translation", status="running", …).
+  // Merging those fields into the Job would clobber kind and status,
+  // hiding the Transcript tab and confusing the summary view. transcript.js
+  // owns chip updates; the badge / patch logic here ignores them.
+  if (event.action === "translation_updated") return;
   if (event.action === "deleted") {
     activeJobIds.delete(j.id);
     streamAccCache.delete(j.id);
@@ -278,7 +443,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 bootstrap().catch((e) => {
   console.error("[TLDR] sidepanel bootstrap", e);
-  renderError(stringifyError(e));
+  renderState({ mode: "error", message: stringifyError(e) });
 });
 
 async function bootstrap() {
@@ -290,48 +455,180 @@ async function bootstrap() {
   if (activeJobId) {
     await loadAndRender(activeJobId);
   } else if (activeUrl) {
-    renderNoSummary(activeUrl);
-    syncChatEnabled(false);
+    renderState({ mode: "no-summary", url: activeUrl });
   }
 }
 
 /**
- * Tab follow: the active tab changed.
- * @param {string} url
- * @param {string | null} jobId
+ * Single entry point for tab-follow. Background fires this twice per switch:
+ *
+ *   phase 1 ({version, url}):           "moving to this tab, jobId unknown yet"
+ *   phase 2 ({version, url, jobId}):    "listJobs done — here's the answer"
+ *
+ * The version filter above (`lastTabVersion`) discards stale phase-2 messages
+ * if a newer switch already fired. Everything else is handled by
+ * `renderState` idempotency: re-rendering the same state is a no-op, so we
+ * don't need a side-flag like the old `domBlankedBySwitch` to remember
+ * whether the DOM was wiped.
+ *
+ * @param {{ version?: number, url: string, jobId?: string | null }} msg
  */
-async function handleTabChanged(url, jobId) {
-  if (jobId) {
-    const active = await getActiveJob();
-    if (active && active.id === jobId) return;
-    await loadAndRender(jobId);
-  } else {
-    abortActiveStream();
+async function handleSetActiveTab(msg) {
+  const { url, jobId } = msg;
+  const active = await getActiveJob();
+
+  if (jobId === undefined) {
+    // Phase 1: probe. background still resolving.
+    if (active?.url === url) return;   // same tab — keep current view
+    renderState({ mode: "loading" });
+    return;
+  }
+
+  // Phase 2: definitive answer.
+  if (jobId === null) {
     setActiveJob(null);
     clearChat();
-    renderNoSummary(url);
-    syncChatEnabled(false);
+    renderState({ mode: "no-summary", url });
     window.scrollTo({ top: 0 });
+    return;
+  }
+
+  if (active && active.id === jobId) {
+    // Same job — render from in-memory. renderState idempotency keeps this
+    // a no-op when nothing changed (window focus restored on the same tab
+    // shouldn't flicker), and replaces a loading skeleton from phase 1.
+    //
+    // BUT: the cache can be stale in two ways — non-terminal status, or
+    // terminal status with a missing payload (see `isCacheStale` for why).
+    // Fall back to the cached view if the refresh fails.
+    if (isCacheStale(active)) {
+      const refreshed = await refreshActiveJob();
+      if (refreshed) return;
+    }
+    renderFromJob(active);
+    return;
+  }
+  await loadAndRender(jobId);
+}
+
+/**
+ * Whether the cached active-job representation is too stale to render off
+ * directly — caller should refresh from the daemon before rendering.
+ *
+ * Two cases count as stale:
+ *
+ * 1. **Non-terminal status.** The daemon may have advanced past the
+ *    cached stage while the side panel was paused (window minimised
+ *    throttles SSE), so the cache could under-report progress.
+ *
+ * 2. **Terminal status with missing payload.** This happens when
+ *    `patchActiveJobIfMatches` receives a `job_event` (a lightweight
+ *    JobSummary that has `status="done"` but no `summary_md`) and the
+ *    per-job SSE "done" frame that *does* carry the content is dropped —
+ *    typically because the side panel was throttled mid-stream by a
+ *    window minimise. `renderFromJob` then sees `status="done" &&
+ *    !summary_md` and falls through to the streaming placeholder,
+ *    re-rendering the "Queued for transcription" view over a job that
+ *    actually finished hours ago.
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null | undefined} j
+ */
+function isCacheStale(j) {
+  if (!j) return false;
+  if (j.status !== "done" && j.status !== "failed") return true;
+  if (j.status === "done" && !j.summary_md) return true;
+  if (j.status === "failed" && !j.error) return true;
+  return false;
+}
+
+/**
+ * Re-fetch the currently-shown job from the daemon and re-render via
+ * `renderFromJob`. Returns false if there's no active job or the fetch
+ * failed (caller is responsible for any fallback).
+ *
+ * Why this exists: the side panel subscribes to GET /events for live
+ * streaming state, but events that fire while the panel is throttled
+ * (most commonly: window minimised → Chrome pauses SSE → /events "done"
+ * arrives into a stalled fetch reader) are lost — EventSource has no
+ * server-side replay. Without an explicit refresh, a streaming job
+ * that finished during the pause is stuck on "queued"/"running" forever
+ * even though the daemon long since wrote summary_md.
+ *
+ * Idempotent: `renderState` short-circuits when nothing changed, so
+ * calling this when the job really is still streaming costs one HTTP
+ * round-trip and zero DOM mutations.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function refreshActiveJob() {
+  const active = await getActiveJob();
+  if (!active) return false;
+  try {
+    const fresh = await daemon.getJob(active.id, { signal: AbortSignal.timeout(8000) });
+    setActiveJob(fresh);
+    renderFromJob(fresh);
+    return true;
+  } catch (err) {
+    console.warn("[TLDR] refresh active job failed", err);
+    return false;
+  }
+}
+
+// When the side panel becomes visible again (window restored from minimise,
+// most often), any /events messages that landed during the pause are gone —
+// the daemon only ever pushes live, no server-side replay. Two things may
+// have gone stale:
+//   1. The currently-shown job — could be stuck on "queued"/"running" even
+//      though it actually finished while we were away.
+//   2. The processing badge counter — could over-count if "done" events for
+//      OTHER jobs were lost during the pause.
+// Refresh both. Terminal cached state never changes so the refresh is
+// skipped there for free.
+//
+// Independent from background.js's tab-sync because that path early-returns
+// for non-summarizable tabs (Library, chrome://, …), so a user staring at
+// Library when they un-minimise gets no `set-active-tab` and would
+// otherwise stay stuck on the cached streaming view.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  seedBadge().catch(() => {});
+  getActiveJob().then((j) => {
+    if (isCacheStale(j)) refreshActiveJob();
+  });
+});
+
+/**
+ * Pick the right renderState mode based on a job's current status.
+ * Used wherever we have a job in hand and want "show this job, whatever
+ * state it's in" without re-implementing the switch four times.
+ *
+ * @param {import("../lib/api-types.js").JobDetails} job
+ */
+function renderFromJob(job) {
+  if (job.status === "done" && job.summary_md) {
+    renderState({ mode: "done", job, content: job.summary_md });
+  } else if (job.status === "failed") {
+    renderState({ mode: "error", message: job.error || "Job failed.", job });
+  } else {
+    renderState({ mode: "streaming", job });
   }
 }
 
 /** @param {string} jobId */
 async function loadAndRender(jobId) {
-  abortActiveStream();
-  renderLoading();
-  syncChatEnabled(false);
+  renderState({ mode: "loading" });
   // Reset scroll to the top so the user sees the new title / summary from
   // the start (otherwise we may be parked deep in the previous job's chat).
   window.scrollTo({ top: 0 });
 
   // Safety net: if getJob hangs (daemon down, dead service worker, …) the
-  // user gets a real error after 8s instead of an endless spinner.
+  // user gets a real error after 8s instead of an indefinite spinner.
   let job;
   try {
-    job = await withTimeout(daemon.getJob(jobId), 8000, `getJob(${jobId})`);
+    job = await daemon.getJob(jobId, { signal: AbortSignal.timeout(8000) });
   } catch (err) {
     console.error("[TLDR] getJob failed", err);
-    renderError(stringifyError(err));
+    renderState({ mode: "error", message: stringifyError(err) });
     return;
   }
   setActiveJob(job);
@@ -339,54 +636,220 @@ async function loadAndRender(jobId) {
   // Pull chat history in parallel with summary rendering.
   loadHistory(jobId).catch((e) => console.warn("[TLDR] message history failed", e));
 
-  if (job.status === "done" && job.summary_md) {
-    renderSummary(job, job.summary_md);
-    setStage(null);
-    syncChatEnabled(true);
-    return;
-  }
-  if (job.status === "failed") {
-    renderError(job.error || "Job failed.", job);
-    setStage(null);
-    return;
-  }
+  renderFromJob(job);
+}
 
-  // queued / running → subscribe to live /ai/stream.
-  await streamSummaryFor(job);
+// ---------------------------------------------------------------------------
+// Single source of truth for the summary pane.
+//
+// `renderState({mode, ...})` owns the triplet (`summaryEl.innerHTML`, the
+// stage badge, chat enablement) for every state the pane can be in. Callers
+// describe the new state declaratively; this function does the DOM writes,
+// the secondary state plumbing, and the stream subscription teardown.
+//
+// Idempotent via `currentRender.key` — calling with the same state twice is
+// a no-op, which matters for `streaming` (re-entering would drop the live
+// subscription and reset the timeline) and `done` (would re-render the same
+// markdown for no reason). State transitions still always render.
+// ---------------------------------------------------------------------------
+
+/** @typedef {(
+ *   | { mode: "loading" }
+ *   | { mode: "no-summary", url: string }
+ *   | { mode: "error", message: string, job?: import("../lib/api-types.js").JobDetails | null }
+ *   | { mode: "done", job: import("../lib/api-types.js").JobDetails, content: string }
+ *   | { mode: "streaming", job: import("../lib/api-types.js").JobDetails }
+ * )} ViewState */
+
+/** @type {{ key: string } | null} */
+let currentRender = null;
+
+/** @param {ViewState} state */
+function renderState(state) {
+  const key = _stateKey(state);
+  if (currentRender?.key === key) return;
+  currentRender = { key };
+
+  // Every state transition drops any live subscription from the previous
+  // state. Streaming re-attaches its own below.
+  abortActiveStream();
+
+  switch (state.mode) {
+    case "loading":
+      summaryEl.innerHTML = `
+        <div class="status-block">
+          <div class="spinner" aria-hidden="true"></div>
+          <p>Loading…</p>
+        </div>
+      `;
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+
+    case "no-summary":
+      summaryEl.innerHTML = `
+        <div class="placeholder-block">
+          <p class="muted small url-line">${escapeHtml(state.url || "")}</p>
+          <button class="summarize-btn" type="button">Summarize this page</button>
+        </div>
+      `;
+      _bindSummarizeButton();
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+
+    case "error": {
+      const titleHtml = _titleHtml(state.job || null);
+      const retryHtml = state.job?.id
+        ? `<button class="retry-btn" data-retry-id="${escapeHtml(state.job.id)}">Retry</button>`
+        : "";
+      summaryEl.innerHTML = `
+        ${titleHtml}
+        <div class="status-block error">
+          <p><strong>Error.</strong></p>
+          <p class="muted small">${escapeHtml(state.message)}</p>
+          ${retryHtml}
+        </div>
+      `;
+      _bindRetryButton(state.job || null);
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+    }
+
+    case "done": {
+      const titleHtml = _titleHtml(state.job);
+      const html = renderMarkdown(state.content || "_(empty summary)_", state.job);
+      summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
+      setStage(null);
+      syncChatEnabled(true);
+      return;
+    }
+
+    case "streaming": {
+      const titleHtml = _titleHtml(state.job);
+      summaryEl.innerHTML =
+        `${titleHtml}` +
+        `<ul class="timeline" id="phase-timeline"></ul>` +
+        `<div class="markdown-body" id="summary-stream"></div>`;
+      _attachStreamSubscription(state.job);
+      // Chat is disabled while streaming: daemon /ai/qa requires status=done.
+      syncChatEnabled(false);
+      return;
+    }
+  }
+}
+
+/** @param {ViewState} state */
+function _stateKey(state) {
+  switch (state.mode) {
+    case "loading":    return "loading";
+    case "no-summary": return `no-summary:${state.url || ""}`;
+    case "error":      return `error:${state.job?.id || ""}:${state.message}`;
+    case "done":       return `done:${state.job.id}:${state.content?.length ?? 0}`;
+    case "streaming":  return `streaming:${state.job.id}`;
+  }
 }
 
 /**
- * Drive the summary area for a queued/running job from /events.
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ */
+function _titleHtml(job) {
+  if (!job?.title) return "";
+  const safeUrl = escapeHtml(job.url);
+  const safeTitle = escapeHtml(job.title);
+  const altHtml = _altSourcesHtml(job);
+  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>${altHtml}`;
+}
+
+/**
+ * "Wrong source?" chip for media jobs with multiple candidates on the
+ * source page. Read-only for now — clicking expands a list of the other
+ * candidates with their labels + URLs so the user can SEE we picked
+ * something else, but switching requires manual "Process this page" on
+ * another tab (Phase 2 wires actual one-click switch + old-job delete).
+ *
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ * @returns {string}
+ */
+function _altSourcesHtml(job) {
+  const alts = job?.alt_media_candidates || [];
+  if (alts.length === 0) return "";
+  const items = alts
+    .map((c) => {
+      const label = escapeHtml(c.label || c.media_url);
+      const kind = escapeHtml(c.kind || "media");
+      const url = escapeHtml(c.media_url);
+      return `<li class="alt-source-item">
+        <span class="alt-source-kind">${kind}</span>
+        <span class="alt-source-label">${label}</span>
+        <code class="alt-source-url">${url}</code>
+      </li>`;
+    })
+    .join("");
+  const count = alts.length;
+  const word = count === 1 ? "source" : "sources";
+  return `<details class="alt-sources">
+    <summary>Wrong source? ${count} other ${word} on this page</summary>
+    <ul class="alt-source-list">${items}</ul>
+    <p class="alt-sources-hint muted small">
+      Picker coming next — for now: open the right one in its own tab and re-run.
+    </p>
+  </details>`;
+}
+
+function _bindSummarizeButton() {
+  const btn = /** @type {HTMLButtonElement | null} */ (
+    summaryEl.querySelector(".summarize-btn")
+  );
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+    try {
+      await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
+    } catch (err) {
+      console.error("[TLDR] summarize-active-tab failed", err);
+      renderState({ mode: "error", message: stringifyError(err) });
+    }
+  });
+}
+
+/** @param {import("../lib/api-types.js").JobDetails | null} job */
+function _bindRetryButton(job) {
+  const btn = /** @type {HTMLButtonElement | null} */ (summaryEl.querySelector(".retry-btn"));
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const id = btn.dataset.retryId;
+    if (!id) return;
+    btn.setAttribute("disabled", "true");
+    try {
+      await daemon.retryJob(id);
+      await loadAndRender(id);
+    } catch (err) {
+      console.error("[TLDR] retry failed", err);
+      btn.removeAttribute("disabled");
+      renderState({ mode: "error", message: stringifyError(err), job });
+    }
+  });
+}
+
+/**
+ * Wire up the live event-stream subscription for a streaming job. Expects
+ * `summaryEl` to already contain the streaming skeleton (timeline + stream
+ * div). The unsubscribe handle goes into `activeStreamUnsubscribe`; any
+ * later `renderState(...)` (or explicit `abortActiveStream`) tears it down.
  *
  * No second SSE connection is opened — we filter the global event stream by
  * job_id. This keeps each side panel at exactly one long-lived connection
- * and avoids running into Chrome's 6-per-origin HTTP/1.1 cap, which used
- * to leave subsequent fetches "stalled" with no entry in DevTools' Network
- * tab while a /ai/stream connection still hung from a prior pipeline.
- *
- * UI shape during streaming:
- *   <h2>title</h2>
- *   <ul class="timeline">
- *     <li class="phase phase--done">  ✓  Extracting page content
- *     <li class="phase phase--active"> dots Transcribing audio
- *   </ul>
- *   <div class="markdown-body" id="summary-stream"></div>  ← starts empty
- *
- * On the first delta the timeline collapses to a muted strip and tokens
- * begin flowing into #summary-stream. On done it's replaced with the
- * rendered markdown.
+ * and avoids running into Chrome's 6-per-origin HTTP/1.1 cap.
  *
  * @param {import("../lib/api-types.js").JobDetails} job
  */
-function streamSummaryFor(job) {
-  const titleHtml = renderTitleHtml(job);
-  const initialStage = job.progress_stage || "queued";
-  summaryEl.innerHTML =
-    `${titleHtml}` +
-    `<ul class="timeline" id="phase-timeline"></ul>` +
-    `<div class="markdown-body" id="summary-stream"></div>`;
+function _attachStreamSubscription(job) {
   const timelineEl = /** @type {HTMLElement} */ (document.getElementById("phase-timeline"));
   const streamEl = /** @type {HTMLElement} */ (document.getElementById("summary-stream"));
+  const initialStage = job.progress_stage || "queued";
 
   /** @type {Array<{stage:string, detail:(string|undefined), status:"active"|"done"|"failed", error?:string}>} */
   const phases = [];
@@ -403,36 +866,25 @@ function streamSummaryFor(job) {
   let rafId = null;
   setStage(initialStage);
 
-  // If we already have buffered content, collapse the phase timeline and
-  // render it right away so the user sees the full replay instead of a blank.
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
-    streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+    streamEl.innerHTML = renderMarkdown(acc, job);
   }
 
-  /**
-   * Schedule a markdown re-render for the next animation frame.
-   * Using rAF as a throttle: multiple delta events arriving in the same JS
-   * task batch collapse into one DOM write per frame (~60 Hz max, but in
-   * practice limited by the daemon's ~10 Hz delta flush rate). This gives
-   * progressive formatted rendering during streaming instead of raw text.
-   */
+  // rAF throttle: multiple delta events in the same JS task batch collapse
+  // into one DOM write per frame.
   const scheduleRender = () => {
-    if (rafId !== null) return;          // already queued
+    if (rafId !== null) return;
     rafId = requestAnimationFrame(() => {
       rafId = null;
-      if (acc) streamEl.innerHTML = renderMarkdown(acc, job.video_id);
+      if (acc) streamEl.innerHTML = renderMarkdown(acc, job);
     });
   };
-
   const cancelRender = () => {
     if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
   };
 
-  // Subscribe to the global event stream filtered by this job's id.
-  // The unsubscribe handle goes into `activeStreamUnsubscribe` so
-  // loadAndRender / handleTabChanged can drop it when the user moves on.
-  const unsubscribe = eventStream.subscribe((ev) => {
+  activeStreamUnsubscribe = eventStream.subscribe((ev) => {
     if (ev.job_id !== job.id) return;
     if (ev.type === "stage") {
       setStage(ev.stage, ev.detail);
@@ -446,43 +898,38 @@ function streamSummaryFor(job) {
         firstDelta = false;
       }
       acc += ev.delta;
-      streamAccCache.set(job.id, acc);  // keep replay buffer current
+      streamAccCache.set(job.id, acc);
       scheduleRender();
     } else if (ev.type === "done") {
       cancelRender();
-      streamAccCache.delete(job.id);   // job finished — no longer need replay
+      streamAccCache.delete(job.id);
       const content = ev.content || acc;
-      markAllDone(phases);
-      setStage(null);
-      abortActiveStream();
-      // Fetch the fresh job BEFORE rendering so video_id and the canonical
-      // title are available. The job object captured at stream start has
-      // video_id=null (set mid-pipeline by _set_extracted) and may still
-      // carry the video-id placeholder as title. Rendering with the stale
-      // object would leave [MM:SS] timecodes as plain text instead of links.
-      daemon.getJob(job.id).then(fresh => {
-        setActiveJob(fresh);
-        renderSummary(fresh, content);
-        syncChatEnabled(true);
-      }).catch(() => {
-        // Daemon unreachable — fall back to the stale job; timecodes won't
-        // be links but at least the summary text is shown.
-        renderSummary(job, content);
-        syncChatEnabled(true);
+      // Persist summary_md into the in-memory active-job cache: a later
+      // renderFromJob(active) (window restore, tab switch back) would
+      // otherwise see status="done" with summary_md=null (the daemon's
+      // job_event publishes JobSummary without summary_md) and fall
+      // through to the streaming placeholder. Merge into the *current*
+      // active so mid-stream patches (yt-dlp title, etc.) aren't lost.
+      getActiveJob().then((cur) => {
+        if (cur?.id === job.id) {
+          setActiveJob({ ...cur, status: "done", summary_md: content });
+        }
       });
+      renderState({ mode: "done", job, content });
     } else if (ev.type === "error") {
       cancelRender();
-      streamAccCache.delete(job.id);   // job failed — drop replay buffer
-      markActiveFailed(phases, ev.error || "Error");
-      renderTimeline(timelineEl, phases);
-      renderError(ev.error, job);
-      setStage(null);
-      syncChatEnabled(false);
-      abortActiveStream();
+      streamAccCache.delete(job.id);
+      const error = ev.error || "Error";
+      // Same reasoning as the "done" branch — mirror status/error into the
+      // cache so the failed-state render branch is taken on later renders.
+      getActiveJob().then((cur) => {
+        if (cur?.id === job.id) {
+          setActiveJob({ ...cur, status: "failed", error });
+        }
+      });
+      renderState({ mode: "error", message: error, job });
     }
   });
-
-  activeStreamUnsubscribe = unsubscribe;
 }
 
 // ---------------------------------------------------------------------------
@@ -591,94 +1038,6 @@ async function loadHistory(jobId) {
   }
 }
 
-/**
- * @param {import("../lib/api-types.js").JobDetails} job
- * @param {string} markdown
- */
-function renderSummary(job, markdown) {
-  const titleHtml = renderTitleHtml(job);
-  const html = renderMarkdown(markdown || "_(empty summary)_", job.video_id);
-  summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
-}
-
-/** @param {import("../lib/api-types.js").JobDetails | null} job */
-function renderTitleHtml(job) {
-  if (!job?.title) return "";
-  const safeUrl = escapeHtml(job.url);
-  const safeTitle = escapeHtml(job.title);
-  return `<h2 class="job-title"><a href="${safeUrl}" target="_blank" rel="noopener">${safeTitle}</a></h2>`;
-}
-
-function renderLoading() {
-  summaryEl.innerHTML = `
-    <div class="status-block">
-      <div class="spinner" aria-hidden="true"></div>
-      <p>Loading…</p>
-    </div>
-  `;
-}
-
-/** @param {string} url */
-function renderNoSummary(url) {
-  summaryEl.innerHTML = `
-    <div class="placeholder-block">
-      <p class="muted small url-line">${escapeHtml(url || "")}</p>
-      <button class="summarize-btn" type="button">Summarize this page</button>
-    </div>
-  `;
-  const btn = /** @type {HTMLButtonElement | null} */ (
-    summaryEl.querySelector(".summarize-btn")
-  );
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      btn.textContent = "Starting…";
-      try {
-        await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
-      } catch (err) {
-        console.error("[TLDR] summarize-active-tab failed", err);
-        renderError(stringifyError(err));
-      }
-    });
-  }
-  setStage(null);
-}
-
-/**
- * @param {string} message
- * @param {import("../lib/api-types.js").JobDetails} [job]
- */
-function renderError(message, job) {
-  const titleHtml = renderTitleHtml(job || null);
-  const retryHtml = job?.id
-    ? `<button class="retry-btn" data-retry-id="${escapeHtml(job.id)}">Retry</button>`
-    : "";
-  summaryEl.innerHTML = `
-    ${titleHtml}
-    <div class="status-block error">
-      <p><strong>Error.</strong></p>
-      <p class="muted small">${escapeHtml(message)}</p>
-      ${retryHtml}
-    </div>
-  `;
-  const btn = summaryEl.querySelector(".retry-btn");
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      const id = /** @type {HTMLElement} */ (btn).dataset.retryId;
-      if (!id) return;
-      btn.setAttribute("disabled", "true");
-      try {
-        await daemon.retryJob(id);
-        await loadAndRender(id);
-      } catch (err) {
-        console.error("[TLDR] retry failed", err);
-        btn.removeAttribute("disabled");
-        renderError(stringifyError(err), job);
-      }
-    });
-  }
-}
-
 /** @param {string | null} stage @param {string | null | undefined} [detail] */
 function setStage(stage, detail) {
   if (!stageBadgeEl) return;
@@ -719,26 +1078,3 @@ function syncChatEnabled(enabled) {
   if (chatSubmit) chatSubmit.disabled = !enabled;
 }
 
-/**
- * Race a promise against a timeout. Used as a safety net so a hung HTTP
- * call (daemon stopped, container restarting, MV3 service worker dead) shows
- * a real error instead of an indefinite spinner.
- *
- * @template T
- * @param {Promise<T>} promise
- * @param {number} ms
- * @param {string} label
- * @returns {Promise<T>}
- */
-function withTimeout(promise, ms, label) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${label} timed out after ${ms}ms`)),
-      ms,
-    );
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}

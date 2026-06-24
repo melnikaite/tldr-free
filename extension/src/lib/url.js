@@ -36,6 +36,53 @@ const YT_HOST_RE =
   /^(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com)$/i;
 
 /**
+ * Resolve the YouTube video id for a job. Prefers `job.video_id` (the
+ * canonical value the daemon writes mid-pipeline) and falls back to parsing
+ * the URL — so timecode links work from the very first delta event, before
+ * the daemon has finished filling in `video_id`.
+ *
+ * One helper, one place where the policy lives. Callers should never write
+ * `job.video_id || extractYoutubeVideoId(job.url)` directly.
+ *
+ * @param {{ video_id?: string | null, url?: string | null } | null | undefined} job
+ * @returns {string | null}
+ */
+export function resolveVideoId(job) {
+  if (!job) return null;
+  return job.video_id || extractYoutubeVideoId(job.url);
+}
+
+/**
+ * Extract a YouTube video id from a URL, or null if the URL isn't a
+ * recognisable YouTube video page. Pure function — does not touch storage
+ * or the daemon, so it's safe to call during render without race conditions
+ * (the alternative — reading `job.video_id` — depends on the daemon having
+ * already written that field, which happens mid-pipeline).
+ *
+ * @param {string | null | undefined} rawUrl
+ * @returns {string | null}
+ */
+export function extractYoutubeVideoId(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl) return null;
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (!YT_HOST_RE.test(u.hostname)) return null;
+  const fromQuery = u.searchParams.get("v");
+  if (fromQuery) return fromQuery;
+  const m = u.pathname.match(/^\/(?:embed|shorts|v|live)\/([\w-]{6,})/);
+  if (m) return m[1];
+  if (/^youtu\.be$/i.test(u.hostname)) {
+    const tail = u.pathname.replace(/^\//, "").split("/")[0];
+    if (tail) return tail;
+  }
+  return null;
+}
+
+/**
  * Return a canonical form of the URL for matching/storage.
  * Returns the input unchanged if it's not parseable as a URL.
  *
@@ -57,15 +104,7 @@ export function normalizeUrl(rawUrl) {
   if (YT_HOST_RE.test(u.hostname)) {
     // YouTube: identity is the video id. Anything else (t=, list=, index=,
     // ab_channel=, pp=, etc.) is noise.
-    let videoId = u.searchParams.get("v");
-    if (!videoId) {
-      const m = u.pathname.match(/^\/(?:embed|shorts|v|live)\/([\w-]{6,})/);
-      if (m) videoId = m[1];
-      else if (/^youtu\.be$/i.test(u.hostname)) {
-        const tail = u.pathname.replace(/^\//, "").split("/")[0];
-        if (tail) videoId = tail;
-      }
-    }
+    const videoId = extractYoutubeVideoId(u.toString());
     if (videoId) {
       u.hostname = "www.youtube.com";
       u.pathname = "/watch";

@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "TLDR free",
+  "version": "0.1.0",
+  "description": "Local summaries and Q&A with clickable timecodes for pages, PDFs, YouTube and any media. Nothing leaves your machine.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tldr@melnikaite.github.io",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "cookies",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "Summarize this page"
+  },
+  "background": {
+    "scripts": ["src/background.js"],
+    "type": "module"
+  },
+  "sidebar_action": {
+    "default_panel": "src/sidepanel/index.html",
+    "default_title": "TLDR",
+    "default_icon": "public/icons/icon48.png",
+    "open_at_install": false
+  },
+  "options_ui": {
+    "page": "src/options/index.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "16": "public/icons/icon16.png",
+    "48": "public/icons/icon48.png",
+    "128": "public/icons/icon128.png"
+  }
+}

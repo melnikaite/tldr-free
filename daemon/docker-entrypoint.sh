@@ -14,6 +14,11 @@
 
 set -e
 
+# This entrypoint already handles the upgrade below; tell the daemon's own
+# startup self-update (src/selfupdate.py, used in native/uv mode) to skip so
+# the libraries are never upgraded twice per start.
+export TLDR_SKIP_PKG_UPDATE=1
+
 if [ "$1" = "uvicorn" ]; then
   echo "==> entrypoint: refreshing yt-dlp + youtube-transcript-api ..."
   if pip install --upgrade --disable-pip-version-check --quiet \

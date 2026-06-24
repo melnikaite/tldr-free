@@ -56,8 +56,14 @@ def create_job(
     kind: str,
     title: str | None = None,
     progress_stage: str | None = None,
+    alt_media_candidates_json: str | None = None,
 ) -> Job:
     """Insert a fresh Job row in ``status='running'`` and return it.
+
+    ``alt_media_candidates_json`` is the pre-serialised JSON payload
+    discovered by the extension's page scanner (see the column comment
+    on ``Job.alt_media_candidates_json``). Persisted only at create time
+    — we don't re-scan a page after the job exists.
 
     Emits ``job_event("created", …)`` so the Library renders the row instantly
     without polling.
@@ -70,6 +76,7 @@ def create_job(
         status="running",
         title=title,
         progress_stage=progress_stage,
+        alt_media_candidates_json=alt_media_candidates_json,
         created_at=now,
         updated_at=now,
     )
@@ -117,8 +124,15 @@ def mark_done(
     title: str | None = None,
     duration_seconds: int | None = None,
     video_id: str | None = None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
 ) -> None:
     """Finalise a job with status=done, persisting all extracted fields.
+
+    ``transcript_language`` is the ISO-639-1 code of the source transcript.
+    Setting it here AND in ``set_extracted`` is redundant on the happy path,
+    but ``set_extracted`` is what catches mid-pipeline failures (summary
+    errors after transcription succeeded), so both paths persist it.
 
     Emits ``job_event("updated", …)`` so the Library row flips to done with the
     final title in one event.
@@ -138,6 +152,10 @@ def mark_done(
             job.duration_seconds = duration_seconds
         if video_id is not None:
             job.video_id = video_id
+        if transcript_language is not None:
+            job.transcript_language = transcript_language
+        if raw_segments_json is not None:
+            job.raw_segments_json = raw_segments_json
         job.completed_at = now
         job.updated_at = now
         job.error = None
@@ -153,6 +171,8 @@ def set_extracted(
     transcript_source: str,
     title: str | None = None,
     video_id: str | None = None,
+    transcript_language: str | None = None,
+    raw_segments_json: str | None = None,
 ) -> None:
     """Persist extraction output mid-pipeline (before the summary call).
 
@@ -180,6 +200,10 @@ def set_extracted(
             job.title = title
         if video_id is not None:
             job.video_id = video_id
+        if transcript_language is not None:
+            job.transcript_language = transcript_language
+        if raw_segments_json is not None:
+            job.raw_segments_json = raw_segments_json
         job.updated_at = now
         session.add(job)
     _emit_updated(job_id)
@@ -283,10 +307,57 @@ def job_summary_dict(job: Job) -> dict[str, Any]:
         "duration_seconds": job.duration_seconds,
         "progress_stage": job.progress_stage,
         "transcript_source": job.transcript_source,
+        "transcript_language": getattr(job, "transcript_language", None),
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
     }
+
+
+def list_translations(job_id: str) -> list[Any]:
+    """Return cached translation summaries for ``job_id``.
+
+    Empty list when no translation has been requested. Returned as plain
+    dicts (Pydantic in the API layer coerces them into the
+    ``TranscriptTranslationSummary`` schema).
+    """
+    from src.storage.db import TranscriptTranslation
+
+    with session_scope() as session:
+        rows = session.exec(
+            select(TranscriptTranslation).where(TranscriptTranslation.job_id == job_id)
+        ).all()
+        return [
+            {
+                "language_code": r.language_code,
+                "status": r.status,
+                "progress_percent": int(r.progress_percent),
+                "error": r.error,
+            }
+            for r in rows
+        ]
+
+
+def get_translation(job_id: str, language_code: str) -> dict[str, Any] | None:
+    """Return a single cached translation row (or ``None`` if absent).
+
+    Returns the full text in ``"text"`` — used by ``GET /transcript`` to
+    serve the body. Callers should check ``status == "done"`` before
+    relying on the text (in-flight rows are present too with text=None).
+    """
+    from src.storage.db import TranscriptTranslation
+
+    with session_scope() as session:
+        row = session.get(TranscriptTranslation, (job_id, language_code))
+        if row is None:
+            return None
+        return {
+            "language_code": row.language_code,
+            "status": row.status,
+            "progress_percent": int(row.progress_percent),
+            "text": row.text,
+            "error": row.error,
+        }
 
 
 # ---------------------------------------------------------------------------

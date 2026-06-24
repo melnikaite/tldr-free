@@ -11,6 +11,7 @@
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
+import { openSidePanel } from "../lib/browser-compat.js";
 
 // Library only renders status badges + queue counter — skip the high-volume
 // stage/delta chatter from running pipelines.
@@ -285,6 +286,12 @@ async function handleAction(action, id) {
 
 /** @param {string} id */
 async function openInSidePanel(id) {
+  // Kick off the panel open FIRST, synchronously within the button-click
+  // gesture — Firefox's sidebarAction.open() rejects if any await runs
+  // before it. The promise is awaited below so the existing
+  // toast-on-failure path still works. (The Chrome path inside the shim
+  // resolves the current window itself, same as before.)
+  const opening = openSidePanel();
   await chrome.storage.session.set({ activeJobId: id });
   // Try to broadcast so an open side panel switches.
   try {
@@ -297,13 +304,11 @@ async function openInSidePanel(id) {
   } catch {
     // No side panel listening — that's fine, it'll read storage on next open.
   }
-  // Best-effort attempt to open the side panel. Requires a user gesture, which
-  // a button click satisfies. Need a windowId — use the current window.
+  // Best-effort attempt to open the side panel. Requires a user gesture,
+  // which the button click satisfies (the call was issued synchronously
+  // above; only the await is deferred).
   try {
-    const win = await chrome.windows.getCurrent();
-    if (win?.id !== undefined) {
-      await chrome.sidePanel.open({ windowId: win.id });
-    }
+    await opening;
   } catch (err) {
     // Common case: opening a side panel from a tab page sometimes requires the
     // user gesture to come through the action button. Show a friendly hint.

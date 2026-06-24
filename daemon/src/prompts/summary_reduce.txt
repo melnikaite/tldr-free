@@ -14,7 +14,7 @@ Rules:
 - Always respond in: {output_language}.
 - Do not add information beyond what is in the chunk summaries.
 - Preserve names, numbers, and dates.
-- If the chunk summaries contain timestamps [MM:SS] or [HH:MM:SS] — always carry them into the final summary next to the relevant key points.
+- If the chunk summaries contain timestamps [MM:SS] or [HH:MM:SS] — always carry them into the final summary next to the relevant key points. If a key point has no timestamp, omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
 
 Material title: {title}
 

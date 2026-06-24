@@ -30,7 +30,7 @@ models:
     kv_bits: 4
     kv_group_size: 64
 
-  - model_path: mlx-community/whisper-large-v3-mlx-4bit
+  - model_path: mlx-community/whisper-large-v3-turbo
     model_type: whisper
     served_model_name: whisper
     on_demand: true

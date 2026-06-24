@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from src.workers.timecodes import build_marked_text
+from src.workers.timecodes import (
+    build_marked_text,
+    format_segments_as_marked_text,
+    strip_timecode_placeholders,
+)
 
 
 def test_empty_segments_returns_empty_string() -> None:
@@ -103,3 +107,114 @@ def test_whisper_segments_with_end_field_work_too() -> None:
     ]
     out = build_marked_text(segs, window_seconds=30)
     assert out == "[00:00] hello\n[00:30] world\n"
+
+
+# ---------------------------------------------------------------------------
+# format_segments_as_marked_text — one line per segment, no bucketing
+# ---------------------------------------------------------------------------
+# This is the sibling formatter used by the Transcript tab (no bucketing)
+# and the translator (which feeds it to the LLM as the source). The key
+# property is that the output has the SAME number of lines as the input
+# has non-empty segments — that's the contract the translation prompt
+# relies on for marker preservation.
+
+
+def test_format_segments_emits_one_line_per_segment() -> None:
+    """No bucketing — each segment is its own line, even if close in time."""
+    segs = [
+        {"start": 0.0, "end": 2.5, "text": "first"},
+        {"start": 2.5, "end": 5.0, "text": "second"},
+        {"start": 5.0, "end": 7.5, "text": "third"},
+    ]
+    out = format_segments_as_marked_text(segs)
+    assert out == "[00:00] first\n[00:02] second\n[00:05] third\n"
+
+
+def test_format_segments_empty_returns_empty() -> None:
+    assert format_segments_as_marked_text([]) == ""
+
+
+def test_format_segments_skips_empty_text() -> None:
+    """Whitespace-only / blank segments are dropped — silence in audio."""
+    segs = [
+        {"start": 0.0, "text": "real"},
+        {"start": 1.0, "text": "   "},
+        {"start": 2.0, "text": ""},
+        {"start": 3.0, "text": "also real"},
+    ]
+    out = format_segments_as_marked_text(segs)
+    assert out == "[00:00] real\n[00:03] also real\n"
+
+
+def test_format_segments_uses_hours_when_past_one_hour() -> None:
+    """Same HH:MM:SS / MM:SS auto-detection as build_marked_text."""
+    segs = [
+        {"start": 0.0, "text": "intro"},
+        {"start": 3605.0, "text": "much later"},
+    ]
+    out = format_segments_as_marked_text(segs)
+    # Past 3600 s → hour-format used throughout for consistency.
+    assert "[0:00:00] intro\n" in out
+    assert "[1:00:05] much later\n" in out
+
+
+def test_format_segments_preserves_input_order_per_segment() -> None:
+    """Segments are emitted in input order. build_marked_text sorts by bucket
+    index; this one preserves order (segments are already time-ordered by
+    construction upstream, but we don't re-sort and don't merge)."""
+    segs = [
+        {"start": 0.0, "text": "a"},
+        {"start": 0.5, "text": "b"},
+        {"start": 1.0, "text": "c"},
+    ]
+    out = format_segments_as_marked_text(segs)
+    assert out == "[00:00] a\n[00:00] b\n[00:01] c\n"
+
+
+# --- strip_timecode_placeholders --------------------------------------------
+
+
+def test_strip_removes_russian_placeholder() -> None:
+    assert (
+        strip_timecode_placeholders("- Главный вывод [Не указано]")
+        == "- Главный вывод"
+    )
+
+
+def test_strip_removes_various_placeholders() -> None:
+    for ph in ("[Not specified]", "[N/A]", "[—]", "[ ]", "[-]"):
+        assert strip_timecode_placeholders(f"point {ph}") == "point"
+
+
+def test_strip_keeps_real_timecodes() -> None:
+    text = "- Key point [12:34]\n- Another [1:02:03]"
+    assert strip_timecode_placeholders(text) == text
+
+
+def test_strip_keeps_markdown_links() -> None:
+    text = "See [the docs](https://example.com) for details"
+    assert strip_timecode_placeholders(text) == text
+
+
+def test_strip_drops_dangling_separator() -> None:
+    assert strip_timecode_placeholders("Key point — [Не указано]") == "Key point"
+    assert strip_timecode_placeholders("Key point - [N/A]") == "Key point"
+
+
+def test_strip_collapses_inner_double_space() -> None:
+    assert (
+        strip_timecode_placeholders("before [Не указано] after") == "before after"
+    )
+
+
+def test_strip_noop_without_brackets() -> None:
+    text = "plain summary with no markers"
+    assert strip_timecode_placeholders(text) is text
+
+
+def test_strip_mixed_lines() -> None:
+    text = "- has time [00:30]\n- no time [Не указано]\n- link [x](y)"
+    assert (
+        strip_timecode_placeholders(text)
+        == "- has time [00:30]\n- no time\n- link [x](y)"
+    )

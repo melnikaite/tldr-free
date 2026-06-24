@@ -34,8 +34,17 @@ The output is deterministic and pure: same input → same output.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
+
+# A bracketed inline marker the LLM emits where a timecode *would* go but none
+# exists in the source — e.g. "[Не указано]", "[Not specified]", "[N/A]",
+# "[—]". The only legitimate bracket markers in a summary are timecodes
+# ([MM:SS] / [HH:MM:SS]), which always contain digits; a bracket with no digit
+# is therefore a placeholder. We skip markdown links ("[text](url)") via the
+# negative lookahead so genuine links survive untouched.
+_PLACEHOLDER_BRACKET = re.compile(r"\[[^\]\d]*\](?!\()")
 
 # Format strings for ``str.format(...)`` so callers / tests can refer to the
 # exact formatting without parsing f-strings out of the source.
@@ -108,4 +117,77 @@ def build_marked_text(segments: list[dict[str, Any]], window_seconds: int) -> st
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["build_marked_text"]
+def format_segments_as_marked_text(segments: list[dict[str, Any]]) -> str:
+    """Emit one ``[MM:SS] text`` line per segment — no bucketing.
+
+    Sibling of ``build_marked_text`` that preserves the source's native
+    granularity (1-5 s per line for Whisper / yt-captions) rather than
+    grouping into N-second buckets. Used by:
+    - ``api/jobs.py`` ``_build_segments_text`` to serve the Transcript
+      tab's body.
+    - ``workers/translator.py`` to construct the translation source so
+      the translated transcript inherits the same fine granularity as
+      the original (not the coarse 30 s buckets that ``raw_text`` uses
+      for summary / Q&A).
+
+    Returns an empty string when the input is empty or every segment
+    has empty text after stripping.
+    """
+    if not segments:
+        return ""
+
+    max_start = max((_segment_start(s) for s in segments), default=0.0)
+    use_hours = max_start >= 3600.0
+
+    lines: list[str] = []
+    for seg in segments:
+        text = _segment_text(seg)
+        if not text:
+            continue
+        start = _segment_start(seg)
+        if start < 0:
+            start = 0.0
+        marker = _format_marker(int(math.floor(start)), use_hours=use_hours)
+        lines.append(f"[{marker}] {text}")
+
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def strip_timecode_placeholders(text: str) -> str:
+    """Remove empty bracket markers the LLM left where no timecode exists.
+
+    Belt-and-suspenders for the summary prompts (which already forbid such
+    placeholders): even instructed, a small local model occasionally writes
+    "[Не указано]" / "[N/A]" next to a key point that has no timestamp. We
+    strip those brackets, then tidy the leftover whitespace (a dangling space,
+    a doubled space, or a now-orphaned " — "/"-" separator the model put
+    between the text and the marker).
+
+    Pure: same input → same output. Markdown links and real [MM:SS] markers
+    are preserved (see ``_PLACEHOLDER_BRACKET``).
+    """
+    if not text or "[" not in text:
+        return text
+
+    cleaned = _PLACEHOLDER_BRACKET.sub("", text)
+    if cleaned == text:
+        return text
+
+    out_lines: list[str] = []
+    for line in cleaned.split("\n"):
+        # Collapse runs of spaces/tabs created by the removal.
+        line = re.sub(r"[ \t]{2,}", " ", line)
+        # Drop a separator the model left dangling before the removed marker,
+        # e.g. "key point — " or "key point -".
+        line = re.sub(r"[ \t]*[—–-][ \t]*$", "", line)
+        out_lines.append(line.rstrip())
+    return "\n".join(out_lines)
+
+
+__all__ = [
+    "build_marked_text",
+    "format_segments_as_marked_text",
+    "strip_timecode_placeholders",
+]

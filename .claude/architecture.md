@@ -91,7 +91,7 @@ AI-stream events use the same shapes regardless of mode (`AIStageEvent`,
 The chain that matters: a state-changing call in `src/storage/repo.py`
 publishes `job_event(...)` itself. So `repo.mark_done(...)` flips the
 DB row AND tells the Library to re-render the row, atomically as far as
-callers are concerned. See conventions.md for the invariant.
+callers are concerned. See [events.md](events.md) for the invariant.
 
 ## Request flows
 
@@ -136,6 +136,64 @@ Restart-safe: repo.find_pending_for_restart() re-enqueues queued/running
 rows on daemon startup.
 ```
 
+### Generic media (deferred to Whisper)
+
+`JobKind.MEDIA` covers any audio/video the extension finds in the DOM —
+native `<video>`/`<audio>` or an iframe-embed (whitelist lives in
+`extension/src/content/extract.js`). The pipeline branch is identical to
+YouTube-without-captions minus the caption probe: enqueue a `WhisperTask`,
+runner downloads via yt-dlp, transcribes, summarizes.
+
+Not restart-safe — see [workers.md](workers.md) for why.
+
+### PDF (text-first, vision OCR fallback)
+
+`JobKind.PDF` runs synchronously inside the pipeline (no queue). Daemon
+fetches http(s) URLs itself; for `file://` URLs the extension reads the
+bytes (Chrome `fetch()`) and uploads them as `pdf_bytes_b64`. Then:
+
+```
+workers.pdf.process_pdf:
+  pypdf text extract → if >= 200 chars → return (PDF_TEXT, text)
+                    ↓ else
+  pymupdf render pages → PNG → for each page:
+    LLM chat with image_url content + "transcribe this page" prompt
+                    ↓
+  concat per-page transcriptions → return (PDF_VISION, text)
+```
+
+After extraction the path is identical to PAGE: same
+`_summarize_and_finish` runs `stream_summarize` over the resulting text
+and emits delta events. The `transcript_source` field
+(`pdf_text` vs `pdf_vision`) lets the Library distinguish the two.
+
+Restart-safety: same as PAGE/MEDIA — not resumable, marked failed on
+daemon restart so the user re-submits.
+
+### Transcript translation (deferred, behind Transcript tab)
+
+```
+POST /jobs/{id}/transcript/translate {lang}:
+  normalize lang (llm.languages) → reject 400 if unknown
+  if (job, lang) row exists and status in queued/running/done → return its status
+  if status == failed → reset, re-spawn worker
+  else insert row(status=queued), spawn workers.translator._run
+
+(asynchronously)
+workers.translator._run:
+  loop chunks(raw_text) →
+    publish translation_updated(running, progress%) →
+    llm.client.stream_complete with translate prompt (respect_pause=True)
+  write done row + publish translation_updated(done, 100)
+
+GET /jobs/{id}/transcript?lang=…:
+  serves Job.raw_text (no lang or matches source) or cached translation
+```
+
+Restart-safe: `re_enqueue_running_on_startup` (from `main.lifespan`)
+respawns workers for any row left in `running`. `raw_text` is in the
+DB and the language code is on the row — nothing external is needed.
+
 ### Q&A (any time after extraction)
 
 ```
@@ -152,9 +210,9 @@ loads it on every job switch so chats persist across tab changes.
 ## Storage
 
 Single SQLite database under the named docker volume `tldr-data`, mounted
-at `/data/tldr.db`. Tables: `Job`, `Message`, `_migrations`, plus the
-FTS5 virtual table `job_fts` and its AI/AD/AU triggers. FK cascade
-deletes `Message` rows when a Job is removed.
+at `/data/tldr.db`. Tables: `Job`, `Message`, `TranscriptTranslation`,
+`_migrations`. FK cascade deletes `Message` and `TranscriptTranslation`
+rows when a Job is removed.
 
 Pragmas (per connection): `journal_mode=WAL`, `synchronous=NORMAL`,
 `cache_size=-64000`, `mmap_size=268435456`, `temp_store=MEMORY`,

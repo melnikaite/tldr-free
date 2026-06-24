@@ -24,6 +24,18 @@ from pydantic import BaseModel
 class JobKind(StrEnum):
     PAGE = "page"
     YOUTUBE = "youtube"
+    # Generic media URL: anything yt-dlp can extract — direct mp4/webm,
+    # HLS (.m3u8), DASH (.mpd), iframe embeds (Vimeo, Dailymotion, Twitch
+    # VOD, Bunny, Brightcove, JW Player, Wistia, Streamable, SoundCloud,
+    # Spotify, …). Distinguished from YOUTUBE because there's no
+    # subtitle/captions fast path — everything goes straight to Whisper.
+    MEDIA = "media"
+    # PDF documents. Text-first via pypdf; if pypdf returns ~nothing the
+    # daemon assumes the PDF is scanned/image-only and falls back to
+    # multimodal vision (pages rendered to PNG, sent to the LLM via
+    # ``image_url`` content). For http(s) URLs the daemon fetches itself;
+    # for ``file://`` the extension uploads bytes via ``pdf_bytes_b64``.
+    PDF = "pdf"
 
 
 class JobStatus(StrEnum):
@@ -39,6 +51,8 @@ class TranscriptSource(StrEnum):
     WHISPER = "whisper"
     PAGE_EXTRACT = "page_extract"     # extension extracted via Readability
     TRAFILATURA = "trafilatura"       # daemon fallback for pages without page_text
+    PDF_TEXT = "pdf_text"             # pypdf — text-first path on a native PDF
+    PDF_VISION = "pdf_vision"         # multimodal OCR — scanned/image-only fallback
 
 
 class DeferredReason(StrEnum):
@@ -64,6 +78,30 @@ class Cookie(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Media candidate (one of several playable sources discovered on the page)
+# ---------------------------------------------------------------------------
+
+
+class MediaCandidate(BaseModel):
+    """One playable media source found by the extension's page scanner.
+
+    Pages can carry multiple playable items (lecture page with several
+    talks, news article with embedded video + promo, podcast page with
+    iframe embed + native ``<audio>`` download link, …). The extension
+    auto-picks the top-scored one as ``media_url`` of the job; the
+    remaining candidates ride along on the job under
+    ``JobDetails.alt_media_candidates`` so the sidepanel can surface a
+    "wrong source?" chip without re-running the extraction.
+
+    Fields are deliberately minimal — we don't need to round-trip the DOM
+    element, just enough to identify the source and label it in UI.
+    """
+    media_url: str
+    kind: Literal["video", "audio", "iframe"]
+    label: str
+
+
+# ---------------------------------------------------------------------------
 # POST /jobs (always async — work happens in the background, client subscribes
 # to POST /ai/stream {job_id} to watch progress and receive summary tokens)
 # ---------------------------------------------------------------------------
@@ -71,9 +109,26 @@ class Cookie(BaseModel):
 
 class JobCreateRequest(BaseModel):
     url: str
-    kind: Literal["page", "youtube", "auto"] = "auto"
+    kind: Literal["page", "youtube", "media", "pdf", "auto"] = "auto"
     page_text: str | None = None     # extension-extracted clean text (Readability)
     page_title: str | None = None
+    # Direct media stream URL discovered by the extension on the page (a
+    # <video src=…>, <audio src=…>, or known iframe embed). yt-dlp's
+    # generic + site-specific extractors handle it. When present, the
+    # daemon prefers ``JobKind.MEDIA`` regardless of host. ``url`` stays
+    # the human-visible page URL — used for library dedup, display, and
+    # the "open source" link.
+    media_url: str | None = None
+    # Other playable sources the extension saw on the same page. Stored
+    # on the Job row for the sidepanel's "wrong source?" picker (see
+    # JobDetails.alt_media_candidates). The daemon never reads these
+    # itself — they're inert UI state that round-trips through the DB.
+    alt_media_candidates: list[MediaCandidate] | None = None
+    # PDF bytes, base64-encoded. Set only when the source is a ``file://``
+    # URL the daemon can't reach itself (the extension reads the file via
+    # ``fetch()`` and forwards the bytes). For http(s) PDFs leave None and
+    # the daemon fetches the URL with the cookies below.
+    pdf_bytes_b64: str | None = None
     cookies: list[Cookie] | None = None
 
 
@@ -109,6 +164,18 @@ class JobSummary(BaseModel):
     completed_at: datetime | None
 
 
+class TranscriptTranslationSummary(BaseModel):
+    """One translation entry as shown on a Job's detail response.
+
+    Just enough for the sidepanel to render chips (cached languages with
+    status) — full text comes through ``GET /jobs/{id}/transcript?lang=``.
+    """
+    language_code: str
+    status: Literal["queued", "running", "done", "failed"]
+    progress_percent: int = 0
+    error: str | None = None
+
+
 class JobDetails(JobSummary):
     """Full job with summary_md and partial_summary for reconnect replay."""
     summary_md: str | None
@@ -118,6 +185,24 @@ class JobDetails(JobSummary):
     # that reconnects mid-generation (or restarts the browser) replay the
     # buffered content without waiting for future deltas. None once done.
     partial_summary: str | None = None
+    # ISO-639-1 code of the transcript's source language. ``None`` for
+    # PDF / HTML jobs where we don't run language detection on extracted
+    # text — UI shows "Original" without a code in that case.
+    transcript_language: str | None = None
+    # Translations of this job's transcript that have been requested
+    # (cached, in-flight, or failed). The original language is NOT in
+    # this list — it's served from ``Job.raw_text`` directly. Empty list
+    # for jobs no-one ever translated.
+    transcript_translations: list[TranscriptTranslationSummary] = []
+    # Other playable sources the extension discovered on the page at
+    # job-creation time. Surfaced by the sidepanel as a "wrong source?"
+    # chip when non-empty — clicking opens the list so the user can
+    # switch to a different candidate (handled client-side: create a new
+    # job for that URL, delete the current one). Empty for YouTube jobs
+    # (URL is unambiguous), PAGE/PDF jobs, and media pages with exactly
+    # one candidate. Backfilled as ``[]`` for legacy jobs created before
+    # this field existed.
+    alt_media_candidates: list[MediaCandidate] = []
 
 
 class JobListResponse(BaseModel):

@@ -162,6 +162,100 @@ def _migration_v2(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v3 — transcript_language + transcript_translation table
+# ---------------------------------------------------------------------------
+# Adds the source-language column on Job (populated by Whisper's auto-detect
+# via the patched mlx-server response, or by the YouTube caption track's
+# language for the fast path), and a separate ``transcript_translation``
+# table to cache user-requested translations of a job's transcript.
+#
+# Legacy rows have no language captured (this column didn't exist yet). We
+# backfill them as ``'en'`` per the agreed policy — most existing local
+# transcripts are English by accident of the dev environment, and an
+# explicit code is better than ``None`` (the UI would otherwise show
+# "Original" with no chip-clickable language).
+
+_V3_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN transcript_language TEXT",
+    "UPDATE job SET transcript_language = 'en' WHERE transcript_language IS NULL",
+    # Translation cache. PK is (job_id, language_code) so a re-POST for the
+    # same language idempotently updates the same row instead of inserting.
+    # ``status`` flows: queued → running → done | failed. ``text`` is only
+    # populated on ``done``; ``error`` only on ``failed``.
+    """
+    CREATE TABLE IF NOT EXISTS transcript_translation (
+        job_id TEXT NOT NULL,
+        language_code TEXT NOT NULL,
+        status TEXT NOT NULL,
+        text TEXT,
+        error TEXT,
+        progress_percent INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, language_code),
+        FOREIGN KEY (job_id) REFERENCES job(id) ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_transcript_translation_status "
+    "ON transcript_translation (status)",
+)
+
+
+def _migration_v3(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V3_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
+# v4 — fine-grained transcript segments
+# ---------------------------------------------------------------------------
+# Adds Job.raw_segments_json so the Transcript-tab UI can render one line
+# per actual Whisper segment (typically 1-5 s) instead of the 30 s buckets
+# raw_text uses for summary / Q&A. Legacy jobs and PAGE / PDF jobs leave
+# this null — the Transcript tab falls back to raw_text in that case.
+
+_V4_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN raw_segments_json TEXT",
+)
+
+
+def _migration_v4(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V4_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
+# v5 — alt_media_candidates_json
+# ---------------------------------------------------------------------------
+# Round-trip storage for the "other playable sources we saw on the page"
+# list that the extension's media scanner produces. The sidepanel uses
+# this to render a "wrong source?" picker chip when a page has more than
+# one candidate (lecture page with 3 talks, news article with embedded
+# video + promo, …). Daemon never reads it itself — pure UI state.
+
+_V5_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN alt_media_candidates_json TEXT",
+)
+
+
+def _migration_v5(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V5_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -169,6 +263,9 @@ def _migration_v2(conn: Any) -> None:  # noqa: ANN401
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _migration_v1),
     (2, _migration_v2),
+    (3, _migration_v3),
+    (4, _migration_v4),
+    (5, _migration_v5),
 ]
 
 

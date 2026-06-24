@@ -2,12 +2,15 @@
 
 Started from ``main.lifespan`` as ``asyncio.create_task(whisper_worker(queue, repo))``.
 Single worker, sequential processing. Each item:
-    1. yt-dlp audio download → broker stage("transcribing", "downloading")
-    2. mlx /v1/audio/transcriptions (streaming, chunk-by-chunk)
-       → broker stage("transcribing", "<percent>%") per ~30 s of audio
-    3. assemble raw_text → broker stage("ready")
+    1. yt-dlp audio download → broker stage("downloading")
+    2. mlx /v1/audio/transcriptions (verbose_json, one HTTP call)
+       → broker stage("transcribing") once; the call returns when the
+       whole file is done. See workers/transcribe.py for why we don't
+       stream chunks any more (we need real segments + language for the
+       transcript-tab UI and the streaming endpoint doesn't expose them).
+    3. assemble raw_text from segments → broker stage("ready")
     4. summarize (streaming) → broker delta(...) per token
-    5. mark_done → broker done(content)
+    5. mark_done with the Whisper-detected language → broker done(content)
 finally: delete the audio file.
 
 All progress flows through ``workers.broker``, so any /ai/stream subscriber
@@ -18,6 +21,7 @@ fast path or the deferred whisper queue.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -44,6 +48,22 @@ def _audio_dir() -> Path:
     p = Path(get_config().storage.data_dir) / "audio"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _normalise_lang_code(raw: object) -> str | None:
+    """Lowercase a yt-dlp language code, collapsing ``en-US`` → ``en``.
+
+    Mirrors the pipeline's fast-path normaliser; ``None``/empty → ``None`` so
+    the column stays null when we don't know.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    if "-" in s and len(s.split("-", 1)[0]) == 2:
+        s = s.split("-", 1)[0]
+    return s
 
 
 async def _checkpoint_pause(
@@ -139,34 +159,63 @@ async def _process_one(
             status=JobStatus.RUNNING.value,
             progress_stage="transcribing",
         )
-        broker.publish(task_job_id, stage_event("transcribing", detail="0%"))
+        # No mid-transcription percent any more — verbose_json is one HTTP
+        # roundtrip per file (server side mlx_whisper handles batching
+        # internally) so we publish the stage once and let the Library row
+        # sit on it until the call returns. See workers/transcribe.py.
+        broker.publish(task_job_id, stage_event("transcribing"))
 
-        def _on_transcribe_progress(fraction: float) -> None:
-            pct = int(round(min(1.0, max(0.0, fraction)) * 100))
-            broker.publish(
-                task_job_id,
-                stage_event("transcribing", detail=f"{pct}%"),
-            )
-
-        segments = await transcribe.transcribe_stream(
+        whisper_result = await transcribe.transcribe_audio(
             audio_path,
             total_duration=audio_duration,
-            on_progress=_on_transcribe_progress,
         )
         transcribe_done = True
 
         raw_text = timecodes.build_marked_text(
-            segments,
+            whisper_result.segments,
             window_seconds=cfg.youtube.segment_window_seconds,
         )
+        # Whisper's auto-detect. ``None`` if the backend doesn't report it
+        # (e.g. LocalAI returns ``language: null``); we backfill from yt-dlp
+        # metadata below, else the column stays null and the UI shows
+        # "Original".
+        whisper_language = whisper_result.language
 
-        # Persist raw_text mid-pipeline so re-subscribers can see context if
-        # the summary fails or the daemon restarts.
+        # The DB row's title is whatever the extension scraped from a possibly
+        # stale SPA DOM — often just the video id. Fetch YouTube's own title
+        # (and language as a fallback), the same probe the caption fast path
+        # uses. Best-effort: a metadata hiccup must not break the summary.
+        metadata = await youtube.fetch_video_metadata(
+            url=task_url, cookies=task_cookies, scratch_dir=_audio_dir(),
+        )
+        meta_title = metadata.get("title")
+        if isinstance(meta_title, str) and meta_title.strip():
+            title = meta_title.strip()
+        if whisper_language is None:
+            whisper_language = _normalise_lang_code(metadata.get("language"))
+
+        # Serialize the fine-grained Whisper segments so the Transcript tab
+        # can render one line per ~1-5 s instead of the 30 s buckets
+        # ``raw_text`` uses. Only persist when we got real segments — if the
+        # mlx-server patch isn't applied we got a single all-encompassing
+        # segment and there's no fine-grained detail to surface.
+        raw_segments_json: str | None = None
+        if len(whisper_result.segments) > 1:
+            raw_segments_json = json.dumps(
+                whisper_result.segments, ensure_ascii=False, separators=(",", ":"),
+            )
+
+        # Persist raw_text + language mid-pipeline so re-subscribers can see
+        # context if the summary fails or the daemon restarts. ``transcript_
+        # language`` is set on the same write so the column is filled even
+        # if the LLM stream below dies.
         try:
             set_extracted(
                 task_job_id,
                 raw_text=raw_text,
                 transcript_source=TranscriptSource.WHISPER.value,
+                transcript_language=whisper_language,
+                raw_segments_json=raw_segments_json,
             )
         except Exception:
             log.exception("set_extracted failed for %s; continuing", task_job_id)
@@ -190,7 +239,7 @@ async def _process_one(
         ):
             parts.append(delta)
             broker.publish(task_job_id, delta_event(delta))
-        summary = "".join(parts).strip()
+        summary = timecodes.strip_timecode_placeholders("".join(parts).strip())
 
         if not summary:
             broker.publish(task_job_id, error_event("LLM returned empty summary"))
@@ -210,6 +259,8 @@ async def _process_one(
             transcript_source=TranscriptSource.WHISPER.value,
             title=title,
             video_id=video_id,
+            transcript_language=whisper_language,
+            raw_segments_json=raw_segments_json,
         )
         broker.publish(task_job_id, done_event(summary))
     finally:
