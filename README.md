@@ -139,7 +139,45 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 | [**faster-whisper-server**](https://github.com/fedirz/faster-whisper-server) | Any OS, CPU / GPU | `docker run -p 8000:8000 fedirz/faster-whisper-server` |
 | [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
 
-### Install
+### Install — native, no Docker (recommended)
+
+One command; works on macOS and Linux (Windows is experimental):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/melnikaite/tldr-free/main/scripts/install-uv.sh | sh
+# or from a checkout: task install:uv
+```
+
+The script installs [uv](https://docs.astral.sh/uv/) if missing, installs the
+daemon as a uv tool, creates the config from the packaged template, registers
+a user-level autostart service (launchd LaunchAgent on macOS, systemd user
+unit on Linux) and waits for `/health`.
+
+Lifecycle after that:
+
+```bash
+tldr-daemon service status      # unit present? /health ok?
+tldr-daemon service uninstall   # stop + remove autostart
+tldr-daemon service install     # register + start again (= restart)
+tldr-daemon                     # or run in the foreground, no service
+task uninstall:uv               # remove everything (keeps your data)
+```
+
+Config and data live in the platform-conventional dirs —
+`~/Library/Application Support/tldr/` on macOS,
+`$XDG_CONFIG_HOME/tldr` + `$XDG_DATA_HOME/tldr` on Linux. Edit
+`tldr.yaml` there (backend URLs point at `127.0.0.1`), then restart the
+service.
+
+To **update**: `uv tool install --force git+https://github.com/melnikaite/tldr-free#subdirectory=daemon`
+(or `--force ./daemon` from a checkout), then restart the service. yt-dlp and
+youtube-transcript-api self-update on every daemon start, so YouTube breakage
+usually fixes itself with a restart.
+
+`ffmpeg` on PATH is needed for the Whisper fallback
+(`brew install ffmpeg` / `apt install ffmpeg`).
+
+### Install — Docker
 
 ```bash
 task install            # config + daemon image + extension vendor libs
@@ -160,6 +198,9 @@ Load the extension once:
 3. After source changes, hit the reload icon — no rebuild step.
 
 ## Daily commands
+
+Native mode: `tldr-daemon service status|install|uninstall` (see above).
+Docker mode:
 
 ```
 task up          # start
