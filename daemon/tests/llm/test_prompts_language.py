@@ -39,8 +39,18 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "title": "Sample title",
         "context": "Material body.",
         "question": "What's the main point?",
+        "web_results": "Search results body.",
+    },
+    "qa_plan.txt": {
+        "title": "Sample title",
+        "context": "Material body.",
+        "question": "What's the main point?",
     },
 }
+
+# Prompts that legitimately have no {output_language} (e.g. the planning prompt
+# only routes; its output is a tool call, not user-facing prose).
+_NO_LANGUAGE_PROMPTS = {"qa_plan.txt"}
 
 
 @pytest.mark.parametrize("name,kwargs", list(_PROMPT_KWARGS.items()))
@@ -55,7 +65,8 @@ def test_prompt_formats_cleanly(name: str, kwargs: dict[str, object]) -> None:
     assert not leftovers, f"{name}: unfilled placeholders {leftovers}"
 
     # output_language must be substituted into the body somewhere.
-    assert "English" in formatted, f"{name}: output_language not visible in body"
+    if name not in _NO_LANGUAGE_PROMPTS:
+        assert "English" in formatted, f"{name}: output_language not visible in body"
 
 
 def test_all_prompt_files_present() -> None:
@@ -69,6 +80,8 @@ def test_prompts_use_output_language_placeholder() -> None:
     """Each prompt template must reference {output_language} at least once
     (so config-driven language switching actually works)."""
     for name in _PROMPT_KWARGS:
+        if name in _NO_LANGUAGE_PROMPTS:
+            continue
         body = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
         assert "{output_language}" in body, (
             f"{name} does not reference {{output_language}} — language is hardcoded"

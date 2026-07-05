@@ -535,6 +535,62 @@ def test_ai_qa_persists_messages(client: TestClient) -> None:
     assert msgs["items"][1]["id"] == done["message_id"]
 
 
+def test_ai_qa_strips_degeneration_tail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that finishes then loops on <br> filler has the tail cut and the
+    stored message cleaned — only the real answer is persisted."""
+    from src.llm import qa as llm_qa
+
+    async def _degen_stream(*, job: Any, question: str, output_language: str):
+        yield "Real answer."
+        for _ in range(8):
+            yield "\n<br>"
+
+    monkeypatch.setattr(llm_qa, "stream_answer", _degen_stream)
+
+    create = client.post(
+        "/jobs", json={"url": "https://degen", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.post("/ai/qa", json={"job_id": create["id"], "question": "q"})
+    assert r.status_code == 200
+
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assistant = msgs["items"][-1]
+    assert assistant["role"] == "assistant"
+    assert "<br>" not in assistant["content"]
+    assert assistant["content"] == "Real answer."
+
+
+def test_ai_qa_empty_answer_errors(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whitespace-only answer yields an error and persists no assistant row."""
+    from src.llm import qa as llm_qa
+
+    async def _empty_stream(*, job: Any, question: str, output_language: str):
+        yield "   "
+
+    monkeypatch.setattr(llm_qa, "stream_answer", _empty_stream)
+
+    create = client.post(
+        "/jobs", json={"url": "https://empty", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.post("/ai/qa", json={"job_id": create["id"], "question": "q"})
+    assert r.status_code == 200
+    events = _read_sse_events(r)
+    assert any(e["type"] == "error" for e in events)
+
+    # The user question is persisted; no assistant row for an empty answer.
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assert len(msgs["items"]) == 1
+    assert msgs["items"][0]["role"] == "user"
+
+
 def test_ai_qa_404_for_unknown_job(client: TestClient) -> None:
     r = client.post("/ai/qa", json={"job_id": "nope", "question": "hi"})
     assert r.status_code == 404

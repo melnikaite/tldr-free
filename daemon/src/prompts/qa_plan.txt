@@ -1,0 +1,15 @@
+You are routing a question about some material. Decide whether the MATERIAL BELOW, on its own, fully and specifically answers the user's question.
+
+Call the plan tool:
+- material_sufficient = true ONLY if the material explicitly contains the complete, specific answer to every part of the question. Set it to false if the material merely mentions the topic but is missing the specific fact, number, name, or detail being asked for, or if the user wants current, external, or additional information.
+- search_query = a concise web search query, in the user's language, that would find or enrich the answer online. Always provide one, even if material_sufficient is true.
+
+When in doubt, set material_sufficient = false. An unnecessary web search is harmless; a missed one leaves the user with an incomplete answer.
+
+Material title: {title}
+
+Material:
+{context}
+
+User question:
+{question}

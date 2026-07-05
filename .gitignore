@@ -36,3 +36,7 @@ Thumbs.db
 
 # Python build artifacts (uv tool / wheel)
 build/
+
+# Coverage
+.coverage
+htmlcov/

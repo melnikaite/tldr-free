@@ -1,4 +1,4 @@
-"""Single-job Q&A — streaming with DuckDuckGo web search + page fetching.
+"""Single-job Q&A — layered answering: material → AI knowledge → web.
 
 Public surface:
     async def stream_answer(*, job, question: str, output_language: str)
@@ -6,29 +6,26 @@ Public surface:
 
         Builds context = job.raw_text if it fits, else job.summary_md.
 
-        Routing is language-agnostic and decided by the model itself, not
-        by keyword matching. We offer TWO tools and require the model to
-        pick exactly one (tool_choice="required"):
+        Flow (the model never gets to veto a search with a single tool pick —
+        that is the failure mode small models like Gemma 4 abuse, refusing to
+        search at the slightest excuse):
 
-          - web_search(query): the answer is NOT in the material, OR the
-            user wants external / current / online information, OR the user
-            asked to search / look up / find something (in ANY language).
-          - answer_from_material(): the answer IS in the provided material.
-
-        Because the model must choose a tool, it can't "forget" to search
-        or refuse with "the material doesn't contain that" — the decision
-        is structural, not dependent on the model volunteering a tool call
-        on tool_choice="auto" (which small models like Gemma 4 do unreliably).
-
-        web_search path fetches real page content (trafilatura-cleaned) in
-        parallel, not just DDG snippets.
+          1. PLAN — one forced `plan` tool call returns
+             {material_sufficient: bool, search_query: str}. The bar for
+             `material_sufficient=true` is high: the material must explicitly
+             and completely answer. Anything else — uncertainty, a missing
+             specific detail, a parse error, a backend without tool support —
+             defaults to SEARCHING. An extra web trip is cheap; a missed one
+             leaves the user short.
+          2. SEARCH — when not sufficient, fetch + trafilatura-clean the DDG
+             results (real page content, not just snippets).
+          3. SYNTHESIS — stream the answer grounded in, by priority, the
+             material, then the model's own knowledge, then the web results
+             (cited). The prompt actively encourages going beyond the material.
 
         Yields:
           - str — token delta for the final answer
           - dict — stage event, e.g. {"type":"stage","stage":"searching","detail":"<query>"}
-
-        Graceful degradation: if the backend doesn't support tool calling
-        (or tool_choice="required"), falls back to a plain stream_complete.
 
 Called from api/ai.py POST /ai/qa.
 """
@@ -37,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +44,7 @@ from src.config import get_config
 from src.llm import client as llm_client
 from src.llm.tokens import count_tokens
 from src.workers import search as _search
+from src.workers import timecodes as _timecodes
 
 log = logging.getLogger(__name__)
 
@@ -54,63 +53,75 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # Reserve room for the prompt scaffolding, tool results, and the answer.
 _PROMPT_OVERHEAD_TOKENS = 4000
 
-# Two-tool router. The model MUST pick exactly one (tool_choice="required"),
-# so the search-vs-material decision is structural rather than relying on the
-# model to volunteer a web_search call on its own. The descriptions are
-# phrased around USER INTENT so the model maps requests in any language to the
-# right tool — no keyword lists, no per-language maintenance.
-_WEB_SEARCH_TOOL: dict[str, Any] = {
+# Single forced tool. The model must fill in the plan — it cannot refuse to
+# decide. material_sufficient is deliberately strict; we treat anything other
+# than a clean True as "search".
+_PLAN_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "web_search",
+        "name": "plan",
         "description": (
-            "Search the web (DuckDuckGo) and read the resulting pages. Choose "
-            "this when ANY of the following is true, regardless of the language "
-            "the user writes in:\n"
-            "- the answer is NOT clearly present in the provided material;\n"
-            "- the user asks for current, recent, or external information "
-            "(news, prices, reviews, what other people say, status, releases);\n"
-            "- the user asks you to search, look up, find, google, or check "
-            "something online.\n"
-            "When in doubt between this and answer_from_material, prefer "
-            "web_search — it is the safe fallback."
+            "Decide whether the provided material alone fully and specifically "
+            "answers the user's question, and propose a web search query."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
+                "material_sufficient": {
+                    "type": "boolean",
+                    "description": (
+                        "true ONLY if the material explicitly contains the "
+                        "complete, specific answer to every part of the "
+                        "question. false if the material only mentions the "
+                        "topic but lacks the specific fact, number, name, or "
+                        "detail asked for, or if current/external/additional "
+                        "information would help. When in doubt, false."
+                    ),
+                },
+                "search_query": {
                     "type": "string",
                     "description": (
-                        "Concise search query in the user's language. Include "
-                        "the topic from the material if it adds useful context."
+                        "A concise web search query in the user's language to "
+                        "find or enrich the answer online. Always provide one."
                     ),
                 },
             },
-            "required": ["query"],
+            "required": ["material_sufficient", "search_query"],
         },
     },
 }
 
-_ANSWER_FROM_MATERIAL_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "answer_from_material",
-        "description": (
-            "Answer directly from the material that was provided to you, with no "
-            "web search. Choose this ONLY when the material clearly contains the "
-            "answer to the user's question and no external or current information "
-            "is needed."
-        ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-}
-
-_TOOLS = [_WEB_SEARCH_TOOL, _ANSWER_FROM_MATERIAL_TOOL]
+# A line that is nothing but HTML tags + whitespace — a run of <br>, a stray
+# </blockquote>, etc. A small local model degenerating at the end of an answer
+# emits these as filler. A line with real text between tags (e.g. a link,
+# "<a ...>Источник</a>") does NOT match, so genuine content survives; the
+# frequency penalty on generation is what stops the loop producing them.
+_MARKUP_ONLY_LINE = re.compile(r"^\s*(?:<[^>]+>\s*)+$")
 
 
-@lru_cache(maxsize=1)
-def _load_prompt() -> str:
-    return (_PROMPTS_DIR / "qa.txt").read_text(encoding="utf-8")
+def clean_answer(text: str) -> str:
+    """Strip degenerate filler a small model appends to a Q&A answer.
+
+    Observed tail-noise that carries no information:
+      - a dump of bare ``[MM:SS]`` markers, one per line (the whole transcript);
+      - lines made only of HTML tags (runs of ``<br>``, a stray ``</blockquote>``).
+    We drop both, collapse the blank runs left behind, and trim. Lines with real
+    text — an inline timecode next to a sentence, a link with a label — are kept.
+
+    Pure: same input → same output.
+    """
+    if not text:
+        return text
+    cleaned = _timecodes.strip_bare_timecode_lines(text)
+    if "<" in cleaned:
+        kept = [ln for ln in cleaned.split("\n") if not _MARKUP_ONLY_LINE.match(ln)]
+        cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return cleaned
+
+
+@lru_cache(maxsize=4)
+def _load_prompt(name: str) -> str:
+    return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
 
 
 def _select_context(job: Any) -> str:
@@ -123,48 +134,61 @@ def _select_context(job: Any) -> str:
     return summary
 
 
-def _build_messages(
+def _plan_context(job: Any, *, fallback: str) -> str:
+    """Compact context for the cheap PLAN call — prefer the summary over the
+    full transcript. The plan only judges sufficiency + drafts a query, so the
+    summary is enough; it also halves the plan-call prefill and biases toward
+    searching (the summary omits detail), which is the behaviour we want."""
+    return getattr(job, "summary_md", None) or fallback
+
+
+def _plan_messages(*, title: str, context: str, question: str) -> list[dict[str, Any]]:
+    prompt = _load_prompt("qa_plan.txt").format(
+        title=title, context=context, question=question
+    )
+    return [{"role": "user", "content": prompt}]
+
+
+def _answer_messages(
     *,
     output_language: str,
     title: str,
     context: str,
     question: str,
+    web_results: str,
 ) -> list[dict[str, Any]]:
-    prompt = _load_prompt().format(
+    prompt = _load_prompt("qa.txt").format(
         output_language=output_language,
         title=title,
         context=context,
         question=question,
+        web_results=web_results or "(no web search was run)",
     )
     return [{"role": "user", "content": prompt}]
 
 
-def _assistant_tool_call_msg(tc: Any) -> dict[str, Any]:
-    """Build the assistant message echoing a single tool call for history."""
-    return {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-        ],
-    }
+def _parse_plan(response: Any) -> tuple[bool, str]:
+    """Extract (material_sufficient, search_query) from the plan tool call.
 
-
-def _pick_tool_call(tool_calls: list[Any]) -> Any | None:
-    """Return the chosen tool call. web_search wins if the model emits both."""
-    if not tool_calls:
-        return None
+    Defaults to (False, "") — i.e. SEARCH — on any malformed / missing call,
+    so a flaky tool response biases toward searching rather than dodging it.
+    """
+    try:
+        tool_calls = response.choices[0].message.tool_calls or []
+    except (AttributeError, IndexError):
+        return False, ""
     for tc in tool_calls:
-        if tc.function.name == "web_search":
-            return tc
-    return tool_calls[0]
+        if tc.function.name != "plan":
+            continue
+        try:
+            args = json.loads(tc.function.arguments)
+        except (json.JSONDecodeError, TypeError):
+            return False, ""
+        sufficient = args.get("material_sufficient")
+        query = args.get("search_query") or ""
+        # Strict: only an explicit boolean True counts as sufficient.
+        return (sufficient is True), str(query).strip()
+    return False, ""
 
 
 async def stream_answer(
@@ -175,91 +199,61 @@ async def stream_answer(
 ) -> AsyncIterator[str | dict[str, Any]]:
     """Yield token deltas (str) or stage dicts (dict) for a QA turn.
 
-    Flow:
-    1. Non-streaming call with both tools + tool_choice="required" — the model
-       must pick web_search or answer_from_material (language-agnostic routing).
-    2a. web_search → emit ``searching`` stage, fetch + clean pages, stream answer.
-    2b. answer_from_material → stream the answer grounded in the material.
-    3. Fallback: if the tool call raises (backend lacks tool support /
-       "required"), stream a plain completion from the base prompt.
+    See module docstring for the plan → search → synthesis flow.
     """
     context = _select_context(job)
     title = getattr(job, "title", None) or ""
-    messages = _build_messages(
+
+    # Step 1: PLAN. Forced single tool — the model must decide; we bias to
+    # search on any failure. Judged against the compact summary, not the full
+    # transcript, to keep this call cheap.
+    sufficient = False
+    query = question
+    try:
+        plan = await llm_client.complete_with_messages(
+            _plan_messages(
+                title=title,
+                context=_plan_context(job, fallback=context),
+                question=question,
+            ),
+            tools=[_PLAN_TOOL],
+            tool_choice={"type": "function", "function": {"name": "plan"}},
+            max_tokens=300,
+            temperature=0.0,
+        )
+        sufficient, parsed_query = _parse_plan(plan)
+        if parsed_query:
+            query = parsed_query
+    except Exception:
+        # Backend lacks tool support / errored — default to searching.
+        log.warning("QA plan call failed; defaulting to web search", exc_info=True)
+        sufficient = False
+
+    # Step 2: SEARCH unless the material clearly suffices on its own.
+    web_results = ""
+    if not sufficient:
+        yield {"type": "stage", "stage": "searching", "detail": query}
+        try:
+            results = await _search.ddg_search_with_content(query)
+            web_results = _search.format_results(results, full_content=True)
+        except Exception:
+            log.warning("QA web search failed; answering without it", exc_info=True)
+            web_results = ""
+
+    # Step 3: SYNTHESIS. Stream the grounded answer (material → knowledge → web).
+    messages = _answer_messages(
         output_language=output_language,
         title=title,
         context=context,
         question=question,
+        web_results=web_results,
     )
-
-    # Step 1: forced tool choice — the model routes the request itself.
-    try:
-        response = await llm_client.complete_with_messages(
-            messages,
-            tools=_TOOLS,
-            tool_choice="required",
-            max_tokens=500,
-            temperature=0.3,
-        )
-    except Exception:
-        log.warning(
-            "tool-capable request failed; falling back to plain stream", exc_info=True
-        )
-        async for delta in llm_client.stream_complete(
-            messages[0]["content"],
-            max_tokens=2000,
-            temperature=0.3,
-            respect_pause=False,
-        ):
-            yield delta
-        return
-
-    choice = response.choices[0]
-    chosen = _pick_tool_call(choice.message.tool_calls or [])
-
-    # Defensive: some backends honour "required" loosely and may return content
-    # with no tool call. If so, just yield whatever the model said.
-    if chosen is None:
-        content = choice.message.content or ""
-        if content:
-            yield content
-        return
-
-    messages.append(_assistant_tool_call_msg(chosen))
-
-    if chosen.function.name == "web_search":
-        try:
-            args = json.loads(chosen.function.arguments)
-            query = args.get("query") or question
-        except (json.JSONDecodeError, KeyError):
-            query = question
-
-        yield {"type": "stage", "stage": "searching", "detail": query}
-
-        # Enriched search: fetch + trafilatura-clean the actual pages.
-        results = await _search.ddg_search_with_content(query)
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": chosen.id,
-                "content": _search.format_results(results, full_content=True),
-            }
-        )
-    else:
-        # answer_from_material — acknowledge the tool and ask for the answer.
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": chosen.id,
-                "content": "Now answer the user's question using the material above.",
-            }
-        )
-
-    # Step 2: stream the grounded final answer (no tools this turn).
     async for delta in llm_client.stream_with_messages(
-        messages, max_tokens=2000, temperature=0.3
+        messages,
+        max_tokens=2000,
+        temperature=0.3,
     ):
         yield delta
 
 
-__all__ = ["stream_answer"]
+__all__ = ["clean_answer", "stream_answer"]

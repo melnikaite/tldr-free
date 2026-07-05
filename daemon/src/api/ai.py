@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -32,6 +33,16 @@ from src.workers.broker import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+
+# A small local model finishes the answer, then degenerates into a repetition
+# loop — a run of <br> tags, a stray closing tag, or bare [MM:SS] markers — and
+# keeps emitting until max_tokens. The real answer is already complete by then,
+# so once the output ENDS with 6+ consecutive such filler tokens we stop reading
+# the stream (cuts the live spam and the wasted generation). clean_answer()
+# trims whatever partial filler slipped through before the cutoff.
+_DEGEN_TAIL_RE = re.compile(
+    r"(?:\s*(?:<[^>]+>|\[\d{1,2}:\d{2}(?::\d{2})?\])\s*){6,}\Z"
+)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -96,6 +107,10 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
             if isinstance(item, str):
                 parts.append(item)
                 yield _sse(delta_event(item))
+                # Stop as soon as the output degenerates into a filler loop —
+                # don't keep streaming junk to the client or burning tokens.
+                if _DEGEN_TAIL_RE.search("".join(parts)[-400:]):
+                    break
             else:
                 # Stage event from tool use (e.g. {"type": "stage", "stage": "searching"}).
                 yield _sse(item)
@@ -104,7 +119,10 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
         yield _sse(error_event(f"qa failed: {exc}"))
         return
 
-    answer = "".join(parts).strip()
+    # Final tidy: strip any partial filler that slipped through before the
+    # degeneration cutoff above (bare [MM:SS] dumps, runs of <br>, stray tags)
+    # so the stored — and reloaded — message is clean.
+    answer = llm_qa.clean_answer("".join(parts).strip())
     if not answer:
         yield _sse(error_event("LLM returned empty answer"))
         return
