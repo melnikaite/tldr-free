@@ -26,6 +26,23 @@ a local library (SQLite on your disk) you can come back to any time. The
 daemon talks to an LLM/Whisper backend over the **OpenAI-compatible HTTP
 API** — pick whatever runner you like.
 
+<table>
+  <tr>
+    <td><img src="docs/screenshots/sidepanel-youtube.png" alt="YouTube video summary with clickable timecodes" /></td>
+    <td><img src="docs/screenshots/sidepanel-pdf.png" alt="PDF paper summary" /></td>
+    <td><img src="docs/screenshots/sidepanel-podcast.png" alt="Podcast audio summary via local Whisper" /></td>
+  </tr>
+  <tr align="center">
+    <td>YouTube video</td>
+    <td>PDF paper</td>
+    <td>Podcast audio (local Whisper)</td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="Local library of processed pages, videos and podcasts" width="820" />
+</p>
+
 <!-- TODO: 30-second demo GIF here (toolbar click → streaming summary →
      timecode click seeks the video → Q&A). See distribution-plan.md §4. -->
 
