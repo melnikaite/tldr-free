@@ -8,8 +8,35 @@ from src.llm.languages import (
     Language,
     UnknownLanguageError,
     normalize_lang,
+    short_lang_code,
     supported_codes,
 )
+
+
+def test_short_lang_code_collapses_region() -> None:
+    assert short_lang_code("en-US") == "en"
+    assert short_lang_code("ru-RU") == "ru"
+
+
+def test_short_lang_code_lowercases_and_strips() -> None:
+    assert short_lang_code("  RU  ") == "ru"
+
+
+def test_short_lang_code_passes_unknown_through() -> None:
+    # Unlike normalize_lang, it does not resolve — just tidies the string.
+    assert short_lang_code("english") == "english"
+
+
+def test_short_lang_code_keeps_long_prefix() -> None:
+    # Only a 2-char first segment is collapsed; "zho-Hant" is left alone.
+    assert short_lang_code("zho-Hant") == "zho-hant"
+
+
+def test_short_lang_code_none_and_empty() -> None:
+    assert short_lang_code(None) is None
+    assert short_lang_code("") is None
+    assert short_lang_code("   ") is None
+    assert short_lang_code(123) is None
 
 
 def test_normalize_iso_639_1_code() -> None:

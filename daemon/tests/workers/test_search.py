@@ -97,3 +97,41 @@ def test_format_results_snippet_mode_uses_body() -> None:
 
 def test_format_results_empty() -> None:
     assert search_mod.format_results([]) == "No results found."
+
+
+def test_format_results_numbers_and_layout() -> None:
+    results = [
+        {"title": "First", "href": "https://1.test", "body": "b1"},
+        {"title": "Second", "href": "https://2.test", "body": "b2"},
+        {"title": "Third", "href": "https://3.test", "body": "b3"},
+    ]
+    out = search_mod.format_results(results)
+    # 1-based numbering with the title on the numbered line.
+    assert "1. First" in out
+    assert "2. Second" in out
+    assert "3. Third" in out
+    # href and body sit on their own indented lines under each entry.
+    assert "   https://2.test" in out
+    assert "   b2" in out
+    # Entries are blank-line separated.
+    assert out.count("\n\n") == 2
+
+
+def test_format_results_missing_keys_default_to_empty() -> None:
+    # No title / href / body keys at all — should not raise, just blanks.
+    out = search_mod.format_results([{}])
+    assert out == "1. \n   \n   "
+
+
+def test_format_results_none_content_falls_back_to_empty() -> None:
+    # full_content=True but content is None → the `or ""` guard kicks in.
+    results = [{"title": "T", "href": "https://x.test", "body": "snip", "content": None}]
+    out = search_mod.format_results(results, full_content=True)
+    assert out == "1. T\n   https://x.test\n   "
+
+
+def test_format_results_snippet_mode_ignores_missing_content() -> None:
+    # No content key at all in snippet mode — body is used, no KeyError.
+    results = [{"title": "T", "href": "https://x.test", "body": "only body"}]
+    out = search_mod.format_results(results, full_content=False)
+    assert "only body" in out

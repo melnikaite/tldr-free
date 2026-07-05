@@ -583,7 +583,6 @@ __all__ = [
     "delete_jobs_older_than",
     "find_pending_for_restart",
     "get_job",
-    "job_summary_dict",
     "list_jobs",
     "list_messages",
     "mark_done",

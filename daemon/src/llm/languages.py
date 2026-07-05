@@ -141,6 +141,26 @@ def supported_codes() -> list[str]:
     return [lang.code for lang in _LANGUAGES]
 
 
+def short_lang_code(raw: object) -> str | None:
+    """Lowercase a raw language code, collapsing ``en-US`` → ``en``.
+
+    Unlike :func:`normalize_lang`, this does NOT resolve to a known
+    :class:`Language` and never raises — it just shortens whatever yt-dlp /
+    Whisper reports so the DB column holds a tidy code (or stays ``None`` when
+    we don't know). Full canonicalisation is left to ``normalize_lang`` /
+    ``detect_language`` downstream.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    # ``en-US`` / ``ru-ru`` style — keep the first segment when it's a 2-char code.
+    if "-" in s and len(s.split("-", 1)[0]) == 2:
+        s = s.split("-", 1)[0]
+    return s
+
+
 # Drop ``[MM:SS]`` / ``[HH:MM:SS]`` markers before language detection — they're
 # noise that biases the detector toward nothing useful.
 _MARKER_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
@@ -182,5 +202,6 @@ __all__ = [
     "UnknownLanguageError",
     "detect_language",
     "normalize_lang",
+    "short_lang_code",
     "supported_codes",
 ]

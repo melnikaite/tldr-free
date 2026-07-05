@@ -6,9 +6,14 @@ fetch_transcript_with_retry with a monkeypatched YouTubeTranscriptApi.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+import requests
 from youtube_transcript_api._errors import (
     AgeRestricted,
+    CouldNotRetrieveTranscript,
     IpBlocked,
     NoTranscriptFound,
     RequestBlocked,
@@ -19,7 +24,9 @@ from youtube_transcript_api._errors import (
 from src.workers import youtube
 from src.workers.errors import (
     ExhaustedRetriesError,
+    NetworkTranscriptError,
     PermanentTranscriptError,
+    TransientTranscriptError,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,6 +55,24 @@ def test_extract_video_id_handles_common_forms(url: str, expected: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "url, expected",
+    [
+        # Extra path/query segments after the id are ignored.
+        ("https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/embed/dQw4w9WgXcQ?start=10", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/shorts/dQw4w9WgXcQ/", "dQw4w9WgXcQ"),
+        ("https://youtu.be/dQw4w9WgXcQ/", "dQw4w9WgXcQ"),
+        # Multiple v= params — first one wins.
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=ZZZZZZZZZZZ", "dQw4w9WgXcQ"),
+        # Subdomains beyond the common ones still resolve.
+        ("https://gaming.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ],
+)
+def test_extract_video_id_handles_edge_forms(url: str, expected: str) -> None:
+    assert youtube.extract_video_id(url) == expected
+
+
+@pytest.mark.parametrize(
     "url",
     [
         "",
@@ -57,11 +82,150 @@ def test_extract_video_id_handles_common_forms(url: str, expected: str) -> None:
         "https://www.youtube.com/watch?x=foo",
         "https://www.youtube.com/playlist?list=PLxxxxx",
         "not a url",
+        # youtu.be host but no/invalid id in path.
+        "https://youtu.be/",
+        "https://youtu.be/short",  # too short for the 11-char pattern
+        "https://youtu.be/waytoolongvideoid",  # too long
+        # youtube.com host but id fails the strict pattern.
+        "https://www.youtube.com/watch?v=tooShort",
+        "https://www.youtube.com/shorts/bad!chars99",
+        "https://www.youtube.com/embed/",
+        # Recognised host, unrecognised path shape.
+        "https://www.youtube.com/feed/subscriptions",
     ],
 )
 def test_extract_video_id_rejects_invalid(url: str) -> None:
     with pytest.raises(ValueError):
         youtube.extract_video_id(url)
+
+
+# ---------------------------------------------------------------------------
+# _classify_transcript_exception — direct (pure) branch coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc_cls",
+    [TranscriptsDisabled, VideoUnavailable, AgeRestricted],
+)
+def test_classify_permanent(exc_cls) -> None:  # noqa: ANN001
+    exc = _build_yt_api_exception(exc_cls)
+    out = youtube._classify_transcript_exception(exc)
+    assert isinstance(out, PermanentTranscriptError)
+
+
+@pytest.mark.parametrize(
+    "exc_cls",
+    [IpBlocked, RequestBlocked],
+)
+def test_classify_transient(exc_cls) -> None:  # noqa: ANN001
+    exc = _build_yt_api_exception(exc_cls)
+    out = youtube._classify_transcript_exception(exc)
+    assert isinstance(out, TransientTranscriptError)
+
+
+def test_classify_request_exception_is_network() -> None:
+    out = youtube._classify_transcript_exception(
+        requests.exceptions.ConnectTimeout("boom")
+    )
+    assert isinstance(out, NetworkTranscriptError)
+
+
+def test_classify_could_not_retrieve_is_transient() -> None:
+    # CouldNotRetrieveTranscript (base of the library hierarchy, not in either
+    # explicit tuple) → treated as transient so the caller still defers.
+    exc = CouldNotRetrieveTranscript(video_id="abc")
+    out = youtube._classify_transcript_exception(exc)
+    assert isinstance(out, TransientTranscriptError)
+
+
+def test_classify_unknown_exception_is_transient() -> None:
+    out = youtube._classify_transcript_exception(RuntimeError("surprise"))
+    assert isinstance(out, TransientTranscriptError)
+
+
+# ---------------------------------------------------------------------------
+# _pick_subtitle_lang — pure language-selection logic
+# ---------------------------------------------------------------------------
+
+
+def test_pick_subtitle_lang_empty_returns_none() -> None:
+    assert youtube._pick_subtitle_lang({}, "en", ["en", "fr"]) is None
+
+
+def test_pick_subtitle_lang_prefers_original() -> None:
+    available = {"en": [], "fr": [], "de": []}
+    # Original language wins even when it sits later in preferences.
+    assert youtube._pick_subtitle_lang(available, "de", ["en", "fr"]) == "de"
+
+
+def test_pick_subtitle_lang_falls_back_to_preferences_in_order() -> None:
+    available = {"fr": [], "de": []}
+    # Original not available → first matching preference wins.
+    assert youtube._pick_subtitle_lang(available, "en", ["es", "fr", "de"]) == "fr"
+
+
+def test_pick_subtitle_lang_skips_none_original() -> None:
+    available = {"fr": [], "de": []}
+    assert youtube._pick_subtitle_lang(available, None, ["de"]) == "de"
+
+
+def test_pick_subtitle_lang_alphabetical_last_resort() -> None:
+    available = {"zh": [], "ar": [], "de": []}
+    # Neither original nor any preference matches → alphabetically first key.
+    assert youtube._pick_subtitle_lang(available, "en", ["es", "fr"]) == "ar"
+
+
+# ---------------------------------------------------------------------------
+# _parse_subtitle_json3 — pure parsing of YouTube's json3 caption format
+# ---------------------------------------------------------------------------
+
+
+def _write_json3(tmp_path: Path, payload: dict) -> Path:
+    p = tmp_path / "subs.json3"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def test_parse_subtitle_json3_basic(tmp_path: Path) -> None:
+    payload = {
+        "events": [
+            {
+                "tStartMs": 1500,
+                "dDurationMs": 2000,
+                "segs": [{"utf8": "hello "}, {"utf8": "world"}],
+            }
+        ]
+    }
+    out = youtube._parse_subtitle_json3(_write_json3(tmp_path, payload))
+    assert out == [{"start": 1.5, "duration": 2.0, "text": "hello world"}]
+
+
+def test_parse_subtitle_json3_skips_blank_and_cue_only(tmp_path: Path) -> None:
+    payload = {
+        "events": [
+            # Missing tStartMs → skipped.
+            {"dDurationMs": 1000, "segs": [{"utf8": "no start"}]},
+            # Empty text after join/strip → skipped.
+            {"tStartMs": 0, "dDurationMs": 500, "segs": [{"utf8": "  "}]},
+            # No segs key at all → empty text → skipped.
+            {"tStartMs": 1000, "dDurationMs": 500},
+            # Valid one with newline normalised to space.
+            {"tStartMs": 2000, "dDurationMs": 1000, "segs": [{"utf8": "a\nb"}]},
+        ]
+    }
+    out = youtube._parse_subtitle_json3(_write_json3(tmp_path, payload))
+    assert out == [{"start": 2.0, "duration": 1.0, "text": "a b"}]
+
+
+def test_parse_subtitle_json3_defaults_missing_duration(tmp_path: Path) -> None:
+    payload = {"events": [{"tStartMs": 3000, "segs": [{"utf8": "x"}]}]}
+    out = youtube._parse_subtitle_json3(_write_json3(tmp_path, payload))
+    assert out == [{"start": 3.0, "duration": 0.0, "text": "x"}]
+
+
+def test_parse_subtitle_json3_no_events(tmp_path: Path) -> None:
+    assert youtube._parse_subtitle_json3(_write_json3(tmp_path, {})) == []
 
 
 # ---------------------------------------------------------------------------

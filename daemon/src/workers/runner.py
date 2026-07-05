@@ -51,22 +51,6 @@ def _audio_dir() -> Path:
     return p
 
 
-def _normalise_lang_code(raw: object) -> str | None:
-    """Lowercase a yt-dlp language code, collapsing ``en-US`` → ``en``.
-
-    Mirrors the pipeline's fast-path normaliser; ``None``/empty → ``None`` so
-    the column stays null when we don't know.
-    """
-    if not isinstance(raw, str):
-        return None
-    s = raw.strip().lower()
-    if not s:
-        return None
-    if "-" in s and len(s.split("-", 1)[0]) == 2:
-        s = s.split("-", 1)[0]
-    return s
-
-
 async def _checkpoint_pause(
     job_id: str, repo_module: object, on_resume_stage: str,
 ) -> None:
@@ -193,7 +177,7 @@ async def _process_one(
         if isinstance(meta_title, str) and meta_title.strip():
             title = meta_title.strip()
         if whisper_language is None:
-            whisper_language = _normalise_lang_code(metadata.get("language"))
+            whisper_language = languages.short_lang_code(metadata.get("language"))
         # Last resort: guess from the transcript text itself (LocalAI Whisper
         # returns no language, and some videos carry no metadata language).
         if whisper_language is None:

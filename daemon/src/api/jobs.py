@@ -17,7 +17,6 @@ import binascii
 import contextlib
 import json
 import logging
-import math
 from datetime import datetime
 from typing import Any
 
@@ -39,7 +38,7 @@ from src.api.schemas import (
     Message as MessageModel,
 )
 from src.storage import repo
-from src.workers import pipeline, youtube
+from src.workers import pipeline, timecodes, youtube
 from src.workers.broker import get_stream_buffer
 
 log = logging.getLogger(__name__)
@@ -130,43 +129,10 @@ def _build_segments_text(raw_segments_json: str | None) -> str | None:
         return None
     if not isinstance(segments, list) or not segments:
         return None
-    # Hours-or-minutes marker format decided once for the whole text so
-    # the regex on the client side stays one variant per file.
-    last_start = 0.0
-    for seg in segments:
-        if not isinstance(seg, dict):
-            continue
-        try:
-            last_start = max(last_start, float(seg.get("start", 0.0)))
-        except (TypeError, ValueError):
-            continue
-    use_hours = last_start >= 3600.0
-
-    lines: list[str] = []
-    for seg in segments:
-        if not isinstance(seg, dict):
-            continue
-        try:
-            start = float(seg.get("start", 0.0))
-        except (TypeError, ValueError):
-            continue
-        text = str(seg.get("text") or "").strip()
-        if not text:
-            continue
-        total = int(math.floor(start))
-        if use_hours:
-            h = total // 3600
-            m = (total % 3600) // 60
-            s = total % 60
-            marker = f"[{h:02d}:{m:02d}:{s:02d}]"
-        else:
-            m = total // 60
-            s = total % 60
-            marker = f"[{m:02d}:{s:02d}]"
-        lines.append(f"{marker} {text}")
-    if not lines:
-        return None
-    return "\n".join(lines) + "\n"
+    # Delegate to the single timecode formatter so the marker format stays
+    # identical to the summary / transcript views (one source of truth).
+    dict_segments = [s for s in segments if isinstance(s, dict)]
+    return timecodes.format_segments_as_marked_text(dict_segments) or None
 
 
 def _to_details(job: Any) -> JobDetails:
