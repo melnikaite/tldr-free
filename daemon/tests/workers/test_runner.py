@@ -75,9 +75,9 @@ async def _wait_until(predicate: Any, *, timeout: float = 2.0, interval: float =
 @pytest.fixture
 def fake_segments() -> list[dict[str, Any]]:
     return [
-        {"start": 0.0, "end": 5.0, "text": "First chunk"},
-        {"start": 30.0, "end": 35.0, "text": "Second chunk"},
-        {"start": 60.0, "end": 65.0, "text": "Third chunk"},
+        {"start": 0.0, "end": 5.0, "text": "First chunk."},
+        {"start": 30.0, "end": 35.0, "text": "Second chunk."},
+        {"start": 60.0, "end": 65.0, "text": "Third chunk."},
     ]
 
 

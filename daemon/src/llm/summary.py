@@ -37,6 +37,15 @@ _TRANSCRIPT_SOURCE_NOTE = (
     "your summary; do not invent facts the text does not support."
 )
 
+# Injected when the source is a written document (web page / PDF), which has no
+# timestamps. Counters the prompt's "include timestamps" rule so a small local
+# model doesn't fabricate "[00:42]" markers next to key points (the pipeline
+# also strips any that slip through — see workers.timecodes.strip_all_timecodes).
+_DOCUMENT_SOURCE_NOTE = (
+    "The text below is a written document (web page or PDF). It has NO "
+    "timestamps. Do NOT add any [MM:SS] or [HH:MM:SS] markers to your summary."
+)
+
 
 @lru_cache(maxsize=8)
 def _load_prompt(name: str) -> str:
@@ -50,7 +59,7 @@ def _safe_title(title: str | None) -> str:
 
 
 def _source_note(*, from_audio_transcript: bool) -> str:
-    return _TRANSCRIPT_SOURCE_NOTE if from_audio_transcript else ""
+    return _TRANSCRIPT_SOURCE_NOTE if from_audio_transcript else _DOCUMENT_SOURCE_NOTE
 
 
 def _build_single_pass_prompt(

@@ -342,7 +342,7 @@ async def _run_youtube(
     # because the caption track we picked may differ (e.g. auto-translated
     # captions in another language). Best-effort only — None falls through
     # cleanly and the UI shows "Original".
-    transcript_language = _normalise_lang_code(metadata.get("language"))
+    transcript_language = languages.short_lang_code(metadata.get("language"))
     # Last resort when metadata carries no language: guess from the captions.
     if transcript_language is None:
         transcript_language = languages.detect_language(raw_text)
@@ -479,26 +479,6 @@ async def _run_pdf(
 # ---------------------------------------------------------------------------
 
 
-def _normalise_lang_code(raw: Any) -> str | None:
-    """Lowercase + strip a language code from yt-dlp / whisper output.
-
-    yt-dlp's ``info.get("language")`` sometimes returns ``"en-US"`` or a
-    full name; we keep the value short here (just lowercase + first two
-    chars when it looks like ``xx-YY``) and leave full canonicalisation
-    to the Phase 3 language helper. ``None`` and empty strings come back
-    as ``None`` so the column stays null for "we don't know".
-    """
-    if not isinstance(raw, str):
-        return None
-    s = raw.strip().lower()
-    if not s:
-        return None
-    # ``en-US`` / ``ru-ru`` style — keep the first segment.
-    if "-" in s and len(s.split("-", 1)[0]) == 2:
-        s = s.split("-", 1)[0]
-    return s
-
-
 def _persist_extracted(
     job_id: str,
     *,
@@ -614,6 +594,11 @@ async def _summarize_and_finish(
         return
 
     summary_md = timecodes.strip_timecode_placeholders("".join(parts).strip())
+    # Non-transcript sources (web pages, PDFs) have no timecodes in the source,
+    # so any [MM:SS] marker here is a model hallucination — strip them all. For
+    # audio sources real markers must survive, so this only runs for the rest.
+    if not from_audio:
+        summary_md = timecodes.strip_all_timecodes(summary_md)
     if not summary_md:
         repo.mark_failed(job_id, error="LLM returned empty summary")
         broker.publish(job_id, error_event("LLM returned empty summary"))

@@ -6,7 +6,7 @@ Format:
 - 5–8 sentences
 - List the main claims and facts from this chunk
 - Preserve names, numbers, and dates exactly
-- If the source contains timestamps [MM:SS] or [HH:MM:SS] — always keep them next to the relevant claims. If a claim has no timestamp in the source, omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
+- If the source contains timestamps [MM:SS] or [HH:MM:SS] — always keep them next to the relevant claims, each in its own bracket ("[01:30] [04:30]"), never combined like "[01:30, 04:30]". If a claim has no timestamp in the source, omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
 - Do not add anything not present in the text
 
 Material title: {title}

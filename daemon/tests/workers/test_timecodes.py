@@ -5,6 +5,8 @@ from __future__ import annotations
 from src.workers.timecodes import (
     build_marked_text,
     format_segments_as_marked_text,
+    strip_all_timecodes,
+    strip_bare_timecode_lines,
     strip_timecode_placeholders,
     strip_transcript_tail_noise,
 )
@@ -19,7 +21,8 @@ def test_zero_window_seconds_returns_empty_string() -> None:
     assert build_marked_text(segs, window_seconds=0) == ""
 
 
-def test_single_bucket_mm_ss() -> None:
+def test_unpunctuated_cues_merge_into_one_line() -> None:
+    # No sentence terminator and under the cap → one line, marked at the start.
     segs = [
         {"start": 0.0, "duration": 5.0, "text": "hello"},
         {"start": 5.0, "duration": 5.0, "text": "world"},
@@ -28,42 +31,61 @@ def test_single_bucket_mm_ss() -> None:
     assert out == "[00:00] hello world\n"
 
 
-def test_multiple_buckets_mm_ss() -> None:
+def test_one_line_per_sentence_with_exact_starts() -> None:
+    # Sentence boundaries split the text; each line is marked with the exact
+    # start of the cue its sentence begins in (not a rounded window).
     segs = [
-        {"start": 0.0, "duration": 5.0, "text": "first"},
-        {"start": 30.0, "duration": 5.0, "text": "second"},
-        {"start": 65.0, "duration": 5.0, "text": "third"},
+        {"start": 0.0, "duration": 5.0, "text": "Hello there."},
+        {"start": 7.0, "duration": 5.0, "text": "Next bit now."},
     ]
     out = build_marked_text(segs, window_seconds=30)
-    assert out == "[00:00] first\n[00:30] second\n[01:00] third\n"
+    assert out == "[00:00] Hello there.\n[00:07] Next bit now.\n"
+
+
+def test_sentence_spanning_cues_is_one_line() -> None:
+    segs = [
+        {"start": 0.0, "duration": 5.0, "text": "It looks like"},
+        {"start": 6.0, "duration": 5.0, "text": "today Fable reappeared."},
+    ]
+    out = build_marked_text(segs, window_seconds=30)
+    assert out == "[00:00] It looks like today Fable reappeared.\n"
+
+
+def test_decimal_point_is_not_a_sentence_break() -> None:
+    # "5.6" must not split — the dot is followed by a digit, not whitespace.
+    segs = [{"start": 12.0, "duration": 5.0, "text": "GPT 5.6 is out now."}]
+    out = build_marked_text(segs, window_seconds=30)
+    assert out == "[00:12] GPT 5.6 is out now.\n"
+
+
+def test_long_unpunctuated_run_is_capped_at_window() -> None:
+    # No punctuation → the window_seconds cap forces a break at a word boundary
+    # so the whole track doesn't collapse into one [00:00] line.
+    segs = [
+        {"start": 0.0, "text": "aa"},
+        {"start": 10.0, "text": "bb"},
+        {"start": 20.0, "text": "cc"},
+        {"start": 30.0, "text": "dd"},
+        {"start": 40.0, "text": "ee"},
+    ]
+    out = build_marked_text(segs, window_seconds=30)
+    assert out == "[00:00] aa bb cc\n[00:30] dd ee\n"
 
 
 def test_switches_to_hh_mm_ss_at_one_hour() -> None:
     segs = [
-        {"start": 0.0, "duration": 5.0, "text": "alpha"},
-        {"start": 3600.0, "duration": 5.0, "text": "omega"},
+        {"start": 0.0, "duration": 5.0, "text": "Alpha begins."},
+        {"start": 3600.0, "duration": 5.0, "text": "Omega ends."},
     ]
     out = build_marked_text(segs, window_seconds=30)
-    # use_hours kicks in because max_start >= 3600 → all markers use HH:MM:SS.
-    assert out == "[0:00:00] alpha\n[1:00:00] omega\n"
+    # use_hours kicks in because max start >= 3600 → all markers use HH:MM:SS.
+    assert out == "[0:00:00] Alpha begins.\n[1:00:00] Omega ends.\n"
 
 
-def test_below_one_hour_stays_mm_ss() -> None:
-    # 59:30 is well under an hour, marker stays MM:SS.
-    segs = [{"start": 3590.0, "duration": 5.0, "text": "almost"}]
+def test_below_one_hour_stays_mm_ss_with_exact_start() -> None:
+    segs = [{"start": 3590.0, "duration": 5.0, "text": "almost there"}]
     out = build_marked_text(segs, window_seconds=30)
-    assert out == "[59:30] almost\n"
-
-
-def test_empty_buckets_skipped() -> None:
-    segs = [
-        {"start": 0.0, "duration": 5.0, "text": "first"},
-        # 30..60 has no segments.
-        {"start": 60.0, "duration": 5.0, "text": "third"},
-    ]
-    out = build_marked_text(segs, window_seconds=30)
-    # No empty bucket, just the two non-empty.
-    assert out == "[00:00] first\n[01:00] third\n"
+    assert out == "[59:50] almost there\n"
 
 
 def test_segments_with_blank_text_skipped() -> None:
@@ -76,38 +98,29 @@ def test_segments_with_blank_text_skipped() -> None:
     assert out == "[00:00] real\n"
 
 
-def test_text_is_trimmed_per_bucket() -> None:
-    segs = [
-        {"start": 0.0, "duration": 5.0, "text": "  alpha  "},
-        {"start": 5.0, "duration": 5.0, "text": "  beta  "},
-    ]
-    out = build_marked_text(segs, window_seconds=30)
-    assert out == "[00:00] alpha beta\n"
-
-
 def test_deterministic_output_for_unsorted_input() -> None:
     segs_a = [
-        {"start": 60.0, "duration": 5.0, "text": "second"},
-        {"start": 0.0, "duration": 5.0, "text": "first"},
-        {"start": 30.0, "duration": 5.0, "text": "middle"},
+        {"start": 60.0, "duration": 5.0, "text": "Second."},
+        {"start": 0.0, "duration": 5.0, "text": "First."},
+        {"start": 30.0, "duration": 5.0, "text": "Middle."},
     ]
     segs_b = list(reversed(segs_a))
     out_a = build_marked_text(segs_a, window_seconds=30)
     out_b = build_marked_text(segs_b, window_seconds=30)
     assert out_a == out_b
-    # Buckets ordered by index: 0, 30, 60.
-    assert out_a == "[00:00] first\n[00:30] middle\n[01:00] second\n"
+    # Sorted by start; one sentence per cue, exact-start markers.
+    assert out_a == "[00:00] First.\n[00:30] Middle.\n[01:00] Second.\n"
 
 
 def test_whisper_segments_with_end_field_work_too() -> None:
-    # Whisper verbose_json gives "end" instead of "duration"; both should be
-    # accepted because we only read "start" + "text".
+    # Whisper verbose_json gives "end" instead of "duration"; both work because
+    # we only read "start" + "text".
     segs = [
-        {"start": 0.0, "end": 5.0, "text": "hello"},
-        {"start": 30.0, "end": 35.0, "text": "world"},
+        {"start": 0.0, "end": 5.0, "text": "Hello."},
+        {"start": 30.0, "end": 35.0, "text": "World."},
     ]
     out = build_marked_text(segs, window_seconds=30)
-    assert out == "[00:00] hello\n[00:30] world\n"
+    assert out == "[00:00] Hello.\n[00:30] World.\n"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +232,89 @@ def test_strip_mixed_lines() -> None:
         strip_timecode_placeholders(text)
         == "- has time [00:30]\n- no time\n- link [x](y)"
     )
+
+
+# --- strip_all_timecodes ----------------------------------------------------
+# For non-transcript sources (web pages, PDFs) any [MM:SS] marker the model
+# emitted is a hallucination — strip them all.
+
+
+def test_strip_all_removes_mm_ss() -> None:
+    assert strip_all_timecodes("- Key point [12:34]") == "- Key point"
+
+
+def test_strip_all_removes_hh_mm_ss() -> None:
+    assert strip_all_timecodes("- Key point [1:02:03]") == "- Key point"
+
+
+def test_strip_all_removes_every_marker() -> None:
+    text = "- First [00:30]\n- Second [12:34]\n- Third [1:02:03]"
+    assert strip_all_timecodes(text) == "- First\n- Second\n- Third"
+
+
+def test_strip_all_drops_dangling_separator() -> None:
+    assert strip_all_timecodes("Key point — [12:34]") == "Key point"
+    assert strip_all_timecodes("Key point - [00:30]") == "Key point"
+
+
+def test_strip_all_collapses_inner_double_space() -> None:
+    assert strip_all_timecodes("before [12:34] after") == "before after"
+
+
+def test_strip_all_keeps_markdown_links() -> None:
+    text = "See [the docs](https://example.com) for details"
+    assert strip_all_timecodes(text) == text
+
+
+def test_strip_all_noop_without_brackets() -> None:
+    text = "plain summary with no markers"
+    assert strip_all_timecodes(text) is text
+
+
+def test_strip_all_noop_without_timecodes() -> None:
+    # Brackets present but none are timecodes — left untouched.
+    text = "See [the docs](https://example.com)"
+    assert strip_all_timecodes(text) == text
+
+
+# --- strip_bare_timecode_lines ----------------------------------------------
+# A small local model sometimes ends a Q&A answer with a dump of bare [MM:SS]
+# markers, one per line. Those lines are dropped; lines with real text stay.
+
+
+def test_bare_drops_single_timecode_line() -> None:
+    text = "Answer text here.\n[12:00]\n[5:00]\n[06:30]"
+    assert strip_bare_timecode_lines(text) == "Answer text here."
+
+
+def test_bare_drops_multiple_markers_on_one_line() -> None:
+    text = "Real answer.\n[00:00] [00:30] [01:00]"
+    assert strip_bare_timecode_lines(text) == "Real answer."
+
+
+def test_bare_keeps_inline_timecode() -> None:
+    text = "The GPU is mentioned [04:30] in the video."
+    assert strip_bare_timecode_lines(text) == text
+
+
+def test_bare_keeps_bullet_with_text_and_timecode() -> None:
+    text = "* Homelab runs Linux [00:00]\n* RTX 4060 Ti [04:00]"
+    assert strip_bare_timecode_lines(text) == text
+
+
+def test_bare_drops_timecode_range_line() -> None:
+    text = "Some answer.\n[00:00] - [23:00]"
+    assert strip_bare_timecode_lines(text) == "Some answer."
+
+
+def test_bare_noop_without_brackets() -> None:
+    text = "plain answer, no markers"
+    assert strip_bare_timecode_lines(text) is text
+
+
+def test_bare_collapses_blank_runs() -> None:
+    text = "Answer.\n[00:00]\n\n[01:00]\nMore text."
+    assert strip_bare_timecode_lines(text) == "Answer.\n\nMore text."
 
 
 # --- strip_transcript_tail_noise --------------------------------------------

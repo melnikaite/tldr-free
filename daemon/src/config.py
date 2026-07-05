@@ -107,6 +107,9 @@ class OutputConfig(BaseModel):
 class YouTubeConfig(BaseModel):
     fast_path_max_attempts: int = 4
     fast_path_backoff_seconds: list[int] = Field(default_factory=lambda: [1, 4, 16, 60])
+    # Max seconds of speech per [MM:SS] line. Transcript lines are split by
+    # SENTENCE; this is only a safety cap so a punctuation-free auto-caption
+    # track doesn't collapse into one giant line.
     segment_window_seconds: int = 30
     audio_format: str = "opus"
     audio_bitrate_max: int = 64

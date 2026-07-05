@@ -17,16 +17,19 @@ A ``Segment`` is a plain dict with ``start`` and ``text`` (we don't use
                                                        #  v1.8 stopped returning
                                                        #  per-segment timestamps)
 
-We only need ``start`` and ``text`` to bucket. ``duration``/``end`` are
-used to determine whether the total span is over an hour (so we switch
-to ``HH:MM:SS``).
+We only need ``start`` and ``text``. The latest ``start`` decides MM:SS vs
+HH:MM:SS for the whole text.
 
-Algorithm:
-1. Determine the maximum start time in the input — picks ``HH:MM:SS``
-   when it's >= 3600 s, else ``MM:SS``.
-2. Bucket each segment by ``floor(start / window_seconds)``.
-3. Concatenate the text of each bucket with a single space, trimmed.
-4. Emit one line per non-empty bucket: ``"[MM:SS] text\n"``.
+Algorithm — one line per SENTENCE, not per fixed time window:
+1. Merge the short caption cues into one flowing string, remembering the
+   cue start time behind every character.
+2. Split that string on sentence boundaries (``. ? ! …`` followed by space).
+3. Emit one line per sentence, marked with the EXACT start time of the cue
+   the sentence begins in: ``"[MM:SS] sentence\n"``.
+4. Safety cap: a sentence longer than ``window_seconds`` of speech is broken
+   at a word boundary — auto-captions are often punctuation-free, and without
+   the cap the whole transcript would collapse into one giant ``[00:00]`` line.
+   So ``window_seconds`` is a MAX line length, not a fixed bucket size.
 
 The output is deterministic and pure: same input → same output.
 """
@@ -45,6 +48,17 @@ from typing import Any
 # is therefore a placeholder. We skip markdown links ("[text](url)") via the
 # negative lookahead so genuine links survive untouched.
 _PLACEHOLDER_BRACKET = re.compile(r"\[[^\]\d]*\](?!\()")
+
+# A genuine inline timecode marker: ``[MM:SS]`` or ``[HH:MM:SS]``. The negative
+# lookahead skips markdown links ("[text](url)") so they survive untouched. Used
+# to scrub HALLUCINATED timecodes from a summary whose source has none (web
+# pages, PDFs) — see ``strip_all_timecodes``.
+_TIMECODE_MARKER = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\](?!\()")
+
+# A sentence terminator (one or more of . ? ! …) followed by whitespace or the
+# end of text. The trailing lookahead keeps decimals/version numbers intact
+# ("GPT 5.6", "3.5") since their dot is followed by a digit, not a space.
+_SENTENCE_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
 
 # Format strings for ``str.format(...)`` so callers / tests can refer to the
 # exact formatting without parsing f-strings out of the source.
@@ -74,43 +88,71 @@ def _segment_text(seg: Mapping[str, Any]) -> str:
 
 
 def build_marked_text(segments: list[dict[str, Any]], window_seconds: int) -> str:
-    """Bucket ``segments`` and produce a flat text with ``[MM:SS]`` markers.
+    """Produce a flat text with one ``[MM:SS]`` marked line per SENTENCE.
 
     ``segments`` is a list of dicts (or any Mapping) with ``start`` and ``text``
-    keys. ``window_seconds`` controls the bucket size — ``30`` means each line
-    summarises ~30 seconds of speech.
+    keys. Each line's marker is the EXACT start time (to the second) of the cue
+    the sentence begins in. ``window_seconds`` is a SAFETY CAP — the maximum
+    seconds of speech allowed on one line; a sentence longer than that (e.g. a
+    punctuation-free auto-caption track) is split at a word boundary so the
+    transcript never collapses into a single ``[00:00]`` line.
     """
     if not segments or window_seconds <= 0:
         return ""
 
-    # Decide the marker format once, based on the latest start time.
-    max_start = max((_segment_start(s) for s in segments), default=0.0)
-    use_hours = max_start >= 3600.0
-
-    # Bucket segments by floor(start / window_seconds). Ordered dicts preserve
-    # insertion order — but for safety we explicitly sort buckets by index at
-    # the end, since segments may not arrive in order.
-    buckets: dict[int, list[str]] = {}
-    for seg in segments:
-        text = _segment_text(seg)
-        if not text:
-            continue
-        idx = int(math.floor(_segment_start(seg) / window_seconds))
-        if idx < 0:
-            idx = 0
-        buckets.setdefault(idx, []).append(text)
-
-    if not buckets:
+    # Sort by start and drop empty cues, then merge into one string while
+    # remembering the cue start time behind every character.
+    cues = sorted(
+        ((_segment_start(s), _segment_text(s)) for s in segments),
+        key=lambda c: c[0],
+    )
+    cues = [(start, text) for start, text in cues if text]
+    if not cues:
         return ""
 
+    use_hours = cues[-1][0] >= 3600.0
+
+    buf: list[str] = []
+    starts: list[float] = []
+    for start, text in cues:
+        if buf:
+            buf.append(" ")
+            starts.append(start)
+        buf.append(text)
+        starts.extend([start] * len(text))
+    merged = "".join(buf)
+    n = len(merged)
+
     lines: list[str] = []
-    for idx in sorted(buckets):
-        line_text = " ".join(buckets[idx]).strip()
-        if not line_text:
-            continue
-        seconds = idx * window_seconds
-        marker = _format_marker(seconds, use_hours=use_hours)
-        lines.append(f"[{marker}] {line_text}")
+    i = 0
+    while i < n:
+        while i < n and merged[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start_idx = i
+        line_start = starts[i]
+        match = _SENTENCE_END_RE.search(merged, i)
+        end = match.end() if match else n
+
+        # Safety cap: keep at most window_seconds of speech on one line.
+        cap = line_start + window_seconds
+        if starts[end - 1] > cap:
+            j = start_idx + 1
+            while j < end and starts[j] <= cap:
+                j += 1
+            # Back up to a word boundary so we don't cut mid-word.
+            k = j
+            while k > start_idx and not merged[k - 1].isspace():
+                k -= 1
+            end = k if k > start_idx else j
+
+        line = merged[start_idx:end].strip()
+        if line:
+            seconds = int(math.floor(max(line_start, 0.0)))
+            marker = _format_marker(seconds, use_hours=use_hours)
+            lines.append(f"[{marker}] {line}")
+        i = end
 
     if not lines:
         return ""
@@ -219,26 +261,12 @@ def strip_transcript_tail_noise(text: str) -> str:
     return cleaned + "\n" if text.endswith("\n") and cleaned else cleaned
 
 
-def strip_timecode_placeholders(text: str) -> str:
-    """Remove empty bracket markers the LLM left where no timecode exists.
+def _tidy_after_bracket_removal(cleaned: str) -> str:
+    """Tidy whitespace/separators orphaned by removing a bracket marker.
 
-    Belt-and-suspenders for the summary prompts (which already forbid such
-    placeholders): even instructed, a small local model occasionally writes
-    "[Не указано]" / "[N/A]" next to a key point that has no timestamp. We
-    strip those brackets, then tidy the leftover whitespace (a dangling space,
-    a doubled space, or a now-orphaned " — "/"-" separator the model put
-    between the text and the marker).
-
-    Pure: same input → same output. Markdown links and real [MM:SS] markers
-    are preserved (see ``_PLACEHOLDER_BRACKET``).
+    A dangling space, a doubled space, or a now-orphaned " — "/"-" separator
+    the model put between the text and the marker.
     """
-    if not text or "[" not in text:
-        return text
-
-    cleaned = _PLACEHOLDER_BRACKET.sub("", text)
-    if cleaned == text:
-        return text
-
     out_lines: list[str] = []
     for line in cleaned.split("\n"):
         # Collapse runs of spaces/tabs created by the removal.
@@ -250,9 +278,84 @@ def strip_timecode_placeholders(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def strip_timecode_placeholders(text: str) -> str:
+    """Remove empty bracket markers the LLM left where no timecode exists.
+
+    Belt-and-suspenders for the summary prompts (which already forbid such
+    placeholders): even instructed, a small local model occasionally writes
+    "[Не указано]" / "[N/A]" next to a key point that has no timestamp. We
+    strip those brackets, then tidy the leftover whitespace.
+
+    Pure: same input → same output. Markdown links and real [MM:SS] markers
+    are preserved (see ``_PLACEHOLDER_BRACKET``).
+    """
+    if not text or "[" not in text:
+        return text
+
+    cleaned = _PLACEHOLDER_BRACKET.sub("", text)
+    if cleaned == text:
+        return text
+    return _tidy_after_bracket_removal(cleaned)
+
+
+def strip_bare_timecode_lines(text: str) -> str:
+    """Drop lines that are nothing but timecode markers.
+
+    A small local model sometimes ends a Q&A answer with a dump of every
+    ``[MM:SS]`` marker from the transcript — one bare timecode per line, no
+    text. Those lines carry no information and look broken. We remove any line
+    whose entire content, after removing ``[MM:SS]``/``[HH:MM:SS]`` markers, is
+    empty or pure punctuation/whitespace. Lines with real words — including a
+    timecode sitting inline next to a sentence — are kept untouched.
+
+    Pure: same input → same output.
+    """
+    if not text or "[" not in text:
+        return text
+
+    out: list[str] = []
+    changed = False
+    for line in text.split("\n"):
+        residue = _TIMECODE_MARKER.sub("", line)
+        residue = re.sub(r"[\s\-–—,;:.]+", "", residue)
+        if line.strip() and not residue:
+            changed = True
+            continue
+        out.append(line)
+
+    if not changed:
+        return text
+    # Collapse blank runs the removal may have opened up, then trim.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def strip_all_timecodes(text: str) -> str:
+    """Remove ALL ``[MM:SS]`` / ``[HH:MM:SS]`` markers from a summary.
+
+    For non-transcript sources (web pages, PDFs) the source carries no
+    timecodes, so any marker the model emitted is hallucinated. The prompt
+    already tells it not to, but a small local model occasionally invents
+    "[00:42]" next to a key point anyway — this is the deterministic guarantee
+    that none leak into the stored summary. We strip the markers, then tidy the
+    leftover whitespace / dangling separators.
+
+    Pure: same input → same output. Markdown links survive (see
+    ``_TIMECODE_MARKER``).
+    """
+    if not text or "[" not in text:
+        return text
+
+    cleaned = _TIMECODE_MARKER.sub("", text)
+    if cleaned == text:
+        return text
+    return _tidy_after_bracket_removal(cleaned)
+
+
 __all__ = [
     "build_marked_text",
     "format_segments_as_marked_text",
+    "strip_all_timecodes",
+    "strip_bare_timecode_lines",
     "strip_timecode_placeholders",
     "strip_transcript_tail_noise",
 ]

@@ -17,7 +17,7 @@ Rules:
 - Do not add information not present in the source.
 - Preserve the accuracy of numbers, names, and dates.
 - Quoted text in quotation marks — only if that exact wording appears verbatim in the source.
-- If the source contains timestamps in [MM:SS] or [HH:MM:SS] format — always include them next to the relevant key points. This lets the user jump to that moment in the video. If a key point has no timestamp in the source (e.g. web pages and PDFs have none), simply omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
+- If the source contains timestamps in [MM:SS] or [HH:MM:SS] format — always include them next to the relevant key points. This lets the user jump to that moment in the video. Put EACH timestamp in its own bracket (e.g. "[01:30] [04:30]") — never combine several inside one bracket like "[01:30, 04:30]". If a key point has no timestamp in the source (e.g. web pages and PDFs have none), simply omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
 - Do not write "the author says", "the video explains". Write directly: "X happens because Y".
 
 Material title: {title}

@@ -40,9 +40,11 @@ export function renderMarkdown(md, job) {
   return injectTimecodeLinks(html, { videoId, mediaPageUrl });
 }
 
-// Match [MM:SS] or [HH:MM:SS] markers in a text node. Non-global form for
-// .test() so we don't have to worry about stateful lastIndex.
-const TIMECODE_DETECT_RE = /\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]/;
+// Match a bracket holding ONE OR MORE [MM:SS] / [HH:MM:SS] markers — the model
+// sometimes groups several in one bracket, e.g. "[01:30, 04:30]". Non-global
+// form for .test() so we don't have to worry about stateful lastIndex.
+const TIMECODE_DETECT_RE =
+  /\[\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\s*[,;]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})*\s*\]/;
 
 // Tags whose text contents should NOT be transformed.
 const SKIP_TAGS = new Set(["A", "CODE", "PRE", "SCRIPT", "STYLE", "TEXTAREA"]);
@@ -94,8 +96,34 @@ function injectTimecodeLinks(html, target) {
 }
 
 /**
- * Split a text node, inserting <a> elements for each [MM:SS] or [HH:MM:SS]
- * marker found within.
+ * Build a single clickable <a> for one timecode (h/m/s already parsed).
+ *
+ * @param {Document} doc
+ * @param {string} label   text to show, e.g. "[01:30]"
+ * @param {number} seconds
+ * @param {TimecodeTarget} target
+ * @returns {HTMLAnchorElement}
+ */
+function _makeTimecodeAnchor(doc, label, seconds, target) {
+  const a = doc.createElement("a");
+  if (target.videoId) {
+    a.href = `https://www.youtube.com/watch?v=${encodeURIComponent(target.videoId)}&t=${seconds}s`;
+    a.dataset.tldrVideoId = target.videoId;
+  } else if (target.mediaPageUrl) {
+    a.href = _withTimeFragment(target.mediaPageUrl, seconds);
+    a.dataset.tldrMediaPageUrl = target.mediaPageUrl;
+  }
+  a.target = "_blank";
+  a.rel = "noopener";
+  a.dataset.tldrSeconds = String(seconds);
+  a.textContent = label;
+  return a;
+}
+
+/**
+ * Split a text node, inserting <a> elements for each [MM:SS] / [HH:MM:SS]
+ * marker found within. A bracket may hold several markers ("[01:30, 04:30]");
+ * each becomes its own link, rendered as separate "[01:30] [04:30]" anchors.
  *
  * @param {Text} textNode
  * @param {TimecodeTarget} target
@@ -106,31 +134,27 @@ function replaceInTextNode(textNode, target) {
   const frag = doc.createDocumentFragment();
 
   let lastIndex = 0;
-  // New regex per call so we don't share lastIndex state across nodes.
-  const re = /\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]/g;
+  // Outer: a whole bracket holding one or more timecodes. New regex per call so
+  // we don't share lastIndex state across nodes.
+  const groupRe =
+    /\[\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\s*[,;]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})*\s*\]/g;
+  // Inner: each individual timecode within the bracket.
+  const tcRe = /(?:(\d{1,2}):)?(\d{1,2}):(\d{2})/g;
   let m;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = groupRe.exec(text)) !== null) {
     const before = text.slice(lastIndex, m.index);
     if (before) frag.appendChild(doc.createTextNode(before));
 
-    const h = m[1] ? Number(m[1]) : 0;
-    const mm = Number(m[2]);
-    const ss = Number(m[3]);
-    const seconds = h * 3600 + mm * 60 + ss;
-
-    const a = doc.createElement("a");
-    if (target.videoId) {
-      a.href = `https://www.youtube.com/watch?v=${encodeURIComponent(target.videoId)}&t=${seconds}s`;
-      a.dataset.tldrVideoId = target.videoId;
-    } else if (target.mediaPageUrl) {
-      a.href = _withTimeFragment(target.mediaPageUrl, seconds);
-      a.dataset.tldrMediaPageUrl = target.mediaPageUrl;
+    let t;
+    let first = true;
+    tcRe.lastIndex = 0;
+    while ((t = tcRe.exec(m[0])) !== null) {
+      if (!first) frag.appendChild(doc.createTextNode(" "));
+      first = false;
+      const h = t[1] ? Number(t[1]) : 0;
+      const seconds = h * 3600 + Number(t[2]) * 60 + Number(t[3]);
+      frag.appendChild(_makeTimecodeAnchor(doc, `[${t[0]}]`, seconds, target));
     }
-    a.target = "_blank";
-    a.rel = "noopener";
-    a.dataset.tldrSeconds = String(seconds);
-    a.textContent = m[0];
-    frag.appendChild(a);
 
     lastIndex = m.index + m[0].length;
   }
