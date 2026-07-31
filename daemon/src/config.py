@@ -108,11 +108,13 @@ class LLMConfig(BaseModel):
             try:
                 import keyring
             except ImportError as e:
+                # 'keyring' is a base dependency (see pyproject.toml) — this
+                # only happens if it was somehow removed from the venv.
                 raise RuntimeError(
                     "llm.api_key_keychain is set but the 'keyring' package "
-                    "is not installed. Install it with "
-                    "'uv pip install tldr-daemon[keychain]' "
-                    "(or 'pip install tldr-daemon[keychain]')."
+                    "is not installed. Reinstall the daemon "
+                    "('uv tool install --force .' / 'pip install .') to "
+                    "restore it."
                 ) from e
             password = keyring.get_password(self.api_key_keychain, self.api_key_keychain_account)
             if not password:
@@ -379,6 +381,42 @@ def write_api_key_file(key: str) -> Path:
     path = api_key_file_path()
     _atomic_write_text(path, key, 0o600)
     return path
+
+
+@lru_cache(maxsize=1)
+def keychain_backend_available() -> bool:
+    """Whether the OS keychain (macOS Keychain / Linux Secret Service /
+    Windows Credential Locker) is actually usable on this machine — not
+    merely whether the ``keyring`` package is importable, but whether a
+    real backend is configured. ``keyring`` falls back to
+    ``keyring.backends.fail.Keyring`` (every call raises) when no usable
+    backend is found, e.g. headless Linux without a Secret Service running
+    in the session — this returns ``False`` in that case.
+
+    This is the single source of truth for "is keychain storage viable
+    right now": ``GET /config`` reports it as ``keychain_available`` and
+    ``PATCH /config`` uses it to pick the default ``api_key_storage``
+    when the caller doesn't specify one — see ``src/api/config.py``.
+
+    Cached for the process lifetime: the available backend can't change
+    while the daemon is running (same rationale as the LLM client cache —
+    see ``.claude/llm.md``).
+    """
+    try:
+        import keyring
+    except ImportError:
+        return False
+    try:
+        backend = keyring.get_keyring()
+    except Exception:
+        return False
+    # keyring falls back to the null "fail" backend when no real backend is
+    # configured (e.g. headless Linux without a Secret Service in the
+    # session) — every call on it raises. Compared by qualified class name
+    # rather than isinstance-against-an-import so this stays robust under
+    # test doubles that stub out the `keyring` module itself.
+    backend_name = f"{type(backend).__module__}.{type(backend).__qualname__}"
+    return backend_name != "keyring.backends.fail.Keyring"
 
 
 def validate_full_config(overrides: dict[str, Any]) -> Config:

@@ -24,6 +24,12 @@ dependencies = [
     "httpx>=0.27",
     "PyYAML>=6.0",
     "ddgs>=1.0",
+    # OS keychain (macOS Keychain / Linux Secret Service) storage for the LLM
+    # API key. A base dependency (not optional) since headless operation is
+    # unsupported — a human is always at the browser, so keychain access
+    # dialogs are never a problem — and this is now the recommended default
+    # storage mode (see PATCH /config default in src/api/config.py).
+    "keyring>=25",
 ]
 
 [project.scripts]
@@ -38,10 +44,6 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML",
-]
-# Optional: only needed when llm.api_key_keychain is set in config.
-keychain = [
-    "keyring>=25",
 ]
 
 [build-system]

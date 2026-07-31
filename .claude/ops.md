@@ -42,8 +42,8 @@ Invariants the native path must keep:
   for the platform default path, with `host.docker.internal` rewritten to
   `127.0.0.1`. Either way `tldr.yaml` is written with `0600` permissions,
   since it may hold a plaintext cloud API key (`llm.api_key`). Prefer
-  `api_key_file` / `api_key_keychain` for real cloud keys — see
-  [llm.md](llm.md).
+  `api_key_keychain` (recommended default when available) or `api_key_file`
+  (Docker installs) for real cloud keys — see [llm.md](llm.md).
 - **One upgrade per start.** `src/selfupdate.py` refreshes yt-dlp +
   youtube-transcript-api at CLI startup; `docker-entrypoint.sh` exports
   `TLDR_SKIP_PKG_UPDATE=1` because it already upgrades itself. Pytest is

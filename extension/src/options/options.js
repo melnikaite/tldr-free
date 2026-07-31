@@ -50,6 +50,16 @@ const llmApiKeySourceEl = /** @type {HTMLElement} */ (
 const llmApiKeyStorageSelect = /** @type {HTMLSelectElement} */ (
   document.getElementById("llm-api-key-storage")
 );
+const llmApiKeyStorageHintEl = /** @type {HTMLElement} */ (
+  document.getElementById("llm-api-key-storage-hint")
+);
+const apiKeyVerifyResultEl = /** @type {HTMLElement} */ (
+  document.getElementById("api-key-verify-result")
+);
+
+const llmApiKeyStorageKeychainOptionEl = /** @type {HTMLOptionElement} */ (
+  document.getElementById("llm-api-key-storage-keychain-option")
+);
 
 const testBtn = /** @type {HTMLButtonElement} */ (document.getElementById("test-connection"));
 const testResultEl = /** @type {HTMLElement} */ (document.getElementById("test-result"));
@@ -124,9 +134,29 @@ function renderConfig(cfg) {
     ? `Current key source: ${cfg.llm.api_key_source}`
     : "";
 
+  // OS keychain is the recommended default, but only offer it when the
+  // daemon reports a real, usable backend — otherwise disable the option
+  // with an explanatory hint and fall back to File.
+  const keychainAvailable = cfg.keychain_available === true;
+  llmApiKeyStorageKeychainOptionEl.disabled = !keychainAvailable;
+  if (keychainAvailable) {
+    llmApiKeyStorageKeychainOptionEl.title = "";
+    llmApiKeyStorageHintEl.hidden = true;
+    llmApiKeyStorageHintEl.textContent = "";
+  } else {
+    llmApiKeyStorageKeychainOptionEl.title =
+      "No usable OS keychain backend on this daemon's machine.";
+    llmApiKeyStorageHintEl.hidden = false;
+    llmApiKeyStorageHintEl.textContent =
+      "OS keychain unavailable here (no usable backend — e.g. no Secret Service " +
+      "running in this session on Linux). Falling back to File.";
+  }
+
+  const defaultStorage = keychainAvailable ? "keychain" : "file";
   initialApiKeyStorage = API_KEY_STORAGE_OPTIONS.includes(cfg.llm?.api_key_source)
     ? cfg.llm.api_key_source
-    : "file";
+    : defaultStorage;
+  if (initialApiKeyStorage === "keychain" && !keychainAvailable) initialApiKeyStorage = "file";
   llmApiKeyStorageSelect.value = initialApiKeyStorage;
 
   whisperBaseUrlInput.value = cfg.whisper?.base_url ?? "";
@@ -311,6 +341,8 @@ saveSettingsBtn.addEventListener("click", async () => {
   settingsStatusEl.textContent = "";
   settingsStatusEl.className = "";
   restartNoticeEl.hidden = true;
+  apiKeyVerifyResultEl.textContent = "";
+  apiKeyVerifyResultEl.className = "hint";
 
   if (!lastConfig) {
     settingsStatusEl.textContent = "Settings not loaded — nothing to save.";
@@ -323,6 +355,11 @@ saveSettingsBtn.addEventListener("click", async () => {
     settingsStatusEl.textContent = "Nothing changed.";
     return;
   }
+  // Only the API key write path is write-then-read-back verified —
+  // don't show a verification line for a save that didn't touch it.
+  const keyWasWritten =
+    patch.llm !== undefined &&
+    (patch.llm.api_key !== undefined || patch.llm.api_key_storage !== undefined);
 
   saveSettingsBtn.disabled = true;
   try {
@@ -337,6 +374,16 @@ saveSettingsBtn.addEventListener("click", async () => {
         "tldr-daemon service uninstall && tldr-daemon service install";
       restartNoticeEl.hidden = false;
       restartNoticeEl.className = "notice";
+    }
+    if (keyWasWritten) {
+      if (result.api_key_verified) {
+        apiKeyVerifyResultEl.textContent = "API key verified — read back successfully.";
+        apiKeyVerifyResultEl.className = "hint ok";
+      } else {
+        apiKeyVerifyResultEl.textContent =
+          `API key saved, but verification failed: ${result.api_key_verify_error || "unknown reason"}`;
+        apiKeyVerifyResultEl.className = "hint err";
+      }
     }
   } catch (err) {
     settingsStatusEl.textContent = `Save failed: ${formatRequestError(err)}`;

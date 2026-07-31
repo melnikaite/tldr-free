@@ -116,12 +116,29 @@ pipeline changes. Config fields: `api_key`, `api_key_file`,
 
 - **Resolution order (first match wins): env → keychain → file → inline.**
   This lets an operator override a committed `tldr.yaml` at deploy time
-  (env), keep the key out of any file at all (keychain, needs the optional
-  `keychain` extra), or at least keep it out of the YAML (`api_key_file`,
-  path expands `~`, must be `0600`) without touching `api_key` in plain
-  text. Whichever source wins, resolution happens once at config load —
-  changing the keychain entry or key file needs a daemon restart like any
-  other config change.
+  (env, also handy for Docker/foreground runs), keep the key out of any
+  file at all (keychain — recommended and the default `PATCH /config`
+  picks when available; `keyring` is a base dependency, no extra install
+  step), or at least keep it out of the YAML (`api_key_file`, path expands
+  `~`, must be `0600` — the right choice for Docker installs, which have
+  neither macOS Keychain nor a Secret Service) without touching `api_key`
+  in plain text. Whichever source wins, resolution happens once at config
+  load (`effective_api_key`, read once per process lifetime via the
+  `lru_cache`d client — not per request) — changing the keychain entry or
+  key file needs a daemon restart like any other config change.
+  Headless operation (no logged-in user at the console) is explicitly
+  unsupported — the extension needs a human at the browser regardless —
+  so keychain access dialogs are never a problem in practice: the daemon
+  writes its own key (via the options page / `PATCH /config`), the
+  creator of a Keychain item is auto-added to its own trusted-app ACL, and
+  that ACL is persistent (survives reboot, and a `uv tool install --force`
+  reinstall — the venv is rebuilt but the underlying macOS Python binary
+  and the `keyring` code aren't). `config.keychain_backend_available()`
+  (cached for the process lifetime) is the single source of truth for
+  "is keychain actually usable right now" — it backs `GET /config`'s
+  `keychain_available` field, the `PATCH /config` default-storage choice,
+  and the options-page UI that disables the keychain option when false
+  (Linux without a Secret Service in the session).
 - **Backend dialect auto-detection is cached per process.** Some
   OpenAI-compatible backends want `max_tokens`, others (reasoning models —
   gpt-5, o-series) require `max_completion_tokens` and reject `temperature`.

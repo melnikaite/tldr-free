@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from src.config import LLMConfig, ensure_config_file
+from src.config import LLMConfig, ensure_config_file, keychain_backend_available
 
 
 def _cfg(**overrides: Any) -> LLMConfig:
@@ -90,6 +90,111 @@ def test_env_beats_everything(
         api_key_keychain="tldr-llm",
     )
     assert cfg.effective_api_key == "env-secret"
+
+
+# ---------------------------------------------------------------------------
+# keychain_backend_available — real usability check, not just importability
+# ---------------------------------------------------------------------------
+
+
+def test_keychain_backend_available_true_for_usable_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_keyring = type("FakeKeyring", (), {"get_keyring": staticmethod(lambda: object())})()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is True
+    finally:
+        keychain_backend_available.cache_clear()
+
+
+def test_keychain_backend_available_false_for_fail_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stand-in with the same qualified name as keyring's real null
+    # backend — keychain_backend_available() compares by name rather than
+    # isinstance-against-an-import, so it doesn't need the real keyring
+    # package's submodule import to succeed against a stubbed-out
+    # top-level `keyring` module (see src/config.py for why).
+    _FailBackend = type("Keyring", (), {})
+    _FailBackend.__module__ = "keyring.backends.fail"
+
+    fake_keyring = type(
+        "FakeKeyring", (), {"get_keyring": staticmethod(lambda: _FailBackend())}
+    )()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is False
+    finally:
+        keychain_backend_available.cache_clear()
+
+
+def test_keychain_backend_available_false_for_real_fail_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration check against the real `keyring` package (installed as
+    a base dependency — see pyproject.toml) and its real fail backend,
+    rather than a stand-in — belt-and-suspenders for the string-compare
+    logic in keychain_backend_available()."""
+    import keyring
+    from keyring.backends.fail import Keyring as RealFailBackend
+
+    monkeypatch.setattr(keyring, "get_keyring", lambda: RealFailBackend())
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is False
+    finally:
+        keychain_backend_available.cache_clear()
+
+
+def test_keychain_backend_available_false_when_keyring_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "keyring", None)
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is False
+    finally:
+        keychain_backend_available.cache_clear()
+
+
+def test_keychain_backend_available_false_when_get_keyring_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise() -> None:
+        raise RuntimeError("no backend configured")
+
+    fake_keyring = type("FakeKeyring", (), {"get_keyring": staticmethod(_raise)})()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is False
+    finally:
+        keychain_backend_available.cache_clear()
+
+
+def test_keychain_backend_available_is_cached_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check is cached for the process lifetime — a second call must
+    not re-import/re-probe keyring."""
+    calls = {"n": 0}
+
+    def _get_keyring() -> object:
+        calls["n"] += 1
+        return object()
+
+    fake_keyring = type("FakeKeyring", (), {"get_keyring": staticmethod(_get_keyring)})()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    keychain_backend_available.cache_clear()
+    try:
+        assert keychain_backend_available() is True
+        assert keychain_backend_available() is True
+        assert calls["n"] == 1
+    finally:
+        keychain_backend_available.cache_clear()
 
 
 # ---------------------------------------------------------------------------

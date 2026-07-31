@@ -18,17 +18,39 @@ via ``config.validate_full_config``) before anything is written to disk.
 
 API key storage (``PATCH /config`` body ``llm.api_key_storage``):
 
-- ``"file"`` (default) — the key is written to ``config.api_key_file_path()``
-  (mode 0600) and the override points ``llm.api_key_file`` at it.
-- ``"keychain"`` — ``keyring.set_password(...)``; override gets
-  ``llm.api_key_keychain`` / ``llm.api_key_keychain_account``. 422 with an
-  actionable message if the optional ``keyring`` package isn't installed.
+- ``"keychain"`` (default when ``config.keychain_backend_available()`` is
+  true) — ``keyring.set_password(...)``; override gets
+  ``llm.api_key_keychain`` / ``llm.api_key_keychain_account``. This is the
+  recommended mode: the daemon itself writes the entry, so it's
+  automatically in its own trusted-app ACL and reads it back with zero
+  prompts (see ``.claude/llm.md``). 422 with an actionable message if
+  ``keyring`` has no usable backend (headless Linux without a Secret
+  Service in the session — see ``keychain_available`` below).
+- ``"file"`` (default when keychain isn't available) — the key is written
+  to ``config.api_key_file_path()`` (mode 0600) and the override points
+  ``llm.api_key_file`` at it. Also the right choice for Docker installs,
+  which have neither macOS Keychain nor a Secret Service.
 - ``"inline"`` — the key is written directly into the (0600) override file
   as ``llm.api_key``.
 
 Switching storage cleans up the fields (and best-effort the previous
 file/keychain entry) used by the PREVIOUS mode, so only one source of
 truth remains — see ``_apply_api_key_storage``.
+
+``keychain_available`` (``GET``/``PATCH`` response, top level) reflects
+``config.keychain_backend_available()`` — a real check that the keyring
+backend is usable, not just that the package is importable. It's cached
+for the process lifetime (the backend can't change while running) and is
+the single place both the default-storage decision (above) and the
+extension's options-page UI (disabling the keychain choice) read from.
+
+Write-then-read-back verification: whenever a PATCH writes a new API key,
+the response includes ``api_key_verified`` (bool) and
+``api_key_verify_error`` (str, redacted, or None) — the freshly-saved
+config is read back via the EXACT accessor the daemon uses at call time
+(``LLMConfig.effective_api_key``) and compared to what was just written.
+A failed verification is reported, never rolled back — see
+``_verify_saved_api_key``.
 
 Cache invalidation after a successful PATCH: ``get_config.cache_clear()``
 and ``llm_client.reset_caches()`` (client + dialect guess). The LLM
@@ -139,6 +161,7 @@ def _to_response(cfg: Config) -> ConfigResponse:
         output=OutputConfigOut(language=cfg.output.language),
         config_path=str(config_module.config_path()),
         overrides_path=str(config_module.overrides_path()),
+        keychain_available=config_module.keychain_backend_available(),
     )
 
 
@@ -169,18 +192,40 @@ def _apply_api_key_storage(llm_overrides: dict[str, Any], storage: str, key: str
         path = config_module.write_api_key_file(key)
         llm_overrides["api_key_file"] = str(path)
     elif storage == "keychain":
-        try:
-            import keyring
-        except ImportError as e:
+        if not config_module.keychain_backend_available():
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "llm.api_key_storage='keychain' requires the optional 'keyring' "
-                    "package. Install with `uv pip install 'tldr-daemon[keychain]'` "
-                    "(or `pip install 'tldr-daemon[keychain]'`)."
+                    "llm.api_key_storage='keychain' requires a usable OS keychain "
+                    "backend. On macOS/Windows this should always be available; on "
+                    "Linux it needs a Secret Service (GNOME Keyring / KWallet) "
+                    "running in the current session. Use api_key_storage='file' "
+                    "instead (recommended for Docker installs and headless setups)."
+                ),
+            )
+        import keyring
+
+        try:
+            keyring.set_password(_KEYCHAIN_SERVICE, _KEYCHAIN_ACCOUNT, key)
+        except Exception as e:
+            # A usable backend (checked above) doesn't guarantee the WRITE
+            # succeeds — e.g. a stale entry left by a previous install with
+            # an ACL that doesn't trust the current binary (a Python
+            # minor-version bump invalidates it) can make the OS keychain
+            # refuse the write outright rather than prompt, since this
+            # runs headless (no session to show a permission dialog to).
+            # Surface that as an actionable 422 instead of a raw 500.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Failed to write the API key to the OS keychain "
+                    f"(service={_KEYCHAIN_SERVICE!r}): {_redact(str(e), key)}. If a "
+                    "previous version left a stale entry with an incompatible "
+                    "ACL, remove it (e.g. `security delete-generic-password -s "
+                    f"{_KEYCHAIN_SERVICE} -a {_KEYCHAIN_ACCOUNT}` on macOS) and retry, "
+                    "or use api_key_storage='file' instead."
                 ),
             ) from e
-        keyring.set_password(_KEYCHAIN_SERVICE, _KEYCHAIN_ACCOUNT, key)
         llm_overrides["api_key_keychain"] = _KEYCHAIN_SERVICE
         llm_overrides["api_key_keychain_account"] = _KEYCHAIN_ACCOUNT
     else:
@@ -225,6 +270,11 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     whisper_overrides = dict(overrides.get("whisper") or {})
     output_overrides = dict(overrides.get("output") or {})
 
+    # Set only when this PATCH actually (re)writes the API key — that's the
+    # one case worth a write-then-read-back check (see
+    # `_verify_saved_api_key`). Left None otherwise.
+    saved_key: str | None = None
+
     if body.llm is not None:
         simple_fields = body.llm.model_dump(
             exclude={"api_key", "api_key_storage"}, exclude_unset=True
@@ -232,7 +282,9 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
         llm_overrides.update(simple_fields)
 
         if body.llm.api_key or body.llm.api_key_storage:
-            storage = body.llm.api_key_storage or "file"
+            storage = body.llm.api_key_storage or (
+                "keychain" if config_module.keychain_backend_available() else "file"
+            )
             new_key = body.llm.api_key
             if not new_key:
                 # Storage changed but no new key given — migrate the
@@ -250,6 +302,7 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
                         ),
                     ) from e
             _apply_api_key_storage(llm_overrides, storage, new_key)
+            saved_key = new_key
 
     if body.whisper is not None:
         whisper_overrides.update(body.whisper.model_dump(exclude_unset=True))
@@ -282,9 +335,41 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     llm_client.reset_caches()
 
     restart_required = new_cfg.llm.max_concurrent_calls != old_max_concurrent_calls
+    api_key_verified, api_key_verify_error = _verify_saved_api_key(new_cfg, saved_key)
 
     response = _to_response(new_cfg)
-    return ConfigPatchResponse(**response.model_dump(), restart_required=restart_required)
+    return ConfigPatchResponse(
+        **response.model_dump(),
+        restart_required=restart_required,
+        api_key_verified=api_key_verified,
+        api_key_verify_error=api_key_verify_error,
+    )
+
+
+def _verify_saved_api_key(cfg: Config, saved_key: str | None) -> tuple[bool, str | None]:
+    """Read the just-saved API key back using the EXACT accessor the daemon
+    uses at call time (``LLMConfig.effective_api_key``) and compare it to
+    what was just written, so a broken storage choice (e.g. a keychain
+    entry the daemon can't read back, a bad file path) is caught and
+    reported immediately rather than surfacing as a mysterious 401 the next
+    time an LLM call is made.
+
+    Never rolls back the save — by the time this runs, ``write_overrides``
+    already succeeded and IS the source of truth; this only decides what
+    to report. ``saved_key`` is None when this PATCH didn't touch the API
+    key at all, in which case there's nothing to verify.
+
+    Never lets the actual key value leak into the returned error string.
+    """
+    if saved_key is None:
+        return True, None
+    try:
+        resolved = cfg.llm.effective_api_key
+    except Exception as e:
+        return False, _redact(str(e), saved_key)
+    if resolved != saved_key:
+        return False, "Key read back from storage does not match the value just saved."
+    return True, None
 
 
 # ---------------------------------------------------------------------------

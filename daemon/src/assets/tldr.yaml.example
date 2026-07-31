@@ -18,16 +18,22 @@
 # API key storage — applies independently to llm.* and whisper.*, in this
 # priority order (first match wins):
 #   1. Environment variable TLDR__LLM__API_KEY / TLDR__WHISPER__API_KEY —
-#      overrides everything below. Good for CI or an EnvironmentFile on the
-#      systemd unit.
+#      overrides everything below. Convenient for Docker/foreground runs
+#      and CI, or an EnvironmentFile on the systemd unit.
 #   2. api_key_keychain (keychain service name) + api_key_keychain_account
-#      (account name) — macOS Keychain / Linux Secret Service. Needs the
-#      optional `keychain` extra (`tldr-daemon[keychain]`, or
-#      `uv tool install --force './daemon[keychain]'` natively). After
-#      `uv tool install --force` the daemon binary changes, so macOS will
-#      re-prompt for Keychain access once.
+#      (account name) — macOS Keychain / Linux Secret Service. Recommended:
+#      `keyring` is a base dependency (no extra install step), and it's the
+#      default the options page / `PATCH /config` pick when a usable
+#      backend is available. The daemon writes the entry itself, so it's
+#      automatically in its own trusted-app ACL and reads it back with zero
+#      prompts afterwards — including after `uv tool install --force`.
+#      Linux needs a Secret Service (GNOME Keyring / KWallet) running in
+#      the session; the options page falls back to File automatically when
+#      none is found.
 #   3. api_key_file — path to a file containing just the key (`~` expands),
-#      permissions must be 0600. Recommended for real cloud keys.
+#      permissions must be 0600. The right choice for Docker installs (no
+#      macOS Keychain, no Secret Service in the container) or if you just
+#      prefer a file.
 #   4. api_key inline below — fine for local backends that ignore the value
 #      (ollama, dummy, lm-studio, ...); avoid it for real cloud keys since
 #      this file sits in plain text (tldr.yaml itself is created 0600, but

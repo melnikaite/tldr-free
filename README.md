@@ -197,16 +197,27 @@ retries once on an HTTP 400), so GPT-5/o-series work out of the box.
 
 #### API key storage
 
+TLDR is single-user and needs a human at the browser regardless (the Chrome
+extension is how you use it at all), so a headless daemon — no logged-in
+user at the console — isn't a supported scenario. That makes the OS
+keychain the natural default: it's already there whenever the daemon runs.
+
 Four ways to give the daemon a key, in priority order (first match wins):
 
 1. **`TLDR__LLM__API_KEY` environment variable** — overrides everything
-   below. Good for CI, or when the key already lives in your service's
-   environment.
-2. **OS keychain** — `api_key_keychain` (service name) +
-   `api_key_keychain_account` (account name), backed by macOS Keychain or
-   the Linux Secret Service. Requires the optional `keychain` extra:
-   `uv tool install --force './daemon[keychain]'` natively, or
-   `tldr-daemon[keychain]` in the Docker image. Store the secret once —
+   below. Convenient for Docker/foreground runs and CI, or when the key
+   already lives in your service's environment.
+2. **OS keychain** (recommended, and the default the options page and
+   `PATCH /config` pick when available) — `api_key_keychain` (service name)
+   + `api_key_keychain_account` (account name), backed by macOS Keychain or
+   the Linux Secret Service. `keyring` is a base dependency — no extra
+   install step needed. The daemon writes the entry itself (via the
+   options page or `PATCH /config`), and the creator of a Keychain item is
+   automatically added to its own trusted-app ACL, so the same daemon
+   binary reads it back later with zero prompts — including after
+   `uv tool install --force` (the venv is rebuilt, but the `keyring` code
+   and the underlying macOS binary it talks to don't change). The key is
+   resolved once per process start, not per request. To set it by hand:
    ```bash
    security add-generic-password -s tldr-daemon -a openai -w '<your-api-key>'   # macOS
    ```
@@ -215,11 +226,14 @@ Four ways to give the daemon a key, in priority order (first match wins):
    api_key_keychain: tldr-daemon
    api_key_keychain_account: openai
    ```
-   Note: `uv tool install --force` rebuilds the daemon binary, so macOS will
-   ask you to re-approve Keychain access again the first time it runs after
-   an upgrade — that's expected, not a bug.
-3. **`api_key_file`** (recommended for real cloud keys) — a path (`~`
-   expands) to a file holding just the key, locked to `0600`:
+   On Linux this needs a working Secret Service (GNOME Keyring / KWallet)
+   running in your session — `GET /config`'s `keychain_available` reports
+   whether one was found, and the options page falls back to File
+   automatically when it wasn't.
+3. **`api_key_file`** — a path (`~` expands) to a file holding just the
+   key, locked to `0600`. This is the right choice for Docker installs
+   (no macOS Keychain, no Secret Service inside the container) and for
+   anyone who just prefers a file:
    ```bash
    install -m 600 /dev/null ~/.config/tldr/openai.key
    printf '%s' 'sk-...' > ~/.config/tldr/openai.key
@@ -386,11 +400,18 @@ credentials — reachability + a minimal completion — without saving). Partial
 still win over both); `tldr.yaml` itself is never rewritten, so its comments
 and backend examples stay intact. Both files are `0600`. `GET`/`PATCH`
 responses never include the API key itself — only `api_key_set` (bool),
-`api_key_hint` (last 4 chars), and `api_key_source` (`env` / `keychain` /
-`file` / `inline` / `none`). Picking `api_key_storage: file` (the default)
-or `keychain` via `PATCH` keeps the key out of both YAML files entirely.
-Changing `llm.max_concurrent_calls` needs a daemon restart to take effect —
-the response's `restart_required` flag says so.
+`api_key_hint` (last 4 chars), `api_key_source` (`env` / `keychain` /
+`file` / `inline` / `none`), and `keychain_available` (bool — whether a
+real, usable keychain backend was found). Picking `api_key_storage:
+keychain` (the default when `keychain_available` is true) or `file` (the
+default otherwise, and always the right choice for Docker) via `PATCH`
+keeps the key out of both YAML files entirely. After writing a key,
+`PATCH` reads it straight back through the same code path the daemon uses
+at call time and reports `api_key_verified` (bool) + `api_key_verify_error`
+(string or null) — a failed verification is reported, not rolled back, so
+you find out immediately instead of on the next LLM call. Changing
+`llm.max_concurrent_calls` needs a daemon restart to take effect — the
+response's `restart_required` flag says so.
 
 `tldr.yaml.example` has ready-made blocks for each backend combination:
 mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama, llama-server+whisper.cpp,

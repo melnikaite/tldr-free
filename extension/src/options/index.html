@@ -85,10 +85,12 @@
 
         <label for="llm-api-key-storage">Store key in</label>
         <select id="llm-api-key-storage">
-          <option value="file">File (recommended)</option>
-          <option value="keychain">OS keychain</option>
+          <option id="llm-api-key-storage-keychain-option" value="keychain">OS keychain (recommended)</option>
+          <option value="file">File (needed for Docker installs)</option>
           <option value="inline">Inline in config</option>
         </select>
+        <p id="llm-api-key-storage-hint" class="hint" hidden></p>
+        <p id="api-key-verify-result" class="hint"></p>
 
         <button id="test-connection" type="button">Test connection</button>
         <div id="test-result"></div>

@@ -250,6 +250,9 @@
  * @property {OutputConfigOut} output
  * @property {string} config_path      - absolute path to tldr.yaml (read-only template)
  * @property {string} overrides_path   - absolute path to tldr.local.yaml (PATCH target)
+ * @property {boolean} keychain_available - whether the OS keychain backend is actually
+ *   usable (real backend, not a null/fail one) — drives the default api_key_storage
+ *   choice on PATCH and whether the options page offers "OS keychain" at all.
  */
 
 /**
@@ -267,7 +270,9 @@
  * @property {number} [max_concurrent_calls]
  * @property {string | null} [reasoning_effort]
  * @property {string} [api_key]              - write-only; unset/empty = unchanged
- * @property {ApiKeyStorage} [api_key_storage]  - write-only; default "file"
+ * @property {ApiKeyStorage} [api_key_storage]  - write-only; default "keychain" when
+ *   the OS keychain backend is available (see ConfigResponse.keychain_available),
+ *   else "file"
  */
 
 /**
@@ -290,11 +295,24 @@
  */
 
 /**
- * Same shape as ConfigResponse plus `restart_required`: true when a change
- * (currently only `llm.max_concurrent_calls`) can't take effect on the
- * running process and needs a daemon restart.
+ * Same shape as ConfigResponse plus:
+ *   - `restart_required`: true when a change (currently only
+ *     `llm.max_concurrent_calls`) can't take effect on the running process
+ *     and needs a daemon restart.
+ *   - `api_key_verified` / `api_key_verify_error`: write-then-read-back
+ *     check whenever this PATCH (re)wrote the API key — the freshly-saved
+ *     config is read back the same way the daemon does at call time and
+ *     compared to what was saved. `api_key_verified` is true when this
+ *     PATCH didn't touch the key at all (nothing to verify) or the
+ *     read-back matched; `api_key_verify_error` is a redacted reason
+ *     string (never the key itself) when it's false, else null. A failed
+ *     verification does NOT roll back the save.
  *
- * @typedef {ConfigResponse & { restart_required: boolean }} ConfigPatchResponse
+ * @typedef {ConfigResponse & {
+ *   restart_required: boolean,
+ *   api_key_verified: boolean,
+ *   api_key_verify_error: string | null,
+ * }} ConfigPatchResponse
  */
 
 /**

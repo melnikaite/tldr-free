@@ -358,6 +358,12 @@ class ConfigResponse(BaseModel):
     output: OutputConfigOut
     config_path: str        # absolute path to tldr.yaml (read-only template)
     overrides_path: str     # absolute path to tldr.local.yaml (PATCH target)
+    # Whether the OS keychain backend is actually usable (a real backend,
+    # not keyring.backends.fail.Keyring) — not just whether the `keyring`
+    # package is importable. Drives the default api_key_storage choice on
+    # PATCH and the options-page UI (disable the keychain option + hint
+    # when false). See config.keychain_backend_available().
+    keychain_available: bool
 
 
 class LLMConfigPatch(BaseModel):
@@ -401,6 +407,16 @@ class ConfigPatchResponse(ConfigResponse):
     # effect on the running process — the asyncio.Semaphore it sizes is
     # bound to the live event loop and can't be resized in place.
     restart_required: bool
+    # Write-then-read-back check: whenever this PATCH (re)wrote the API
+    # key, it's read back via the exact accessor the daemon uses at call
+    # time (LLMConfig.effective_api_key) and compared to what was saved.
+    # True when this PATCH didn't touch the API key at all (nothing to
+    # verify) or when the read-back matched. A failed verification is
+    # reported here but never rolls back the save.
+    api_key_verified: bool
+    # Human-readable reason when api_key_verified is False. Never contains
+    # the API key value itself. None when api_key_verified is True.
+    api_key_verify_error: str | None = None
 
 
 class ConfigTestLLMOverrides(BaseModel):

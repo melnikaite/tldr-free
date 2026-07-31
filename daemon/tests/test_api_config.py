@@ -57,6 +57,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
     monkeypatch.setenv("TLDR_CONFIG", str(config_file))
     monkeypatch.setenv("TLDR_CONFIG_OVERRIDES", str(overrides_file))
     config_mod.get_config.cache_clear()
+    config_mod.keychain_backend_available.cache_clear()
     llm_client.reset_caches()
 
     db_path = tmp_path / "api.db"
@@ -106,6 +107,10 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
     broker_mod.reset_broker()
     control_mod.reset_control()
     config_mod.get_config.cache_clear()
+    # A test may have monkeypatched this to a plain lambda (no cache to
+    # clear) — guard rather than assume the lru_cache wrapper survived.
+    if hasattr(config_mod.keychain_backend_available, "cache_clear"):
+        config_mod.keychain_backend_available.cache_clear()
     llm_client.reset_caches()
 
 
@@ -153,6 +158,24 @@ def test_get_config_no_key_configured_reports_none(client: TestClient) -> None:
     assert body["llm"]["api_key_set"] is False
     assert body["llm"]["api_key_source"] == "none"
     assert body["llm"]["api_key_hint"] is None
+
+
+def test_get_config_reports_keychain_available_true(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: True)
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    assert r.json()["keychain_available"] is True
+
+
+def test_get_config_reports_keychain_available_false(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: False)
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    assert r.json()["keychain_available"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -270,21 +293,174 @@ def test_patch_api_key_storage_switch_preserves_user_owned_file(
     assert user_file.read_text() == "sk-user-owned"
 
 
-def test_patch_api_key_storage_keychain_without_keyring_returns_422(
+def test_patch_api_key_storage_keychain_unavailable_returns_422(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 'keyring' is an optional extra; force ImportError regardless of
-    # whether it happens to be installed in the dev venv (it's a dev/test
-    # dependency of other tests, not guaranteed absent here).
-    import sys
-
-    monkeypatch.setitem(sys.modules, "keyring", None)
+    # 'keyring' is now a base dependency (see pyproject.toml) — the 422 case
+    # to cover is a keyring package with no *usable backend* (e.g. headless
+    # Linux without a Secret Service in the session), not a missing package.
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: False)
 
     r = client.patch(
         "/config", json={"llm": {"api_key": "sk-x", "api_key_storage": "keychain"}}
     )
     assert r.status_code == 422, r.text
-    assert "keyring" in r.text.lower()
+    assert "keychain" in r.text.lower()
+    assert "sk-x" not in r.text
+
+
+def test_patch_keychain_write_failure_returns_422_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A usable backend (checked separately) doesn't guarantee the WRITE
+    succeeds — e.g. a stale keychain entry from a previous install with an
+    ACL that doesn't trust the current binary. That must surface as a
+    clean 422, not an unhandled 500 crashing the request."""
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: True)
+
+    import sys
+
+    def _raise_on_set(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("Can't store password on keychain: (-25244, 'Unknown Error')")
+
+    fake_keyring = type("FakeKeyring", (), {"set_password": staticmethod(_raise_on_set)})()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+
+    r = client.patch(
+        "/config",
+        json={"llm": {"api_key": "sk-write-fail-secret", "api_key_storage": "keychain"}},
+    )
+    assert r.status_code == 422, r.text
+    assert "sk-write-fail-secret" not in r.text
+    assert "keychain" in r.text.lower()
+
+
+def _fake_keyring_module(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]:
+    """Install an in-memory fake `keyring` module (mirrors the pattern in
+    test_config.py) and return its backing store for assertions."""
+    import sys
+
+    store: dict[tuple[str, str], str] = {}
+    fake_keyring = type(
+        "FakeKeyring",
+        (),
+        {
+            "set_password": staticmethod(
+                lambda service, account, password: store.__setitem__((service, account), password)
+            ),
+            "get_password": staticmethod(lambda service, account: store.get((service, account))),
+            "delete_password": staticmethod(
+                lambda service, account: store.pop((service, account), None)
+            ),
+        },
+    )()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    return store
+
+
+def test_patch_default_storage_is_keychain_when_available(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No `api_key_storage` given + keychain available → default to
+    'keychain', not the old hardcoded 'file' default."""
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: True)
+    _fake_keyring_module(monkeypatch)
+
+    r = client.patch("/config", json={"llm": {"api_key": "sk-auto-keychain"}})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["llm"]["api_key_source"] == "keychain"
+
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert "api_key_keychain" in overrides["llm"]
+    assert "api_key_file" not in overrides["llm"]
+    assert "sk-auto-keychain" not in r.text
+
+
+def test_patch_default_storage_is_file_when_keychain_unavailable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No `api_key_storage` given + keychain NOT available → falls back to
+    'file', same as before this change."""
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: False)
+
+    r = client.patch("/config", json={"llm": {"api_key": "sk-auto-file"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["llm"]["api_key_source"] == "file"
+
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert "api_key_file" in overrides["llm"]
+
+
+# ---------------------------------------------------------------------------
+# PATCH /config — api_key_verified / api_key_verify_error (write-then-read-back)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_api_key_verified_true_on_successful_save(client: TestClient) -> None:
+    r = client.patch(
+        "/config", json={"llm": {"api_key": "sk-verify-ok", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["api_key_verified"] is True
+    assert body["api_key_verify_error"] is None
+    assert "sk-verify-ok" not in r.text
+
+
+def test_patch_api_key_verified_true_when_key_not_touched(client: TestClient) -> None:
+    """A PATCH that doesn't write the API key at all has nothing to
+    verify — reported as verified rather than left ambiguous."""
+    r = client.patch("/config", json={"output": {"language": "de"}})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["api_key_verified"] is True
+    assert body["api_key_verify_error"] is None
+
+
+def test_patch_api_key_verified_false_when_readback_raises(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read-back uses the exact accessor the daemon uses at call time
+    (LLMConfig.effective_api_key) — if IT raises post-save, the save still
+    stands but the failure is reported honestly, not rolled back."""
+
+    def _boom(self: Any) -> str:
+        raise RuntimeError("simulated read-back failure")
+
+    monkeypatch.setattr(config_mod.LLMConfig, "effective_api_key", property(_boom))
+
+    r = client.patch(
+        "/config", json={"llm": {"api_key": "sk-verify-fail", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["api_key_verified"] is False
+    assert body["api_key_verify_error"]
+    assert "sk-verify-fail" not in r.text
+
+    # The save itself was NOT rolled back — GET still reports a key is set
+    # (the effective_api_key property is still stubbed to raise here, so
+    # the source can't be resolved, but the override was written).
+    assert client.get("/config").json()["llm"]["api_key_source"] == "file"
+
+
+def test_patch_api_key_verified_false_when_readback_mismatches(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        config_mod.LLMConfig, "effective_api_key", property(lambda self: "some-other-value")
+    )
+
+    r = client.patch(
+        "/config", json={"llm": {"api_key": "sk-mismatch", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["api_key_verified"] is False
+    assert body["api_key_verify_error"]
+    assert "sk-mismatch" not in r.text
+    assert "some-other-value" not in r.text
 
 
 def test_patch_malformed_field_type_returns_422_and_no_file_written(
