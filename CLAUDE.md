@@ -82,3 +82,43 @@ reload icon in `chrome://extensions`. Full matrix in
    `event-stream.js` to react to daemon state without polling.
 5. Always: `task test` before considering it done. Update the relevant
    `.claude/*.md` if you changed an invariant.
+
+## Delegation
+
+The main session is the orchestrator: it plans, reviews, and answers questions.
+Delegate implementation to the `worker` agent using these rules:
+
+- **Confirm scope before implementing anything.** If it's ambiguous whether
+  the user wants analysis/a plan or actual code changes — or they explicitly
+  asked to "look into," "analyze," "think about," or "plan" something —
+  default to analysis-only: present findings/a plan and stop. Never let "this
+  looks easy" justify skipping that check; easy-looking tasks are exactly the
+  ones that slip through unnoticed and burn tokens on unrequested work.
+- **Do it yourself (no delegation) only if BOTH hold:** the edit touches 1–2
+  files in a precisely known location, AND you're confident the current
+  session's model is not pricier than the worker's fixed model. Don't just
+  assume this — the system prompt states which model is running the
+  session, but its price relative to the worker's fixed model may not be
+  reliably known to you (pricing changes, model lineups change); when that
+  comparison is uncertain, delegate rather than guess. If the orchestrator
+  IS running on a more expensive tier than the worker, delegate even a
+  small edit — the worker's fixed (cheaper) model doing the work costs less
+  than the pricier orchestrator doing it directly, so "pure overhead" no
+  longer holds. This matters most right when the user has deliberately
+  switched the main session to a cheap/fast model for cost control — doing
+  the work in-session instead of delegating defeats that choice.
+- **Send a follow-up task to a live worker (SendMessage):** the next task
+  touches the same code the worker just worked on, and no more than a couple
+  of minutes have passed.
+- **Spawn a new worker:** the topic/subsystem changed, the previous agent
+  already completed a large task (its context is bloated), or the tasks are
+  independent — in that case spawn several new workers in parallel.
+- **Dispatch independent workers in one message, not one at a time.** When a
+  batch's Agent calls have no data dependency between them, send them
+  together (multiple tool uses in a single message) even if you plan to
+  review each one's diff before deciding the next step — reviewing
+  sequentially doesn't require launching sequentially. Conflating "I'll
+  check this before moving on" with "so I'll launch them one at a time"
+  silently serializes work that could run concurrently.
+
+After delegating, always review the resulting diff yourself.
