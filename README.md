@@ -137,6 +137,43 @@ cloud backends further down.
 well — same daemon, same pipeline, no code changes. Ready-made blocks for
 the usual suspects are in `config/tldr.yaml.example`; here's the gist:
 
+Where to get the URL and the key (checked 2026-07-31 — providers do move
+these, so treat the links as the starting point, not gospel):
+
+| Provider | `llm.base_url` | Get a key at | Key looks like |
+|---|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | `sk-…` |
+| Anthropic | `https://api.anthropic.com/v1/` | [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys) | `sk-ant-api03-…` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | — |
+| OpenRouter | `https://openrouter.ai/api/v1` | [openrouter.ai/keys](https://openrouter.ai/keys) | `sk-or-v1-…` |
+| Groq | `https://api.groq.com/openai/v1` | [console.groq.com/keys](https://console.groq.com/keys) | `gsk_…` |
+| DeepSeek | `https://api.deepseek.com` | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | — |
+| Mistral | `https://api.mistral.ai/v1` | [console.mistral.ai](https://console.mistral.ai) | — |
+| Together AI | `https://api.together.ai/v1` | [api.together.ai settings → API keys](https://api.together.ai/settings/projects/~current/api-keys) | — |
+| Fireworks AI | `https://api.fireworks.ai/inference/v1` | [app.fireworks.ai → API keys](https://app.fireworks.ai/settings/users/api-keys) | — |
+| xAI (Grok) | `https://api.x.ai/v1` | [console.x.ai → API keys](https://console.x.ai/team/default/api-keys) | — |
+
+The trailing slash on the Gemini URL is **not** optional. `—` means the
+provider doesn't document a fixed key prefix; don't treat a differently
+shaped key as wrong.
+
+Two provider quirks worth knowing before you debug something that looks
+like our bug:
+
+- **Anthropic's compatibility layer** doesn't document `GET /models`, which
+  is what `/health` probes — the daemon may report the backend as
+  unreachable while summaries work fine. It also ignores `reasoning_effort`.
+- **Gemini's compatibility layer** documents `tool_choice` only as `auto`.
+  Q&A's planning step forces one specific tool, so if that isn't honoured
+  the plan step falls back to searching the web (which is the safe
+  direction, but it means more searches than strictly needed).
+
+**Azure OpenAI** needs the newer v1 endpoint —
+`https://{resource}.openai.azure.com/openai/v1/` — because the classic
+`/openai/deployments/{deployment}/…?api-version=…` shape doesn't fit
+`base_url` + `model` + a bearer token. With the v1 path, `model` is the
+*deployment* name.
+
 **OpenAI**
 ```yaml
 llm:
@@ -202,11 +239,19 @@ extension is how you use it at all), so a headless daemon — no logged-in
 user at the console — isn't a supported scenario. That makes the OS
 keychain the natural default: it's already there whenever the daemon runs.
 
+This applies **independently** to `llm.*` and `whisper.*` — either section
+can point at a cloud backend and store its own key with its own choice of
+mechanism (e.g. LLM via keychain, Whisper inline, or any other combination).
+The two never share storage: separate keychain service
+(`tldr-daemon-llm` / `tldr-daemon-whisper`), separate key file (`llm.key` /
+`whisper.key`), separate env var.
+
 Four ways to give the daemon a key, in priority order (first match wins):
 
-1. **`TLDR__LLM__API_KEY` environment variable** — overrides everything
-   below. Convenient for Docker/foreground runs and CI, or when the key
-   already lives in your service's environment.
+1. **`TLDR__LLM__API_KEY` / `TLDR__WHISPER__API_KEY` environment
+   variable** — overrides everything below, for that section only.
+   Convenient for Docker/foreground runs and CI, or when the key already
+   lives in your service's environment.
 2. **OS keychain** (recommended, and the default the options page and
    `PATCH /config` pick when available) — `api_key_keychain` (service name)
    + `api_key_keychain_account` (account name), backed by macOS Keychain or
@@ -219,12 +264,17 @@ Four ways to give the daemon a key, in priority order (first match wins):
    and the underlying macOS binary it talks to don't change). The key is
    resolved once per process start, not per request. To set it by hand:
    ```bash
-   security add-generic-password -s tldr-daemon -a openai -w '<your-api-key>'   # macOS
+   security add-generic-password -s tldr-daemon-llm -a openai -w '<your-api-key>'      # macOS, LLM
+   security add-generic-password -s tldr-daemon-whisper -a openai -w '<your-api-key>'  # macOS, Whisper
    ```
    — then reference it:
    ```yaml
-   api_key_keychain: tldr-daemon
-   api_key_keychain_account: openai
+   llm:
+     api_key_keychain: tldr-daemon-llm
+     api_key_keychain_account: openai
+   whisper:
+     api_key_keychain: tldr-daemon-whisper
+     api_key_keychain_account: openai
    ```
    On Linux this needs a working Secret Service (GNOME Keyring / KWallet)
    running in your session — `GET /config`'s `keychain_available` reports
@@ -238,15 +288,18 @@ Four ways to give the daemon a key, in priority order (first match wins):
    install -m 600 /dev/null ~/.config/tldr/openai.key
    printf '%s' 'sk-...' > ~/.config/tldr/openai.key
    ```
-   (or `umask 077` before creating the file by hand.)
+   (or `umask 077` before creating the file by hand.) Point both
+   `llm.api_key_file` and `whisper.api_key_file` at the same file if
+   they share one provider key, or use two separate files.
 4. **`api_key`** inline in `tldr.yaml` — fine for local backends that ignore
    the value (`ollama`, `dummy`, `lm-studio`, …). Avoid it for real cloud
    keys: `tldr.yaml` is created `0600`, but a plaintext key in a config file
    you might `cat`, screen-share, or back up is still a plaintext key.
 
 For systemd (native Linux install), an alternative to all of the above is an
-`EnvironmentFile` on the `tldr-daemon` unit setting `TLDR__LLM__API_KEY`,
-kept outside the repo with its own restrictive permissions.
+`EnvironmentFile` on the `tldr-daemon` unit setting `TLDR__LLM__API_KEY` /
+`TLDR__WHISPER__API_KEY`, kept outside the repo with its own restrictive
+permissions.
 
 #### Privacy and cost, with a cloud backend
 
@@ -268,7 +321,43 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 | **mlx-openai-server** | macOS Apple Silicon | Already included if you use it for LLM |
 | [**faster-whisper-server**](https://github.com/fedirz/faster-whisper-server) | Any OS, CPU / GPU | `docker run -p 8000:8000 fedirz/faster-whisper-server` |
 | [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
-| **OpenAI Whisper API** | Cloud | `base_url: https://api.openai.com/v1`, `model: whisper-1` — pay-per-minute |
+| **Cloud** | — | See the short list below — *most* LLM providers have no transcription API at all |
+
+Like the LLM backend, `whisper.base_url` can point at a cloud provider —
+`whisper.api_key` supports the exact same three storage mechanisms
+(environment variable, OS keychain, file) as `llm.api_key`, fully
+independent of it; see [API key storage](#api-key-storage).
+
+#### Cloud transcription — who actually offers it
+
+This is the part that trips people up: a provider selling you a great chat
+model very often has **no audio endpoint whatsoever**. We need
+`POST {base_url}/audio/transcriptions` to accept a multipart `file` and
+return `verbose_json` **with segments** — without segments the transcript
+has no timecodes, so clicking a `[MM:SS]` in the summary can't seek
+anywhere. Checked 2026-07-31:
+
+| Provider | `whisper.base_url` | `whisper.model` | Notes |
+|---|---|---|---|
+| **OpenAI** | `https://api.openai.com/v1` | `whisper-1` | Use `whisper-1`. The newer `gpt-4o-transcribe` / `gpt-4o-mini-transcribe` document only `json` — **timecodes silently disappear** |
+| **Groq** | `https://api.groq.com/openai/v1` | `whisper-large-v3-turbo` or `whisper-large-v3` | Segment and word granularities both supported; cheap and fast |
+| **Together AI** | `https://api.together.ai/v1` | `openai/whisper-large-v3` | `verbose_json` returns segments with start/end |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | e.g. `openai/whisper-large-v3` | Works only while it routes to one of the three above — its docs say other providers reject `verbose_json` with a 400 |
+
+**No transcription endpoint** (fine for `llm.*`, unusable for `whisper.*`):
+Anthropic, Google Gemini, DeepSeek. Two special cases: **Fireworks AI**
+deprecated audio inference in June 2026, and **xAI** does have speech-to-text
+but at `/v1/stt`, not the OpenAI-compatible path, so our client can't reach
+it.
+
+Unverified, so try before you rely on it: **Mistral** exposes
+`/v1/audio/transcriptions` (`voxtral-mini-latest`) but doesn't document
+`response_format`, so our `verbose_json` request may be rejected or ignored;
+**Azure OpenAI** documents transcription only for its dated API versions, so
+whether it works through the v1 path above is untested here.
+
+Cloud transcription is billed per minute of audio, and a long podcast is a
+lot of minutes — local Whisper stays free.
 
 ### Install — native, no Docker (recommended)
 
@@ -389,29 +478,37 @@ the `context_length` field in `~/.mlx-server/config.yaml` (mlx-server).
 at ~60–70% of `context_length` to leave room for the system prompt and output.
 
 **Editing settings from the extension** (backend/model/API key/output
-language) is also possible without touching YAML by hand: open it via
-`chrome://extensions` → TLDR → Details → Extension options (or right-click
-the toolbar icon → Options). The page's **Test connection** button is what
-answers "is my key even valid?" — it calls `POST /config/test` below. The
-daemon exposes `GET /config`, `PATCH /config`, and `POST /config/test` (probes
-credentials — reachability + a minimal completion — without saving). Partial
-`PATCH` writes land in `tldr.local.yaml`, a second file created next to
-`tldr.yaml` and deep-merged on top of it at load time (env var overrides
-still win over both); `tldr.yaml` itself is never rewritten, so its comments
-and backend examples stay intact. Both files are `0600`. `GET`/`PATCH`
-responses never include the API key itself — only `api_key_set` (bool),
-`api_key_hint` (last 4 chars), `api_key_source` (`env` / `keychain` /
-`file` / `inline` / `none`), and `keychain_available` (bool — whether a
-real, usable keychain backend was found). Picking `api_key_storage:
+language, for both LLM and Whisper) is also possible without touching YAML
+by hand: open it via `chrome://extensions` → TLDR → Details → Extension
+options (or right-click the toolbar icon → Options). Each backend section
+has its own **Test connection** button, answering "is my key even valid?"
+for that section — it calls `POST /config/test` below with
+`target: "llm"` or `target: "whisper"` (`target` defaults to `"llm"` when
+omitted, so older callers keep working unchanged). The daemon exposes
+`GET /config`, `PATCH /config`, and `POST /config/test` (probes credentials
+without saving — LLM gets reachability + a minimal completion; Whisper
+gets reachability only, since a real transcription probe would need an
+audio file). Partial `PATCH` writes land in `tldr.local.yaml`, a second
+file created next to `tldr.yaml` and deep-merged on top of it at load time
+(env var overrides still win over both); `tldr.yaml` itself is never
+rewritten, so its comments and backend examples stay intact. Both files
+are `0600`. `GET`/`PATCH` responses never include either API key itself —
+only, per section, `api_key_set` (bool), `api_key_hint` (last 4 chars),
+`api_key_source` (`env` / `keychain` / `file` / `inline` / `none`), plus a
+top-level `keychain_available` (bool — whether a real, usable keychain
+backend was found, shared by both sections). Picking `api_key_storage:
 keychain` (the default when `keychain_available` is true) or `file` (the
 default otherwise, and always the right choice for Docker) via `PATCH`
-keeps the key out of both YAML files entirely. After writing a key,
-`PATCH` reads it straight back through the same code path the daemon uses
-at call time and reports `api_key_verified` (bool) + `api_key_verify_error`
-(string or null) — a failed verification is reported, not rolled back, so
-you find out immediately instead of on the next LLM call. Changing
-`llm.max_concurrent_calls` needs a daemon restart to take effect — the
-response's `restart_required` flag says so.
+keeps the key out of both YAML files entirely — independently for `llm`
+and `whisper`, each with its own keychain entry and key file, so patching
+one never touches the other's storage. After writing a key, `PATCH` reads
+it straight back through the same code path the daemon uses at call time
+and reports `api_key_verified` (bool) + `api_key_verify_error` (string or
+null) for `llm`, and `whisper_api_key_verified` /
+`whisper_api_key_verify_error` for `whisper` — a failed verification is
+reported, not rolled back, so you find out immediately instead of on the
+next LLM/Whisper call. Changing `llm.max_concurrent_calls` needs a daemon
+restart to take effect — the response's `restart_required` flag says so.
 
 `tldr.yaml.example` has ready-made blocks for each backend combination:
 mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama, llama-server+whisper.cpp,

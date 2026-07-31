@@ -201,7 +201,7 @@ whisper:
 #
 # whisper:
 #   base_url: https://api.openai.com/v1
-#   api_key_file: ~/.config/tldr/openai.key
+#   api_key_file: ~/.config/tldr/openai.key          # or: api_key_keychain: tldr-daemon-whisper / api_key_keychain_account: openai
 #   model: whisper-1                                  # pay-per-minute; local Whisper is free
 
 # ---------------------------------------------------------------------------
@@ -274,3 +274,34 @@ workers:
 
 logging:
   level: INFO
+
+# ---------------------------------------------------------------------------
+# Cloud providers — where the URLs and keys come from
+# ---------------------------------------------------------------------------
+# Text (llm.base_url) + the page that issues the key:
+#   OpenAI         https://api.openai.com/v1                                platform.openai.com/api-keys
+#   Anthropic      https://api.anthropic.com/v1/                            platform.claude.com/settings/keys
+#   Google Gemini  https://generativelanguage.googleapis.com/v1beta/openai/ aistudio.google.com/apikey
+#   OpenRouter     https://openrouter.ai/api/v1                             openrouter.ai/keys
+#   Groq           https://api.groq.com/openai/v1                           console.groq.com/keys
+#   DeepSeek       https://api.deepseek.com                                 platform.deepseek.com/api_keys
+#   Mistral        https://api.mistral.ai/v1                                console.mistral.ai
+#   Together AI    https://api.together.ai/v1                               api.together.ai settings -> API keys
+#   Fireworks AI   https://api.fireworks.ai/inference/v1                    app.fireworks.ai -> API keys
+#   xAI (Grok)     https://api.x.ai/v1                                      console.x.ai -> API keys
+# The trailing slash on the Gemini URL is required. Azure OpenAI needs its
+# newer v1 endpoint (https://{resource}.openai.azure.com/openai/v1/) and
+# takes the DEPLOYMENT name in `model`.
+#
+# Audio (whisper.base_url) — far fewer providers have one at all. We need
+# POST {base_url}/audio/transcriptions to return verbose_json WITH segments,
+# otherwise transcripts carry no timecodes:
+#   OpenAI         model: whisper-1                 (gpt-4o-transcribe has no segments!)
+#   Groq           model: whisper-large-v3-turbo    (or whisper-large-v3)
+#   Together AI    model: openai/whisper-large-v3
+#   OpenRouter     only while it routes to one of the three above
+# NO transcription endpoint: Anthropic, Google Gemini, DeepSeek. Fireworks
+# deprecated audio in June 2026; xAI has STT but at /v1/stt, which our
+# OpenAI-compatible client cannot reach. Mistral and Azure are untested.
+# Cloud transcription is billed per minute of audio; local Whisper is free.
+# Checked 2026-07-31 — providers move these, so verify if something 404s.
