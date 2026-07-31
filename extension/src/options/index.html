@@ -4,22 +4,130 @@
     <meta charset="UTF-8" />
     <title>TLDR — Options</title>
     <style>
-      body { font-family: system-ui, sans-serif; padding: 1.5rem 2rem; max-width: 600px; }
+      body {
+        font-family: system-ui, sans-serif;
+        padding: 1.5rem 2rem;
+        max-width: 640px;
+      }
+      h1 { margin-top: 0; }
+      h2 { margin-bottom: 0.25rem; font-size: 1.05rem; }
+      section {
+        margin: 1.5rem 0;
+        padding-bottom: 1.25rem;
+        border-bottom: 1px solid #e0e0e0;
+      }
+      section:last-of-type { border-bottom: none; }
       label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
-      input { width: 100%; padding: 0.5rem; font: inherit; }
-      button { margin-top: 1.5rem; padding: 0.5rem 1rem; }
+      input, select { width: 100%; padding: 0.5rem; font: inherit; box-sizing: border-box; }
+      input:disabled, select:disabled, button:disabled { opacity: 0.6; cursor: not-allowed; }
+      button { margin-top: 1rem; padding: 0.5rem 1rem; font: inherit; }
+      fieldset { border: none; margin: 0; padding: 0; }
+      .hint { margin: 0.25rem 0 0; font-size: 0.85rem; color: #5f6368; }
       .ok { color: #137333; }
       .err { color: #c5221f; }
+      .notice {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        background: #fef7e0;
+        border: 1px solid #f2c94c;
+        font-size: 0.9rem;
+      }
+      .notice.err {
+        background: #fce8e6;
+        border-color: #f28b82;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #f8f9fa;
+        border: 1px solid #dadce0;
+        border-radius: 4px;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.85rem;
+        margin: 0.5rem 0;
+      }
+      #test-result { margin-top: 0.5rem; }
+      #test-result ul { margin: 0.25rem 0 0; padding-left: 1.25rem; }
+      details summary { cursor: pointer; }
     </style>
   </head>
   <body>
     <h1>TLDR — Options</h1>
 
-    <label for="daemon-url">Daemon URL</label>
-    <input id="daemon-url" type="url" placeholder="http://127.0.0.1:8765" />
+    <div id="config-unavailable" class="notice err" hidden></div>
 
-    <button id="save">Save</button>
-    <span id="status"></span>
+    <fieldset id="settings-fieldset" disabled>
+      <section>
+        <h2>LLM backend</h2>
+
+        <label for="llm-base-url">Base URL</label>
+        <input id="llm-base-url" type="url" placeholder="http://127.0.0.1:1240/v1" />
+
+        <label for="llm-model">Model</label>
+        <input id="llm-model" type="text" placeholder="gemma-4-e4b-it-qat-q4_0" />
+
+        <label for="llm-context-length">Context length (tokens)</label>
+        <input id="llm-context-length" type="number" min="1" step="1" />
+
+        <label for="llm-single-pass-limit">Single-pass token limit</label>
+        <input id="llm-single-pass-limit" type="number" min="1" step="1" />
+
+        <label for="llm-max-concurrent">Max concurrent calls</label>
+        <input id="llm-max-concurrent" type="number" min="1" step="1" />
+
+        <label for="llm-reasoning-effort">Reasoning effort</label>
+        <input id="llm-reasoning-effort" type="text" placeholder="e.g. low, none — leave empty for null" />
+
+        <label for="llm-api-key">API key</label>
+        <input id="llm-api-key" type="password" autocomplete="off" placeholder="no API key set" />
+        <p id="llm-api-key-source" class="hint"></p>
+
+        <label for="llm-api-key-storage">Store key in</label>
+        <select id="llm-api-key-storage">
+          <option value="file">File (recommended)</option>
+          <option value="keychain">OS keychain</option>
+          <option value="inline">Inline in config</option>
+        </select>
+
+        <button id="test-connection" type="button">Test connection</button>
+        <div id="test-result"></div>
+      </section>
+
+      <section>
+        <h2>Whisper backend</h2>
+
+        <label for="whisper-base-url">Base URL</label>
+        <input id="whisper-base-url" type="url" placeholder="http://127.0.0.1:1240/v1" />
+
+        <label for="whisper-model">Model</label>
+        <input id="whisper-model" type="text" placeholder="whisper-large-q5_0" />
+
+        <label for="whisper-max-upload">Max upload size (MB)</label>
+        <input id="whisper-max-upload" type="number" min="1" step="1" />
+      </section>
+
+      <section>
+        <h2>Output</h2>
+
+        <label for="output-language">Language</label>
+        <input id="output-language" type="text" placeholder="en, auto, …" />
+      </section>
+
+      <button id="save-settings" type="button">Save settings</button>
+      <span id="settings-status"></span>
+      <div id="restart-notice" class="notice" hidden></div>
+    </fieldset>
+
+    <section>
+      <h2>Daemon</h2>
+
+      <label for="daemon-url">Daemon URL</label>
+      <input id="daemon-url" type="url" placeholder="http://127.0.0.1:8765" />
+
+      <button id="save-daemon">Save</button>
+      <span id="daemon-status"></span>
+    </section>
 
     <script type="module" src="./options.js"></script>
   </body>
