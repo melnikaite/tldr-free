@@ -133,9 +133,14 @@ cloud backends further down.
 
 ### Cloud backends (optional)
 
-`llm.base_url` can point at any OpenAI-compatible **cloud** endpoint just as
-well — same daemon, same pipeline, no code changes. Ready-made blocks for
-the usual suspects are in `config/tldr.yaml.example`; here's the gist:
+Local is the default and needs no API key at all. If you'd rather point
+TLDR at a hosted model, any OpenAI-compatible endpoint works — same
+daemon, same pipeline, no code changes. Ready-made config blocks for the
+usual providers are in `config/tldr.yaml.example`, and the settings page
+in the extension can set all of this without touching YAML.
+
+<details>
+<summary><strong>Provider URLs, where to get a key, key storage, and cost</strong></summary>
 
 Where to get the URL and the key (checked 2026-07-31 — providers do move
 these, so treat the links as the starting point, not gospel):
@@ -311,6 +316,8 @@ Cloud inference is billed by the provider per token, and cloud Whisper
 transcription (e.g. OpenAI's `whisper-1`) is billed per minute — both are
 the provider's cost, not TLDR's.
 
+</details>
+
 ### Whisper backend (optional — only for YouTube without captions)
 
 Required only when `youtube-transcript-api` and yt-dlp captions both fail.
@@ -328,7 +335,8 @@ Like the LLM backend, `whisper.base_url` can point at a cloud provider —
 (environment variable, OS keychain, file) as `llm.api_key`, fully
 independent of it; see [API key storage](#api-key-storage).
 
-#### Cloud transcription — who actually offers it
+<details>
+<summary><strong>Cloud transcription — who actually offers it</strong> (most LLM providers have no audio API at all)</summary>
 
 This is the part that trips people up: a provider selling you a great chat
 model very often has **no audio endpoint whatsoever**. We need
@@ -358,6 +366,8 @@ whether it works through the v1 path above is untested here.
 
 Cloud transcription is billed per minute of audio, and a long podcast is a
 lot of minutes — local Whisper stays free.
+
+</details>
 
 ### Install — native, no Docker (recommended)
 
