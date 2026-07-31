@@ -230,12 +230,12 @@ export const daemon = {
 
   /**
    * Fetch the daemon's current configuration: LLM backend, Whisper
-   * backend, output language, and config file paths. The API key itself
-   * is never returned — only `api_key_set` (bool), `api_key_hint` (last
-   * 4 chars or null), and `api_key_source` (`"env" | "keychain" | "file"
-   * | "inline" | "none"`). May 404 on an older daemon that predates this
-   * endpoint — callers (options page) should treat that the same as a
-   * network failure.
+   * backend, output language, and config file paths. Neither API key is
+   * ever returned — only `api_key_set` (bool), `api_key_hint` (last 4
+   * chars or null), and `api_key_source` (`"env" | "keychain" | "file"
+   * | "inline" | "none"`), reported independently for `llm` and `whisper`.
+   * May 404 on an older daemon that predates this endpoint — callers
+   * (options page) should treat that the same as a network failure.
    *
    * Shape (subset):
    * ```
@@ -243,7 +243,8 @@ export const daemon = {
    *   llm: { base_url, model, context_length, single_pass_token_limit,
    *          max_concurrent_calls, reasoning_effort, api_key_set,
    *          api_key_hint, api_key_source },
-   *   whisper: { base_url, model, max_upload_mb },
+   *   whisper: { base_url, model, max_upload_mb, api_key_set,
+   *              api_key_hint, api_key_source },
    *   output: { language },
    *   config_path, overrides_path
    * }
@@ -256,18 +257,21 @@ export const daemon = {
   /**
    * Partially update the daemon configuration — send only the fields
    * that changed, nested under `llm` / `whisper` / `output` as returned
-   * by `getConfig()`. Two additional write-only fields under `llm`:
+   * by `getConfig()`. Two additional write-only fields under EACH of
+   * `llm` and `whisper` (fully independent per section):
    *   - `api_key` — the raw new key string. Only send this when the user
    *     typed a new key; omit entirely to leave the stored key untouched
    *     (an empty string is NOT a valid way to say "no change").
    *   - `api_key_storage` — one of `"file" | "keychain" | "inline"`,
-   *     defaults to `"file"`.
+   *     defaults to `"keychain"` when available, else `"file"`.
    * A 422 response carries a `detail` field describing the validation
    * error (mirrored in the thrown Error's message by the `request()`
    * helper).
    *
    * @param {object} patch
-   * @returns {Promise<object>} same shape as getConfig() plus `restart_required: boolean`
+   * @returns {Promise<object>} same shape as getConfig() plus `restart_required`,
+   *   `api_key_verified`/`api_key_verify_error` (llm),
+   *   `whisper_api_key_verified`/`whisper_api_key_verify_error` (whisper)
    */
   updateConfig: (patch) =>
     request("/config", {
@@ -276,11 +280,12 @@ export const daemon = {
     }),
 
   /**
-   * Validate LLM credentials/backend without saving anything. Pass
-   * overrides to test values not yet persisted, e.g.
-   * `{ llm: { base_url, model, api_key } }`; an empty/omitted body tests
-   * the currently saved config instead. Always resolves with HTTP 200,
-   * even when the test itself failed — check `ok`.
+   * Validate LLM or Whisper credentials/backend without saving anything.
+   * Pass `{ target: "whisper", whisper: { base_url, model, api_key } }` to
+   * probe Whisper instead of the default `llm` target (only the
+   * reachability step runs for Whisper — no completion-call equivalent).
+   * Omitting `target`/`llm` tests the currently saved llm config. Always
+   * resolves with HTTP 200, even when the test itself failed — check `ok`.
    *
    * @param {object} [overrides]
    * @returns {Promise<{

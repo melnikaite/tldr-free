@@ -47,8 +47,8 @@
         font-size: 0.85rem;
         margin: 0.5rem 0;
       }
-      #test-result { margin-top: 0.5rem; }
-      #test-result ul { margin: 0.25rem 0 0; padding-left: 1.25rem; }
+      #test-result, #whisper-test-result { margin-top: 0.5rem; }
+      #test-result ul, #whisper-test-result ul { margin: 0.25rem 0 0; padding-left: 1.25rem; }
       details summary { cursor: pointer; }
     </style>
   </head>
@@ -107,6 +107,22 @@
 
         <label for="whisper-max-upload">Max upload size (MB)</label>
         <input id="whisper-max-upload" type="number" min="1" step="1" />
+
+        <label for="whisper-api-key">API key</label>
+        <input id="whisper-api-key" type="password" autocomplete="off" placeholder="no API key set" />
+        <p id="whisper-api-key-source" class="hint"></p>
+
+        <label for="whisper-api-key-storage">Store key in</label>
+        <select id="whisper-api-key-storage">
+          <option id="whisper-api-key-storage-keychain-option" value="keychain">OS keychain (recommended)</option>
+          <option value="file">File (needed for Docker installs)</option>
+          <option value="inline">Inline in config</option>
+        </select>
+        <p id="whisper-api-key-storage-hint" class="hint" hidden></p>
+        <p id="whisper-api-key-verify-result" class="hint"></p>
+
+        <button id="whisper-test-connection" type="button">Test connection</button>
+        <div id="whisper-test-result"></div>
       </section>
 
       <section>

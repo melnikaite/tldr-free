@@ -1,9 +1,10 @@
-"""``LLMConfig.effective_api_key`` resolution + ``ensure_config_file`` perms.
+"""``effective_api_key`` resolution (shared by ``LLMConfig`` and
+``WhisperConfig`` via ``_ApiKeyConfigMixin``) + ``ensure_config_file`` perms.
 
 Priority order under test: env var > keychain > file > inline. Each source
-is exercised in isolation via freshly-constructed ``LLMConfig`` instances
-(not the process-wide cached ``get_config()`` singleton) so tests don't leak
-state into each other.
+is exercised in isolation via freshly-constructed ``LLMConfig``/``WhisperConfig``
+instances (not the process-wide cached ``get_config()`` singleton) so tests
+don't leak state into each other.
 """
 
 from __future__ import annotations
@@ -16,11 +17,15 @@ from typing import Any
 
 import pytest
 
-from src.config import LLMConfig, ensure_config_file, keychain_backend_available
+from src.config import LLMConfig, WhisperConfig, ensure_config_file, keychain_backend_available
 
 
 def _cfg(**overrides: Any) -> LLMConfig:
     return LLMConfig(base_url="http://localhost:1234/v1", model="test-model", **overrides)
+
+
+def _whisper_cfg(**overrides: Any) -> WhisperConfig:
+    return WhisperConfig(base_url="http://localhost:1234/v1", **overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +95,99 @@ def test_env_beats_everything(
         api_key_keychain="tldr-llm",
     )
     assert cfg.effective_api_key == "env-secret"
+
+
+# ---------------------------------------------------------------------------
+# Shared mixin: WhisperConfig gets the exact same resolution as LLMConfig,
+# but reads its OWN env var and produces section-appropriate messages.
+# ---------------------------------------------------------------------------
+
+
+def test_whisper_inline_api_key_is_the_fallback() -> None:
+    cfg = _whisper_cfg(api_key="inline-secret")
+    assert cfg.effective_api_key == "inline-secret"
+
+
+def test_whisper_file_beats_inline(tmp_path: Path) -> None:
+    key_file = tmp_path / "key.txt"
+    key_file.write_text("file-secret\n")
+    key_file.chmod(0o600)
+    cfg = _whisper_cfg(api_key="inline-secret", api_key_file=str(key_file))
+    assert cfg.effective_api_key == "file-secret"
+
+
+def test_whisper_keychain_beats_file_and_inline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key_file = tmp_path / "key.txt"
+    key_file.write_text("file-secret")
+    key_file.chmod(0o600)
+
+    fake_keyring = type(
+        "FakeKeyring",
+        (),
+        {"get_password": staticmethod(lambda service, account: f"keychain:{service}:{account}")},
+    )()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+
+    cfg = _whisper_cfg(
+        api_key="inline-secret",
+        api_key_file=str(key_file),
+        api_key_keychain="tldr-whisper",
+        api_key_keychain_account="default",
+    )
+    assert cfg.effective_api_key == "keychain:tldr-whisper:default"
+
+
+def test_whisper_env_beats_everything(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key_file = tmp_path / "key.txt"
+    key_file.write_text("file-secret")
+    key_file.chmod(0o600)
+
+    fake_keyring = type(
+        "FakeKeyring", (), {"get_password": staticmethod(lambda *_: "keychain-secret")}
+    )()
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    monkeypatch.setenv("TLDR__WHISPER__API_KEY", "env-secret")
+
+    cfg = _whisper_cfg(
+        api_key="inline-secret",
+        api_key_file=str(key_file),
+        api_key_keychain="tldr-whisper",
+    )
+    assert cfg.effective_api_key == "env-secret"
+
+
+def test_whisper_missing_api_key_file_raises_with_whisper_prefix(tmp_path: Path) -> None:
+    cfg = _whisper_cfg(api_key_file=str(tmp_path / "does-not-exist.txt"))
+    with pytest.raises(RuntimeError, match="whisper.api_key_file"):
+        _ = cfg.effective_api_key
+
+
+def test_whisper_missing_keyring_module_raises_with_whisper_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "keyring", None)
+    cfg = _whisper_cfg(api_key_keychain="tldr-whisper")
+    with pytest.raises(RuntimeError, match="whisper.api_key_keychain"):
+        _ = cfg.effective_api_key
+
+
+def test_llm_env_var_does_not_leak_into_whisper_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting only TLDR__LLM__API_KEY must never affect WhisperConfig's
+    resolution — each section reads its own env var."""
+    monkeypatch.setenv("TLDR__LLM__API_KEY", "llm-env-secret")
+    cfg = _whisper_cfg(api_key="whisper-inline")
+    assert cfg.effective_api_key == "whisper-inline"
+
+
+def test_whisper_env_var_does_not_leak_into_llm_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the reverse: TLDR__WHISPER__API_KEY must never affect LLMConfig."""
+    monkeypatch.setenv("TLDR__WHISPER__API_KEY", "whisper-env-secret")
+    cfg = _cfg(api_key="llm-inline")
+    assert cfg.effective_api_key == "llm-inline"
 
 
 # ---------------------------------------------------------------------------

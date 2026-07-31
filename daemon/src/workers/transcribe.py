@@ -182,7 +182,7 @@ async def _post_audio(audio_path: Path) -> dict[str, Any]:
     """POST one audio file to the transcription endpoint, return parsed JSON."""
     cfg = get_config().whisper
     endpoint = f"{cfg.base_url.rstrip('/')}/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    headers = {"Authorization": f"Bearer {cfg.effective_api_key}"}
 
     with audio_path.open("rb") as fh:
         files = {"file": (audio_path.name, fh, "application/octet-stream")}

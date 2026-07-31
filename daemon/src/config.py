@@ -20,7 +20,7 @@ import tempfile
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -30,11 +30,24 @@ from src import paths
 log = logging.getLogger(__name__)
 
 DAEMON_VERSION = "0.1.0"
-DAEMON_API_VERSION = 3
+DAEMON_API_VERSION = 4
 
 
-class LLMConfig(BaseModel):
-    base_url: str
+class _ApiKeyConfigMixin(BaseModel):
+    """Shared API-key fields + resolution logic for ``LLMConfig`` and
+    ``WhisperConfig``. Both sections support the exact same four ways to
+    supply a key (see ``effective_api_key``) — this is the single
+    implementation both inherit rather than two copies that could diverge.
+
+    ``_section`` (overridden per subclass to ``"llm"`` / ``"whisper"``)
+    drives the two things that differ between sections: which env var wins
+    (``TLDR__LLM__API_KEY`` vs ``TLDR__WHISPER__API_KEY``) and the
+    field-name prefix in error messages (``llm.api_key_file`` vs
+    ``whisper.api_key_file``).
+    """
+
+    _section: ClassVar[str] = "llm"
+
     api_key: str = "dummy"
     # Alternative ways to supply the API key, in priority order (see
     # ``effective_api_key``): a file on disk, or an OS keychain entry. Both
@@ -43,6 +56,79 @@ class LLMConfig(BaseModel):
     api_key_file: str | None = None
     api_key_keychain: str | None = None
     api_key_keychain_account: str = "api_key"
+
+    @property
+    def effective_api_key(self) -> str:
+        """Resolve the API key to actually send to the backend.
+
+        Strict priority order:
+
+        1. Env var ``TLDR__<SECTION>__API_KEY`` — read directly from
+           ``os.environ`` so it always wins. (``_apply_env_overrides``
+           already maps this same var onto ``api_key`` before validation,
+           so in practice this is usually a no-op re-confirmation — but
+           reading it here directly makes the top-priority guarantee
+           explicit and independent of that generic mechanism.)
+        2. ``api_key_keychain`` — looked up via ``keyring.get_password``,
+           with ``api_key_keychain_account`` as the account name.
+        3. ``api_key_file`` — path read and stripped.
+        4. Inline ``api_key`` field (default: the local-backend dummy value).
+
+        Raises ``RuntimeError`` for any misconfiguration (missing optional
+        dependency, missing/empty file, missing keychain entry) rather than
+        silently falling through to an empty or wrong key.
+        """
+        env_key = os.environ.get(f"TLDR__{self._section.upper()}__API_KEY")
+        if env_key:
+            return env_key
+
+        if self.api_key_keychain:
+            try:
+                import keyring
+            except ImportError as e:
+                # 'keyring' is a base dependency (see pyproject.toml) — this
+                # only happens if it was somehow removed from the venv.
+                raise RuntimeError(
+                    f"{self._section}.api_key_keychain is set but the 'keyring' package "
+                    "is not installed. Reinstall the daemon "
+                    "('uv tool install --force .' / 'pip install .') to "
+                    "restore it."
+                ) from e
+            password = keyring.get_password(self.api_key_keychain, self.api_key_keychain_account)
+            if not password:
+                raise RuntimeError(
+                    "No password found in the OS keychain for "
+                    f"service={self.api_key_keychain!r} "
+                    f"account={self.api_key_keychain_account!r}."
+                )
+            return password
+
+        if self.api_key_file:
+            path = Path(self.api_key_file).expanduser()
+            if not path.is_file():
+                raise RuntimeError(f"{self._section}.api_key_file {path} does not exist.")
+            mode = stat.S_IMODE(path.stat().st_mode)
+            if mode & 0o077:
+                log.warning(
+                    "%s.api_key_file %s is readable beyond the owner (mode %o); "
+                    "consider `chmod 600 %s`.",
+                    self._section,
+                    path,
+                    mode,
+                    path,
+                )
+            key = path.read_text().strip()
+            if not key:
+                raise RuntimeError(f"{self._section}.api_key_file {path} is empty.")
+            return key
+
+        return self.api_key
+
+
+class LLMConfig(_ApiKeyConfigMixin):
+    _section: ClassVar[str] = "llm"
+
+    base_url: str
     model: str
     context_length: int = 32768
     single_pass_token_limit: int = 24000
@@ -79,76 +165,11 @@ class LLMConfig(BaseModel):
     # metered cloud backend. None = no clamp.
     max_output_tokens: int | None = None
 
-    @property
-    def effective_api_key(self) -> str:
-        """Resolve the API key to actually send to the backend.
 
-        Strict priority order:
+class WhisperConfig(_ApiKeyConfigMixin):
+    _section: ClassVar[str] = "whisper"
 
-        1. Env var ``TLDR__LLM__API_KEY`` — read directly from
-           ``os.environ`` so it always wins. (``_apply_env_overrides``
-           already maps this same var onto ``api_key`` before validation,
-           so in practice this is usually a no-op re-confirmation — but
-           reading it here directly makes the top-priority guarantee
-           explicit and independent of that generic mechanism.)
-        2. ``api_key_keychain`` — looked up via ``keyring.get_password``,
-           with ``api_key_keychain_account`` as the account name.
-        3. ``api_key_file`` — path read and stripped.
-        4. Inline ``api_key`` field (default: the local-backend dummy value).
-
-        Raises ``RuntimeError`` for any misconfiguration (missing optional
-        dependency, missing/empty file, missing keychain entry) rather than
-        silently falling through to an empty or wrong key.
-        """
-        env_key = os.environ.get("TLDR__LLM__API_KEY")
-        if env_key:
-            return env_key
-
-        if self.api_key_keychain:
-            try:
-                import keyring
-            except ImportError as e:
-                # 'keyring' is a base dependency (see pyproject.toml) — this
-                # only happens if it was somehow removed from the venv.
-                raise RuntimeError(
-                    "llm.api_key_keychain is set but the 'keyring' package "
-                    "is not installed. Reinstall the daemon "
-                    "('uv tool install --force .' / 'pip install .') to "
-                    "restore it."
-                ) from e
-            password = keyring.get_password(self.api_key_keychain, self.api_key_keychain_account)
-            if not password:
-                raise RuntimeError(
-                    "No password found in the OS keychain for "
-                    f"service={self.api_key_keychain!r} "
-                    f"account={self.api_key_keychain_account!r}."
-                )
-            return password
-
-        if self.api_key_file:
-            path = Path(self.api_key_file).expanduser()
-            if not path.is_file():
-                raise RuntimeError(f"llm.api_key_file {path} does not exist.")
-            mode = stat.S_IMODE(path.stat().st_mode)
-            if mode & 0o077:
-                log.warning(
-                    "llm.api_key_file %s is readable beyond the owner (mode %o); "
-                    "consider `chmod 600 %s`.",
-                    path,
-                    mode,
-                    path,
-                )
-            key = path.read_text().strip()
-            if not key:
-                raise RuntimeError(f"llm.api_key_file {path} is empty.")
-            return key
-
-        return self.api_key
-
-
-class WhisperConfig(BaseModel):
     base_url: str
-    api_key: str = "dummy"
     model: str = "whisper"
     # Per-request upload ceiling (MB). Audio larger than this is split into
     # time-based chunks before transcription, then segments are stitched back
@@ -318,15 +339,18 @@ def overrides_path() -> Path:
     return config_path().parent / "tldr.local.yaml"
 
 
-def api_key_file_path() -> Path:
-    """Where ``PATCH /config`` writes the LLM API key when
+def api_key_file_path(section: Literal["llm", "whisper"] = "llm") -> Path:
+    """Where ``PATCH /config`` writes the ``section`` API key when
     ``api_key_storage="file"`` is selected. Lives next to
     ``overrides_path()`` (which the override file itself points at via
-    ``llm.api_key_file``) rather than next to ``config_path()`` directly —
-    this keeps it in the same, possibly test-isolated, writable directory
-    as ``tldr.local.yaml`` instead of next to a possibly read-only
-    ``tldr.yaml`` (e.g. the checked-in example used by the test suite)."""
-    return overrides_path().parent / "llm.key"
+    ``<section>.api_key_file``) rather than next to ``config_path()``
+    directly — this keeps it in the same, possibly test-isolated, writable
+    directory as ``tldr.local.yaml`` instead of next to a possibly
+    read-only ``tldr.yaml`` (e.g. the checked-in example used by the test
+    suite). ``llm`` and ``whisper`` get separate files (``llm.key`` /
+    ``whisper.key``) so switching one section's storage never touches the
+    other's."""
+    return overrides_path().parent / f"{section}.key"
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -375,10 +399,11 @@ def write_overrides(data: dict[str, Any]) -> None:
     _atomic_write_text(overrides_path(), text, 0o600)
 
 
-def write_api_key_file(key: str) -> Path:
-    """Atomically write ``key`` to ``api_key_file_path()`` at mode 0600.
-    Returns the path so the caller can point ``llm.api_key_file`` at it."""
-    path = api_key_file_path()
+def write_api_key_file(key: str, section: Literal["llm", "whisper"] = "llm") -> Path:
+    """Atomically write ``key`` to ``api_key_file_path(section)`` at mode
+    0600. Returns the path so the caller can point ``<section>.api_key_file``
+    at it."""
+    path = api_key_file_path(section)
     _atomic_write_text(path, key, 0o600)
     return path
 

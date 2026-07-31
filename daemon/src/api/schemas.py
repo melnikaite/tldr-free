@@ -343,9 +343,18 @@ class LLMConfigOut(BaseModel):
 
 
 class WhisperConfigOut(BaseModel):
+    """Whisper settings as reported by ``GET /config`` / ``PATCH /config``.
+
+    Same write-only key-storage story as ``LLMConfigOut`` — see its
+    docstring; the two sections' keys are fully independent (separate
+    keychain entry, separate key file, separate env var).
+    """
     base_url: str
     model: str
     max_upload_mb: int
+    api_key_set: bool
+    api_key_hint: str | None      # last 4 chars of the resolved key, or None
+    api_key_source: ApiKeySource
 
 
 class OutputConfigOut(BaseModel):
@@ -387,9 +396,14 @@ class LLMConfigPatch(BaseModel):
 
 
 class WhisperConfigPatch(BaseModel):
+    """Partial update for ``whisper``. Same write-only ``api_key``/
+    ``api_key_storage`` side channel as ``LLMConfigPatch`` — see its
+    docstring."""
     base_url: str | None = None
     model: str | None = None
     max_upload_mb: int | None = None
+    api_key: str | None = None
+    api_key_storage: ApiKeyStorage | None = None
 
 
 class OutputConfigPatch(BaseModel):
@@ -417,6 +431,13 @@ class ConfigPatchResponse(ConfigResponse):
     # Human-readable reason when api_key_verified is False. Never contains
     # the API key value itself. None when api_key_verified is True.
     api_key_verify_error: str | None = None
+    # Same write-then-read-back check as api_key_verified/api_key_verify_error
+    # above, but for whisper.api_key. Parallel top-level fields (rather than
+    # nesting) keep the existing llm-only fields meaning exactly what they
+    # meant before this field was added — no breaking change for old clients
+    # that only ever wrote llm.api_key.
+    whisper_api_key_verified: bool
+    whisper_api_key_verify_error: str | None = None
 
 
 class ConfigTestLLMOverrides(BaseModel):
@@ -428,9 +449,23 @@ class ConfigTestLLMOverrides(BaseModel):
     api_key: str | None = None
 
 
+class ConfigTestWhisperOverrides(BaseModel):
+    """Same shape as ``ConfigTestLLMOverrides``, for ``target="whisper"``."""
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
 class ConfigTestRequest(BaseModel):
-    """Empty body (``{}``) tests the currently saved ``llm`` config."""
+    """Empty body (``{}``) tests the currently saved ``llm`` config — the
+    default ``target`` preserves that exact old contract. Set
+    ``target="whisper"`` (with optional ``whisper`` overrides) to probe the
+    Whisper backend instead; only the reachability step runs for Whisper
+    (see ``ConfigTestResponse`` — a transcription probe would need an audio
+    file, so there's no "completion" equivalent)."""
+    target: Literal["llm", "whisper"] = "llm"
     llm: ConfigTestLLMOverrides | None = None
+    whisper: ConfigTestWhisperOverrides | None = None
 
 
 class ConfigTestResponse(BaseModel):
@@ -438,10 +473,11 @@ class ConfigTestResponse(BaseModel):
     rather than raising, since a 401/timeout/etc. IS the useful answer.
 
     ``step`` marks which probe ran last: "models" (``GET {base_url}/models``)
-    or "completion" (a minimal chat completion against ``model``). ``detail``
-    carries the provider's error message verbatim (truncated), which is the
-    whole point of this endpoint — never redacted except for the API key
-    itself.
+    or "completion" (a minimal chat completion against ``model``) — the
+    Whisper probe (``target="whisper"``) only ever reports "models", since a
+    transcription probe would need an audio file. ``detail`` carries the
+    provider's error message verbatim (truncated), which is the whole point
+    of this endpoint — never redacted except for the API key itself.
     """
     ok: bool
     step: Literal["models", "completion"] | None = None

@@ -110,9 +110,12 @@ anything unknown with a helpful 400 listing supported codes.
 
 `llm.base_url` (and independently `whisper.base_url`) may point at a cloud
 OpenAI-compatible endpoint instead of a local one — nothing else in the
-pipeline changes. Config fields: `api_key`, `api_key_file`,
-`api_key_keychain` + `api_key_keychain_account`, and the
-`TLDR__LLM__API_KEY` env var.
+pipeline changes. Both sections get the exact same key-storage machinery,
+implemented once in `_ApiKeyConfigMixin` (`src/config.py`) and inherited by
+both `LLMConfig` and `WhisperConfig` — not two copies that could diverge.
+Config fields, per section: `api_key`, `api_key_file`, `api_key_keychain` +
+`api_key_keychain_account`, and its own env var (`TLDR__LLM__API_KEY` /
+`TLDR__WHISPER__API_KEY`).
 
 - **Resolution order (first match wins): env → keychain → file → inline.**
   This lets an operator override a committed `tldr.yaml` at deploy time
@@ -126,6 +129,12 @@ pipeline changes. Config fields: `api_key`, `api_key_file`,
   load (`effective_api_key`, read once per process lifetime via the
   `lru_cache`d client — not per request) — changing the keychain entry or
   key file needs a daemon restart like any other config change.
+  `llm` and `whisper` are fully independent: separate keychain service
+  (`tldr-daemon-llm` / `tldr-daemon-whisper`, see
+  `src/api/config.py#_KEYCHAIN_SERVICES`), separate managed key file
+  (`llm.key` / `whisper.key`, see `config.api_key_file_path(section)`),
+  separate env var — patching one section's key via `PATCH /config` never
+  touches the other's storage.
   Headless operation (no logged-in user at the console) is explicitly
   unsupported — the extension needs a human at the browser regardless —
   so keychain access dialogs are never a problem in practice: the daemon
@@ -135,7 +144,8 @@ pipeline changes. Config fields: `api_key`, `api_key_file`,
   reinstall — the venv is rebuilt but the underlying macOS Python binary
   and the `keyring` code aren't). `config.keychain_backend_available()`
   (cached for the process lifetime) is the single source of truth for
-  "is keychain actually usable right now" — it backs `GET /config`'s
+  "is keychain actually usable right now" — shared by both sections (it's
+  a machine-level fact, not per-backend) — it backs `GET /config`'s
   `keychain_available` field, the `PATCH /config` default-storage choice,
   and the options-page UI that disables the keychain option when false
   (Linux without a Secret Service in the session).

@@ -652,3 +652,257 @@ def test_config_test_completion_adapts_dialect_instead_of_failing(
     body = r.json()
     assert body["ok"] is True
     assert body["step"] == "completion"
+
+
+# ---------------------------------------------------------------------------
+# Whisper API key parity: GET/PATCH report + persist it exactly like llm,
+# with fully independent storage (own keychain service, own key file).
+# ---------------------------------------------------------------------------
+
+
+def test_get_config_reports_whisper_key_state_and_never_leaks_it(
+    client: TestClient, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "tldr.yaml"
+    config_file.write_text(
+        _MINIMAL_YAML.replace(
+            "whisper:\n  base_url: http://127.0.0.1:1240/v1\n  api_key: dummy\n  model: whisper",
+            "whisper:\n  base_url: http://127.0.0.1:1240/v1\n  api_key: sk-whisper-CD34\n  model: whisper",
+        )
+    )
+    config_mod.get_config.cache_clear()
+
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["whisper"]["api_key_set"] is True
+    assert body["whisper"]["api_key_source"] == "inline"
+    assert body["whisper"]["api_key_hint"] == "CD34"
+    assert "sk-whisper-CD34" not in r.text
+
+
+def test_get_config_no_whisper_key_configured_reports_none(client: TestClient) -> None:
+    r = client.get("/config")
+    body = r.json()
+    assert body["whisper"]["api_key_set"] is False
+    assert body["whisper"]["api_key_source"] == "none"
+    assert body["whisper"]["api_key_hint"] is None
+
+
+def test_patch_whisper_api_key_file_storage_writes_own_key_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    r = client.patch(
+        "/config",
+        json={"whisper": {"api_key": "sk-whisper-file-secret", "api_key_storage": "file"}},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["whisper"]["api_key_source"] == "file"
+    assert "sk-whisper-file-secret" not in r.text
+
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    key_file = Path(overrides["whisper"]["api_key_file"])
+    assert key_file.name == "whisper.key"
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+    assert key_file.read_text() == "sk-whisper-file-secret"
+    # Whisper's key file is separate from llm's — must never collide.
+    assert key_file != config_mod.api_key_file_path("llm")
+
+
+def test_patch_whisper_api_key_storage_isolated_from_llm_keychain_entry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Patching whisper.api_key via keychain storage must not touch llm's
+    keychain entry or override fields, and vice versa."""
+    monkeypatch.setattr(config_mod, "keychain_backend_available", lambda: True)
+    store = _fake_keyring_module(monkeypatch)
+
+    r = client.patch(
+        "/config", json={"llm": {"api_key": "sk-llm-secret", "api_key_storage": "keychain"}}
+    )
+    assert r.status_code == 200, r.text
+    assert store[("tldr-daemon-llm", "api_key")] == "sk-llm-secret"
+
+    r = client.patch(
+        "/config",
+        json={"whisper": {"api_key": "sk-whisper-secret", "api_key_storage": "keychain"}},
+    )
+    assert r.status_code == 200, r.text
+    assert store[("tldr-daemon-whisper", "api_key")] == "sk-whisper-secret"
+    # The LLM entry survives untouched.
+    assert store[("tldr-daemon-llm", "api_key")] == "sk-llm-secret"
+
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert overrides["llm"]["api_key_keychain"] == "tldr-daemon-llm"
+    assert overrides["whisper"]["api_key_keychain"] == "tldr-daemon-whisper"
+
+    body = client.get("/config").json()
+    assert body["llm"]["api_key_source"] == "keychain"
+    assert body["whisper"]["api_key_source"] == "keychain"
+
+
+def test_patch_whisper_api_key_storage_isolated_from_llm_key_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Same isolation check for file storage: writing whisper's key file
+    must not disturb llm's, and switching whisper away from file storage
+    must not delete llm.key."""
+    r = client.patch(
+        "/config", json={"llm": {"api_key": "sk-llm-file", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    llm_key_file = config_mod.api_key_file_path("llm")
+    assert llm_key_file.exists()
+    assert llm_key_file.read_text() == "sk-llm-file"
+
+    r = client.patch(
+        "/config", json={"whisper": {"api_key": "sk-whisper-file", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    whisper_key_file = config_mod.api_key_file_path("whisper")
+    assert whisper_key_file.exists()
+    assert whisper_key_file.read_text() == "sk-whisper-file"
+    # llm.key untouched by the whisper PATCH.
+    assert llm_key_file.read_text() == "sk-llm-file"
+
+    # Switching whisper's storage away from file must not delete llm.key.
+    r = client.patch(
+        "/config", json={"whisper": {"api_key": "sk-whisper-inline", "api_key_storage": "inline"}}
+    )
+    assert r.status_code == 200, r.text
+    assert not whisper_key_file.exists()
+    assert llm_key_file.exists()
+    assert llm_key_file.read_text() == "sk-llm-file"
+
+
+def test_patch_whisper_api_key_verified_true_on_successful_save(client: TestClient) -> None:
+    r = client.patch(
+        "/config", json={"whisper": {"api_key": "sk-whisper-verify-ok", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["whisper_api_key_verified"] is True
+    assert body["whisper_api_key_verify_error"] is None
+    # The llm-scoped fields are unaffected by a whisper-only PATCH.
+    assert body["api_key_verified"] is True
+    assert body["api_key_verify_error"] is None
+    assert "sk-whisper-verify-ok" not in r.text
+
+
+def test_patch_whisper_api_key_verified_true_when_key_not_touched(client: TestClient) -> None:
+    r = client.patch("/config", json={"output": {"language": "de"}})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["whisper_api_key_verified"] is True
+    assert body["whisper_api_key_verify_error"] is None
+
+
+def test_patch_whisper_api_key_verified_false_when_readback_mismatches(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        config_mod.WhisperConfig,
+        "effective_api_key",
+        property(lambda self: "some-other-value"),
+    )
+
+    r = client.patch(
+        "/config", json={"whisper": {"api_key": "sk-whisper-mismatch", "api_key_storage": "file"}}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["whisper_api_key_verified"] is False
+    assert body["whisper_api_key_verify_error"]
+    assert "sk-whisper-mismatch" not in r.text
+    assert "some-other-value" not in r.text
+    # llm verification is untouched by this whisper-only PATCH.
+    assert body["api_key_verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /config/test — target="whisper"
+# ---------------------------------------------------------------------------
+
+
+def test_config_test_default_target_still_tests_llm(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a body with no `target` at all must keep testing llm,
+    exactly like before `target` was added to the contract."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "test-model"}]}))
+
+    class _FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            return object()
+
+    class _FakeChat:
+        completions = _FakeCompletions()
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.chat = _FakeChat()
+
+    import src.api.config as config_api
+
+    monkeypatch.setattr(config_api, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["step"] == "completion"
+
+
+def test_config_test_whisper_401_reports_verbatim_detail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models_probe(
+        monkeypatch, response=_FakeHttpResponse(401, text="Incorrect API key provided: sk-***")
+    )
+    r = client.post(
+        "/config/test",
+        json={
+            "target": "whisper",
+            "whisper": {
+                "base_url": "https://api.openai.com/v1",
+                "model": "whisper-1",
+                "api_key": "sk-whisper-bogus",
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is False
+    assert body["step"] == "models"
+    assert body["status_code"] == 401
+    assert "Incorrect API key provided" in body["detail"]
+    assert "sk-whisper-bogus" not in r.text
+
+
+def test_config_test_whisper_success_only_runs_models_step(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whisper's probe never attempts a completion call (no audio file to
+    upload for a real transcription probe) — `ok: true` after just the
+    reachability step."""
+    _patch_models_probe(
+        monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "whisper-1"}]})
+    )
+
+    r = client.post("/config/test", json={"target": "whisper"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["step"] == "models"
+    assert body["models"] == ["whisper-1"]
+    assert body["latency_ms"] is not None
+
+
+def test_config_test_whisper_never_persists_anything(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": []}))
+    r = client.post("/config/test", json={"target": "whisper"})
+    assert r.status_code == 200, r.text
+    assert not (tmp_path / "tldr.local.yaml").exists()

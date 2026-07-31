@@ -232,10 +232,17 @@
  */
 
 /**
+ * Same write-only key-storage story as LLMConfigOut — see its comment.
+ * llm and whisper keys are fully independent (separate keychain entry,
+ * separate key file, separate env var).
+ *
  * @typedef {object} WhisperConfigOut
  * @property {string} base_url
  * @property {string} model
  * @property {number} max_upload_mb
+ * @property {boolean} api_key_set
+ * @property {string | null} api_key_hint     - last 4 chars of the resolved key, or null
+ * @property {ApiKeySource} api_key_source
  */
 
 /**
@@ -276,10 +283,15 @@
  */
 
 /**
+ * Same write-only api_key/api_key_storage side channel as LLMConfigPatch —
+ * see its comment.
+ *
  * @typedef {object} WhisperConfigPatch
  * @property {string} [base_url]
  * @property {string} [model]
  * @property {number} [max_upload_mb]
+ * @property {string} [api_key]              - write-only; unset/empty = unchanged
+ * @property {ApiKeyStorage} [api_key_storage]
  */
 
 /**
@@ -300,18 +312,24 @@
  *     `llm.max_concurrent_calls`) can't take effect on the running process
  *     and needs a daemon restart.
  *   - `api_key_verified` / `api_key_verify_error`: write-then-read-back
- *     check whenever this PATCH (re)wrote the API key — the freshly-saved
+ *     check whenever this PATCH (re)wrote the LLM API key — the freshly-saved
  *     config is read back the same way the daemon does at call time and
  *     compared to what was saved. `api_key_verified` is true when this
  *     PATCH didn't touch the key at all (nothing to verify) or the
  *     read-back matched; `api_key_verify_error` is a redacted reason
  *     string (never the key itself) when it's false, else null. A failed
  *     verification does NOT roll back the save.
+ *   - `whisper_api_key_verified` / `whisper_api_key_verify_error`: the same
+ *     check, but for `whisper.api_key` — fully independent of the llm-scoped
+ *     fields above (patching one section's key never affects the other's
+ *     verification result).
  *
  * @typedef {ConfigResponse & {
  *   restart_required: boolean,
  *   api_key_verified: boolean,
  *   api_key_verify_error: string | null,
+ *   whisper_api_key_verified: boolean,
+ *   whisper_api_key_verify_error: string | null,
  * }} ConfigPatchResponse
  */
 
@@ -323,19 +341,34 @@
  */
 
 /**
- * Empty body ({}) tests the currently saved llm config.
+ * Same shape as ConfigTestLLMOverrides, for `target: "whisper"`.
+ *
+ * @typedef {object} ConfigTestWhisperOverrides
+ * @property {string} [base_url]
+ * @property {string} [model]
+ * @property {string} [api_key]
+ */
+
+/**
+ * Empty body ({}) tests the currently saved llm config — `target` defaults
+ * to "llm", preserving that exact old contract. Set `target: "whisper"`
+ * (with optional `whisper` overrides) to probe the Whisper backend instead.
  *
  * @typedef {object} ConfigTestRequest
+ * @property {"llm" | "whisper"} [target]
  * @property {ConfigTestLLMOverrides} [llm]
+ * @property {ConfigTestWhisperOverrides} [whisper]
  */
 
 /**
  * Always HTTP 200 — probe failures are reported in the body (never thrown)
  * since a 401/timeout/etc. IS the useful answer this endpoint exists to
  * give. `step` marks which probe ran last: "models" (GET {base_url}/models)
- * or "completion" (a minimal chat completion). `detail` is the provider's
- * error message verbatim (truncated to 2000 chars), with the API key itself
- * scrubbed out if it happened to be echoed back.
+ * or "completion" (a minimal chat completion) — the whisper probe
+ * (`target: "whisper"`) only ever reports "models", since a transcription
+ * probe would need an audio file. `detail` is the provider's error message
+ * verbatim (truncated to 2000 chars), with the API key itself scrubbed out
+ * if it happened to be echoed back.
  *
  * @typedef {object} ConfigTestResponse
  * @property {boolean} ok

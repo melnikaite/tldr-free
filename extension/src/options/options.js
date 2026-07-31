@@ -73,6 +73,30 @@ const whisperModelInput = /** @type {HTMLInputElement} */ (
 const whisperMaxUploadInput = /** @type {HTMLInputElement} */ (
   document.getElementById("whisper-max-upload")
 );
+const whisperApiKeyInput = /** @type {HTMLInputElement} */ (
+  document.getElementById("whisper-api-key")
+);
+const whisperApiKeySourceEl = /** @type {HTMLElement} */ (
+  document.getElementById("whisper-api-key-source")
+);
+const whisperApiKeyStorageSelect = /** @type {HTMLSelectElement} */ (
+  document.getElementById("whisper-api-key-storage")
+);
+const whisperApiKeyStorageHintEl = /** @type {HTMLElement} */ (
+  document.getElementById("whisper-api-key-storage-hint")
+);
+const whisperApiKeyVerifyResultEl = /** @type {HTMLElement} */ (
+  document.getElementById("whisper-api-key-verify-result")
+);
+const whisperApiKeyStorageKeychainOptionEl = /** @type {HTMLOptionElement} */ (
+  document.getElementById("whisper-api-key-storage-keychain-option")
+);
+const whisperTestBtn = /** @type {HTMLButtonElement} */ (
+  document.getElementById("whisper-test-connection")
+);
+const whisperTestResultEl = /** @type {HTMLElement} */ (
+  document.getElementById("whisper-test-result")
+);
 
 const outputLanguageInput = /** @type {HTMLInputElement} */ (
   document.getElementById("output-language")
@@ -84,10 +108,36 @@ const saveSettingsBtn = /** @type {HTMLButtonElement} */ (
 const settingsStatusEl = /** @type {HTMLElement} */ (document.getElementById("settings-status"));
 const restartNoticeEl = /** @type {HTMLElement} */ (document.getElementById("restart-notice"));
 
+/**
+ * Per-section API-key UI elements, keyed the same way the config API nests
+ * them ("llm" / "whisper") — lets renderApiKeySection/addApiKeyPatchFields
+ * be written once and reused for both sections instead of copy-pasted.
+ */
+const API_KEY_SECTIONS = {
+  llm: {
+    apiKeyInput: llmApiKeyInput,
+    apiKeySourceEl: llmApiKeySourceEl,
+    storageSelect: llmApiKeyStorageSelect,
+    storageHintEl: llmApiKeyStorageHintEl,
+    keychainOptionEl: llmApiKeyStorageKeychainOptionEl,
+    baseUrlInput: llmBaseUrlInput,
+    modelInput: llmModelInput,
+  },
+  whisper: {
+    apiKeyInput: whisperApiKeyInput,
+    apiKeySourceEl: whisperApiKeySourceEl,
+    storageSelect: whisperApiKeyStorageSelect,
+    storageHintEl: whisperApiKeyStorageHintEl,
+    keychainOptionEl: whisperApiKeyStorageKeychainOptionEl,
+    baseUrlInput: whisperBaseUrlInput,
+    modelInput: whisperModelInput,
+  },
+};
+
 /** Last config snapshot returned by the daemon; used as the diff baseline for PATCH. */
 let lastConfig = null;
-/** api_key_storage value implied by the last loaded config's api_key_source. */
-let initialApiKeyStorage = "file";
+/** api_key_storage value implied by the last loaded config's api_key_source, per section. */
+const initialApiKeyStorage = { llm: "file", whisper: "file" };
 
 /**
  * Turn an Error thrown by daemon-client's `request()` (shape:
@@ -115,8 +165,54 @@ function formatRequestError(err) {
 }
 
 /**
- * Populate the settings form from a GET/PATCH /config response. Never
- * writes anything into the password field — only updates its placeholder.
+ * Populate one section's ("llm" | "whisper") API-key UI from its slice of
+ * a GET/PATCH /config response. Never writes anything into the password
+ * field — only updates its placeholder. Records the effective initial
+ * storage mode in `initialApiKeyStorage[section]` so `buildPatch()` can
+ * diff against it later.
+ *
+ * @param {"llm" | "whisper"} section
+ * @param {{ api_key_set?: boolean, api_key_hint?: string | null, api_key_source?: string }} [cfgSection]
+ * @param {boolean} keychainAvailable
+ */
+function renderApiKeySection(section, cfgSection, keychainAvailable) {
+  const els = API_KEY_SECTIONS[section];
+
+  els.apiKeyInput.value = "";
+  els.apiKeyInput.placeholder = cfgSection?.api_key_set
+    ? `••••${cfgSection.api_key_hint || ""}`
+    : "no API key set";
+  els.apiKeySourceEl.textContent = cfgSection?.api_key_set
+    ? `Current key source: ${cfgSection.api_key_source}`
+    : "";
+
+  // OS keychain is the recommended default, but only offer it when the
+  // daemon reports a real, usable backend — otherwise disable the option
+  // with an explanatory hint and fall back to File.
+  els.keychainOptionEl.disabled = !keychainAvailable;
+  if (keychainAvailable) {
+    els.keychainOptionEl.title = "";
+    els.storageHintEl.hidden = true;
+    els.storageHintEl.textContent = "";
+  } else {
+    els.keychainOptionEl.title = "No usable OS keychain backend on this daemon's machine.";
+    els.storageHintEl.hidden = false;
+    els.storageHintEl.textContent =
+      "OS keychain unavailable here (no usable backend — e.g. no Secret Service " +
+      "running in this session on Linux). Falling back to File.";
+  }
+
+  const defaultStorage = keychainAvailable ? "keychain" : "file";
+  let initial = API_KEY_STORAGE_OPTIONS.includes(cfgSection?.api_key_source)
+    ? /** @type {string} */ (cfgSection?.api_key_source)
+    : defaultStorage;
+  if (initial === "keychain" && !keychainAvailable) initial = "file";
+  initialApiKeyStorage[section] = initial;
+  els.storageSelect.value = initial;
+}
+
+/**
+ * Populate the settings form from a GET/PATCH /config response.
  */
 function renderConfig(cfg) {
   llmBaseUrlInput.value = cfg.llm?.base_url ?? "";
@@ -126,42 +222,13 @@ function renderConfig(cfg) {
   llmMaxConcurrentInput.value = cfg.llm?.max_concurrent_calls ?? "";
   llmReasoningEffortInput.value = cfg.llm?.reasoning_effort ?? "";
 
-  llmApiKeyInput.value = "";
-  llmApiKeyInput.placeholder = cfg.llm?.api_key_set
-    ? `••••${cfg.llm.api_key_hint || ""}`
-    : "no API key set";
-  llmApiKeySourceEl.textContent = cfg.llm?.api_key_set
-    ? `Current key source: ${cfg.llm.api_key_source}`
-    : "";
-
-  // OS keychain is the recommended default, but only offer it when the
-  // daemon reports a real, usable backend — otherwise disable the option
-  // with an explanatory hint and fall back to File.
   const keychainAvailable = cfg.keychain_available === true;
-  llmApiKeyStorageKeychainOptionEl.disabled = !keychainAvailable;
-  if (keychainAvailable) {
-    llmApiKeyStorageKeychainOptionEl.title = "";
-    llmApiKeyStorageHintEl.hidden = true;
-    llmApiKeyStorageHintEl.textContent = "";
-  } else {
-    llmApiKeyStorageKeychainOptionEl.title =
-      "No usable OS keychain backend on this daemon's machine.";
-    llmApiKeyStorageHintEl.hidden = false;
-    llmApiKeyStorageHintEl.textContent =
-      "OS keychain unavailable here (no usable backend — e.g. no Secret Service " +
-      "running in this session on Linux). Falling back to File.";
-  }
-
-  const defaultStorage = keychainAvailable ? "keychain" : "file";
-  initialApiKeyStorage = API_KEY_STORAGE_OPTIONS.includes(cfg.llm?.api_key_source)
-    ? cfg.llm.api_key_source
-    : defaultStorage;
-  if (initialApiKeyStorage === "keychain" && !keychainAvailable) initialApiKeyStorage = "file";
-  llmApiKeyStorageSelect.value = initialApiKeyStorage;
+  renderApiKeySection("llm", cfg.llm, keychainAvailable);
 
   whisperBaseUrlInput.value = cfg.whisper?.base_url ?? "";
   whisperModelInput.value = cfg.whisper?.model ?? "";
   whisperMaxUploadInput.value = cfg.whisper?.max_upload_mb ?? "";
+  renderApiKeySection("whisper", cfg.whisper, keychainAvailable);
 
   outputLanguageInput.value = cfg.output?.language ?? "";
 }
@@ -184,6 +251,23 @@ function addNumberDiff(target, key, rawValue, oldValue) {
   const num = Number(trimmed);
   if (Number.isNaN(num)) return;
   if (num !== oldValue) target[key] = num;
+}
+
+/**
+ * Add `api_key`/`api_key_storage` to `sectionPatch` if the user changed
+ * either — shared by both the llm and whisper PATCH builders below.
+ *
+ * @param {"llm" | "whisper"} section
+ * @param {object} sectionPatch
+ */
+function addApiKeyPatchFields(section, sectionPatch) {
+  const els = API_KEY_SECTIONS[section];
+  // Empty API key field means "do not change" — the field is simply omitted.
+  const apiKeyRaw = els.apiKeyInput.value.trim();
+  if (apiKeyRaw !== "") sectionPatch.api_key = apiKeyRaw;
+
+  const storageValue = els.storageSelect.value;
+  if (storageValue !== initialApiKeyStorage[section]) sectionPatch.api_key_storage = storageValue;
 }
 
 /** Build a PATCH /config body containing only fields the user changed. */
@@ -217,12 +301,7 @@ function buildPatch() {
   const reasoningOld = lastConfig.llm?.reasoning_effort ?? null;
   if (reasoningNew !== reasoningOld) llmPatch.reasoning_effort = reasoningNew;
 
-  // Empty API key field means "do not change" — the field is simply omitted.
-  const apiKeyRaw = llmApiKeyInput.value.trim();
-  if (apiKeyRaw !== "") llmPatch.api_key = apiKeyRaw;
-
-  const storageValue = llmApiKeyStorageSelect.value;
-  if (storageValue !== initialApiKeyStorage) llmPatch.api_key_storage = storageValue;
+  addApiKeyPatchFields("llm", llmPatch);
 
   if (Object.keys(llmPatch).length) patch.llm = llmPatch;
 
@@ -235,6 +314,8 @@ function buildPatch() {
     whisperMaxUploadInput.value,
     lastConfig.whisper?.max_upload_mb,
   );
+  addApiKeyPatchFields("whisper", whisperPatch);
+
   if (Object.keys(whisperPatch).length) patch.whisper = whisperPatch;
 
   const outputPatch = {};
@@ -244,9 +325,15 @@ function buildPatch() {
   return patch;
 }
 
-/** Render a POST /config/test result into #test-result. */
-function renderTestResult(result) {
-  testResultEl.textContent = "";
+/**
+ * Render a POST /config/test result into the given container element
+ * (#test-result for llm, #whisper-test-result for whisper).
+ *
+ * @param {HTMLElement} container
+ * @param {object} result
+ */
+function renderTestResult(container, result) {
+  container.textContent = "";
 
   const summary = document.createElement("div");
   summary.className = result.ok ? "ok" : "err";
@@ -256,13 +343,13 @@ function renderTestResult(result) {
     parts.push(`status ${result.status_code}`);
   }
   summary.textContent = parts.join(" — ");
-  testResultEl.appendChild(summary);
+  container.appendChild(summary);
 
   if (!result.ok && result.detail) {
     const pre = document.createElement("pre");
     pre.className = "err";
     pre.textContent = result.detail;
-    testResultEl.appendChild(pre);
+    container.appendChild(pre);
   }
 
   if (Array.isArray(result.models) && result.models.length) {
@@ -277,8 +364,28 @@ function renderTestResult(result) {
       list.appendChild(li);
     }
     details.appendChild(list);
-    testResultEl.appendChild(details);
+    container.appendChild(details);
   }
+}
+
+/**
+ * Build the `{ base_url?, model?, api_key? }` overrides object POSTed to
+ * `/config/test` for one section, from whatever the user has currently
+ * typed into that section's fields (not necessarily saved yet).
+ *
+ * @param {"llm" | "whisper"} section
+ */
+function buildTestOverrides(section) {
+  const els = API_KEY_SECTIONS[section];
+  /** @type {{ base_url?: string, model?: string, api_key?: string }} */
+  const overrides = {};
+  const baseUrl = els.baseUrlInput.value.trim();
+  const model = els.modelInput.value.trim();
+  const apiKey = els.apiKeyInput.value.trim();
+  if (baseUrl) overrides.base_url = baseUrl;
+  if (model) overrides.model = model;
+  if (apiKey) overrides.api_key = apiKey;
+  return overrides;
 }
 
 /** Load the daemon URL (always available, independent of /config). */
@@ -314,18 +421,13 @@ testBtn.addEventListener("click", async () => {
   testResultEl.textContent = "Testing…";
   testBtn.disabled = true;
   try {
-    /** @type {{ base_url?: string, model?: string, api_key?: string }} */
-    const llmOverrides = {};
-    const baseUrl = llmBaseUrlInput.value.trim();
-    const model = llmModelInput.value.trim();
-    const apiKey = llmApiKeyInput.value.trim();
-    if (baseUrl) llmOverrides.base_url = baseUrl;
-    if (model) llmOverrides.model = model;
-    if (apiKey) llmOverrides.api_key = apiKey;
-    const overrides = Object.keys(llmOverrides).length ? { llm: llmOverrides } : {};
+    const llmOverrides = buildTestOverrides("llm");
+    const body = Object.keys(llmOverrides).length
+      ? { target: "llm", llm: llmOverrides }
+      : { target: "llm" };
 
-    const result = await daemon.testConfig(overrides);
-    renderTestResult(result);
+    const result = await daemon.testConfig(body);
+    renderTestResult(testResultEl, result);
   } catch (err) {
     testResultEl.textContent = "";
     const pre = document.createElement("pre");
@@ -337,12 +439,55 @@ testBtn.addEventListener("click", async () => {
   }
 });
 
+whisperTestBtn.addEventListener("click", async () => {
+  whisperTestResultEl.textContent = "Testing…";
+  whisperTestBtn.disabled = true;
+  try {
+    const whisperOverrides = buildTestOverrides("whisper");
+    const body = Object.keys(whisperOverrides).length
+      ? { target: "whisper", whisper: whisperOverrides }
+      : { target: "whisper" };
+
+    const result = await daemon.testConfig(body);
+    renderTestResult(whisperTestResultEl, result);
+  } catch (err) {
+    whisperTestResultEl.textContent = "";
+    const pre = document.createElement("pre");
+    pre.className = "err";
+    pre.textContent = `Request failed: ${formatRequestError(err)}`;
+    whisperTestResultEl.appendChild(pre);
+  } finally {
+    whisperTestBtn.disabled = false;
+  }
+});
+
+/**
+ * Render one section's write-then-read-back verification result into its
+ * hint element, given the PATCH response's `<prefix>api_key_verified` /
+ * `<prefix>api_key_verify_error` fields.
+ *
+ * @param {HTMLElement} el
+ * @param {boolean} verified
+ * @param {string | null | undefined} verifyError
+ */
+function renderApiKeyVerifyResult(el, verified, verifyError) {
+  if (verified) {
+    el.textContent = "API key verified — read back successfully.";
+    el.className = "hint ok";
+  } else {
+    el.textContent = `API key saved, but verification failed: ${verifyError || "unknown reason"}`;
+    el.className = "hint err";
+  }
+}
+
 saveSettingsBtn.addEventListener("click", async () => {
   settingsStatusEl.textContent = "";
   settingsStatusEl.className = "";
   restartNoticeEl.hidden = true;
   apiKeyVerifyResultEl.textContent = "";
   apiKeyVerifyResultEl.className = "hint";
+  whisperApiKeyVerifyResultEl.textContent = "";
+  whisperApiKeyVerifyResultEl.className = "hint";
 
   if (!lastConfig) {
     settingsStatusEl.textContent = "Settings not loaded — nothing to save.";
@@ -357,9 +502,12 @@ saveSettingsBtn.addEventListener("click", async () => {
   }
   // Only the API key write path is write-then-read-back verified —
   // don't show a verification line for a save that didn't touch it.
-  const keyWasWritten =
+  const llmKeyWasWritten =
     patch.llm !== undefined &&
     (patch.llm.api_key !== undefined || patch.llm.api_key_storage !== undefined);
+  const whisperKeyWasWritten =
+    patch.whisper !== undefined &&
+    (patch.whisper.api_key !== undefined || patch.whisper.api_key_storage !== undefined);
 
   saveSettingsBtn.disabled = true;
   try {
@@ -375,15 +523,15 @@ saveSettingsBtn.addEventListener("click", async () => {
       restartNoticeEl.hidden = false;
       restartNoticeEl.className = "notice";
     }
-    if (keyWasWritten) {
-      if (result.api_key_verified) {
-        apiKeyVerifyResultEl.textContent = "API key verified — read back successfully.";
-        apiKeyVerifyResultEl.className = "hint ok";
-      } else {
-        apiKeyVerifyResultEl.textContent =
-          `API key saved, but verification failed: ${result.api_key_verify_error || "unknown reason"}`;
-        apiKeyVerifyResultEl.className = "hint err";
-      }
+    if (llmKeyWasWritten) {
+      renderApiKeyVerifyResult(apiKeyVerifyResultEl, result.api_key_verified, result.api_key_verify_error);
+    }
+    if (whisperKeyWasWritten) {
+      renderApiKeyVerifyResult(
+        whisperApiKeyVerifyResultEl,
+        result.whisper_api_key_verified,
+        result.whisper_api_key_verify_error,
+      );
     }
   } catch (err) {
     settingsStatusEl.textContent = `Save failed: ${formatRequestError(err)}`;
