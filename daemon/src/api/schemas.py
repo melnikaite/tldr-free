@@ -306,4 +306,130 @@ class HealthResponse(BaseModel):
     queue_running: int
     llm_backend_reachable: bool      # any OpenAI-compatible /v1/models pingable
     llm_backend_models: list[str]
+    # Set when the backend responded but rejected the request (401/403) —
+    # distinguishes "unauthorized" (bad/missing llm.api_key) from a plain
+    # network-level "unreachable". None when the probe succeeded or the
+    # failure was a connection-level error.
+    llm_backend_error: str | None = None
     version: str
+
+
+# ---------------------------------------------------------------------------
+# GET/PATCH /config, POST /config/test — daemon settings editable from the
+# extension's options page instead of hand-editing tldr.yaml. Secrets are
+# write-only: a key is never echoed back, only its presence/hint/source.
+# ---------------------------------------------------------------------------
+
+
+ApiKeySource = Literal["env", "keychain", "file", "inline", "none"]
+ApiKeyStorage = Literal["file", "keychain", "inline"]
+
+
+class LLMConfigOut(BaseModel):
+    """LLM settings as reported by ``GET /config`` / ``PATCH /config``.
+
+    ``api_key_set``/``api_key_hint``/``api_key_source`` are the only trace
+    of the key that ever appears in a response — the key itself never is.
+    """
+    base_url: str
+    model: str
+    context_length: int
+    single_pass_token_limit: int
+    max_concurrent_calls: int
+    reasoning_effort: str | None
+    api_key_set: bool
+    api_key_hint: str | None      # last 4 chars of the resolved key, or None
+    api_key_source: ApiKeySource
+
+
+class WhisperConfigOut(BaseModel):
+    base_url: str
+    model: str
+    max_upload_mb: int
+
+
+class OutputConfigOut(BaseModel):
+    language: str
+
+
+class ConfigResponse(BaseModel):
+    llm: LLMConfigOut
+    whisper: WhisperConfigOut
+    output: OutputConfigOut
+    config_path: str        # absolute path to tldr.yaml (read-only template)
+    overrides_path: str     # absolute path to tldr.local.yaml (PATCH target)
+
+
+class LLMConfigPatch(BaseModel):
+    """Partial update for ``llm``. Only fields present in the request body
+    are applied; everything else keeps its current value.
+
+    ``api_key``/``api_key_storage`` are write-only side channels — see
+    ``.claude/daemon.md`` / the ``/config`` route module docstring for the
+    storage-selection logic. An absent or empty ``api_key`` leaves the
+    currently configured key untouched even if ``api_key_storage`` changes
+    (the existing key is migrated to the new storage instead).
+    """
+    base_url: str | None = None
+    model: str | None = None
+    context_length: int | None = None
+    single_pass_token_limit: int | None = None
+    max_concurrent_calls: int | None = None
+    reasoning_effort: str | None = None
+    api_key: str | None = None
+    api_key_storage: ApiKeyStorage | None = None
+
+
+class WhisperConfigPatch(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    max_upload_mb: int | None = None
+
+
+class OutputConfigPatch(BaseModel):
+    language: str | None = None
+
+
+class ConfigPatchRequest(BaseModel):
+    llm: LLMConfigPatch | None = None
+    whisper: WhisperConfigPatch | None = None
+    output: OutputConfigPatch | None = None
+
+
+class ConfigPatchResponse(ConfigResponse):
+    # True when a change (currently: llm.max_concurrent_calls) can't take
+    # effect on the running process — the asyncio.Semaphore it sizes is
+    # bound to the live event loop and can't be resized in place.
+    restart_required: bool
+
+
+class ConfigTestLLMOverrides(BaseModel):
+    """Overrides probed by ``POST /config/test`` instead of the saved
+    config, without persisting anything. All optional — unset fields fall
+    back to the currently saved value."""
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+class ConfigTestRequest(BaseModel):
+    """Empty body (``{}``) tests the currently saved ``llm`` config."""
+    llm: ConfigTestLLMOverrides | None = None
+
+
+class ConfigTestResponse(BaseModel):
+    """Always HTTP 200 — this endpoint reports probe failures in the body
+    rather than raising, since a 401/timeout/etc. IS the useful answer.
+
+    ``step`` marks which probe ran last: "models" (``GET {base_url}/models``)
+    or "completion" (a minimal chat completion against ``model``). ``detail``
+    carries the provider's error message verbatim (truncated), which is the
+    whole point of this endpoint — never redacted except for the API key
+    itself.
+    """
+    ok: bool
+    step: Literal["models", "completion"] | None = None
+    status_code: int | None = None
+    detail: str | None = None
+    models: list[str] = []
+    latency_ms: int | None = None

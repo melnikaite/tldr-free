@@ -39,6 +39,10 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
 ]
+# Optional: only needed when llm.api_key_keychain is set in config.
+keychain = [
+    "keyring>=25",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

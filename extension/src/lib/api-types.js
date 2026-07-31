@@ -204,7 +204,128 @@
  * @property {number} queue_running
  * @property {boolean} llm_backend_reachable
  * @property {string[]} llm_backend_models
+ * @property {string | null} [llm_backend_error]
  * @property {string} version
+ */
+
+// ---------------------------------------------------------------------------
+// GET/PATCH /config, POST /config/test — daemon settings editable from the
+// options page instead of hand-editing tldr.yaml. Secrets are write-only:
+// api_key is never echoed back, only api_key_set/api_key_hint/api_key_source.
+// ---------------------------------------------------------------------------
+
+/** @typedef {"env" | "keychain" | "file" | "inline" | "none"} ApiKeySource */
+
+/** @typedef {"file" | "keychain" | "inline"} ApiKeyStorage */
+
+/**
+ * @typedef {object} LLMConfigOut
+ * @property {string} base_url
+ * @property {string} model
+ * @property {number} context_length
+ * @property {number} single_pass_token_limit
+ * @property {number} max_concurrent_calls
+ * @property {string | null} reasoning_effort
+ * @property {boolean} api_key_set
+ * @property {string | null} api_key_hint     - last 4 chars of the resolved key, or null
+ * @property {ApiKeySource} api_key_source
+ */
+
+/**
+ * @typedef {object} WhisperConfigOut
+ * @property {string} base_url
+ * @property {string} model
+ * @property {number} max_upload_mb
+ */
+
+/**
+ * @typedef {object} OutputConfigOut
+ * @property {string} language
+ */
+
+/**
+ * @typedef {object} ConfigResponse
+ * @property {LLMConfigOut} llm
+ * @property {WhisperConfigOut} whisper
+ * @property {OutputConfigOut} output
+ * @property {string} config_path      - absolute path to tldr.yaml (read-only template)
+ * @property {string} overrides_path   - absolute path to tldr.local.yaml (PATCH target)
+ */
+
+/**
+ * Partial update for `llm` in PATCH /config. Only fields present in the
+ * request body are applied. `api_key`/`api_key_storage` are write-only —
+ * an absent or empty `api_key` leaves the currently configured key
+ * untouched even if `api_key_storage` changes (the existing key is
+ * migrated to the new storage instead).
+ *
+ * @typedef {object} LLMConfigPatch
+ * @property {string} [base_url]
+ * @property {string} [model]
+ * @property {number} [context_length]
+ * @property {number} [single_pass_token_limit]
+ * @property {number} [max_concurrent_calls]
+ * @property {string | null} [reasoning_effort]
+ * @property {string} [api_key]              - write-only; unset/empty = unchanged
+ * @property {ApiKeyStorage} [api_key_storage]  - write-only; default "file"
+ */
+
+/**
+ * @typedef {object} WhisperConfigPatch
+ * @property {string} [base_url]
+ * @property {string} [model]
+ * @property {number} [max_upload_mb]
+ */
+
+/**
+ * @typedef {object} OutputConfigPatch
+ * @property {string} [language]
+ */
+
+/**
+ * @typedef {object} ConfigPatchRequest
+ * @property {LLMConfigPatch} [llm]
+ * @property {WhisperConfigPatch} [whisper]
+ * @property {OutputConfigPatch} [output]
+ */
+
+/**
+ * Same shape as ConfigResponse plus `restart_required`: true when a change
+ * (currently only `llm.max_concurrent_calls`) can't take effect on the
+ * running process and needs a daemon restart.
+ *
+ * @typedef {ConfigResponse & { restart_required: boolean }} ConfigPatchResponse
+ */
+
+/**
+ * @typedef {object} ConfigTestLLMOverrides
+ * @property {string} [base_url]
+ * @property {string} [model]
+ * @property {string} [api_key]
+ */
+
+/**
+ * Empty body ({}) tests the currently saved llm config.
+ *
+ * @typedef {object} ConfigTestRequest
+ * @property {ConfigTestLLMOverrides} [llm]
+ */
+
+/**
+ * Always HTTP 200 — probe failures are reported in the body (never thrown)
+ * since a 401/timeout/etc. IS the useful answer this endpoint exists to
+ * give. `step` marks which probe ran last: "models" (GET {base_url}/models)
+ * or "completion" (a minimal chat completion). `detail` is the provider's
+ * error message verbatim (truncated to 2000 chars), with the API key itself
+ * scrubbed out if it happened to be echoed back.
+ *
+ * @typedef {object} ConfigTestResponse
+ * @property {boolean} ok
+ * @property {"models" | "completion" | null} step
+ * @property {number | null} status_code
+ * @property {string | null} detail
+ * @property {string[]} models
+ * @property {number | null} latency_ms
  */
 
 // Marker export so editors recognise this as an ES module.

@@ -139,6 +139,9 @@ def test_systemd_unit_content_and_hardening(
     unit = service.install_service(platform="linux", home=tmp_path)
     assert unit == tmp_path / ".config" / "systemd" / "user" / "tldr-daemon.service"
     text = unit.read_text()
+    # Optional key material (cloud llm.api_key) can live outside the yaml —
+    # the leading "-" means startup doesn't fail if the file is absent.
+    assert "EnvironmentFile=-%h/.config/tldr/env" in text
     assert "ExecStart=/opt/bin/tldr-daemon" in text
     assert "Restart=on-failure" in text
     assert "NoNewPrivileges=true" in text

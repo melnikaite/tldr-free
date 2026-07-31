@@ -12,16 +12,22 @@ separators, e.g.:
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
+import stat
+import tempfile
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from src import paths
+
+log = logging.getLogger(__name__)
 
 DAEMON_VERSION = "0.1.0"
 DAEMON_API_VERSION = 3
@@ -30,6 +36,13 @@ DAEMON_API_VERSION = 3
 class LLMConfig(BaseModel):
     base_url: str
     api_key: str = "dummy"
+    # Alternative ways to supply the API key, in priority order (see
+    # ``effective_api_key``): a file on disk, or an OS keychain entry. Both
+    # are optional — most local backends (mlx-server, LocalAI, Ollama) don't
+    # check the key at all and the "dummy" default is fine.
+    api_key_file: str | None = None
+    api_key_keychain: str | None = None
+    api_key_keychain_account: str = "api_key"
     model: str
     context_length: int = 32768
     single_pass_token_limit: int = 24000
@@ -48,6 +61,87 @@ class LLMConfig(BaseModel):
     # Leave null (the default) for backends that don't support this field;
     # they will simply ignore or error on the extra body parameter.
     reasoning_effort: str | None = None
+    # Which kwarg carries the token limit. "auto" (default) starts with
+    # "max_tokens" and lets llm.client auto-adapt to "max_completion_tokens"
+    # on a 400 from the backend (OpenAI o-series/gpt-5). Pin it to skip the
+    # detection round-trip once you know your backend's dialect.
+    token_param: Literal["auto", "max_tokens", "max_completion_tokens"] = "auto"
+    # Whether to send `temperature` at all. None (default) = auto-detect:
+    # start by sending it, stop if the backend 400s on a non-default value
+    # (OpenAI o-series/gpt-5 only accept the default). True/False pins it.
+    send_temperature: bool | None = None
+    # Extra tokens added to the requested limit when sending it as
+    # `max_completion_tokens`, so hidden reasoning tokens (o-series/gpt-5)
+    # don't eat the entire budget and leave `content` empty.
+    reasoning_headroom_tokens: int = 4000
+    # Optional hard ceiling on the token limit requested in any single call,
+    # regardless of what the caller asked for. Useful to cap spend on a
+    # metered cloud backend. None = no clamp.
+    max_output_tokens: int | None = None
+
+    @property
+    def effective_api_key(self) -> str:
+        """Resolve the API key to actually send to the backend.
+
+        Strict priority order:
+
+        1. Env var ``TLDR__LLM__API_KEY`` — read directly from
+           ``os.environ`` so it always wins. (``_apply_env_overrides``
+           already maps this same var onto ``api_key`` before validation,
+           so in practice this is usually a no-op re-confirmation — but
+           reading it here directly makes the top-priority guarantee
+           explicit and independent of that generic mechanism.)
+        2. ``api_key_keychain`` — looked up via ``keyring.get_password``,
+           with ``api_key_keychain_account`` as the account name.
+        3. ``api_key_file`` — path read and stripped.
+        4. Inline ``api_key`` field (default: the local-backend dummy value).
+
+        Raises ``RuntimeError`` for any misconfiguration (missing optional
+        dependency, missing/empty file, missing keychain entry) rather than
+        silently falling through to an empty or wrong key.
+        """
+        env_key = os.environ.get("TLDR__LLM__API_KEY")
+        if env_key:
+            return env_key
+
+        if self.api_key_keychain:
+            try:
+                import keyring
+            except ImportError as e:
+                raise RuntimeError(
+                    "llm.api_key_keychain is set but the 'keyring' package "
+                    "is not installed. Install it with "
+                    "'uv pip install tldr-daemon[keychain]' "
+                    "(or 'pip install tldr-daemon[keychain]')."
+                ) from e
+            password = keyring.get_password(self.api_key_keychain, self.api_key_keychain_account)
+            if not password:
+                raise RuntimeError(
+                    "No password found in the OS keychain for "
+                    f"service={self.api_key_keychain!r} "
+                    f"account={self.api_key_keychain_account!r}."
+                )
+            return password
+
+        if self.api_key_file:
+            path = Path(self.api_key_file).expanduser()
+            if not path.is_file():
+                raise RuntimeError(f"llm.api_key_file {path} does not exist.")
+            mode = stat.S_IMODE(path.stat().st_mode)
+            if mode & 0o077:
+                log.warning(
+                    "llm.api_key_file %s is readable beyond the owner (mode %o); "
+                    "consider `chmod 600 %s`.",
+                    path,
+                    mode,
+                    path,
+                )
+            key = path.read_text().strip()
+            if not key:
+                raise RuntimeError(f"llm.api_key_file {path} is empty.")
+            return key
+
+        return self.api_key
 
 
 class WhisperConfig(BaseModel):
@@ -182,29 +276,143 @@ def ensure_config_file(config_path: Path) -> bool:
     Returns True when a new file was written. Backend URLs in the template
     point at ``host.docker.internal`` (the container's view of the host);
     natively the backends are plain localhost, so we rewrite them.
+
+    Written with mode 0600 (owner read/write only) since the file may end up
+    holding a cloud API key inline (``llm.api_key``) — the config directory
+    isn't otherwise access-controlled.
     """
     if config_path.is_file():
         return False
     template = (resources.files("src.assets") / "tldr.yaml.example").read_text()
     template = template.replace("host.docker.internal", "127.0.0.1")
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(template)
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(template)
     return True
+
+
+def config_path() -> Path:
+    """Resolve the active ``tldr.yaml`` path: ``TLDR_CONFIG`` env override,
+    else the platform-conventional path (see ``paths.py``). Also used to
+    derive ``overrides_path()`` and reported verbatim by ``GET /config``."""
+    env_path = os.environ.get("TLDR_CONFIG")
+    return Path(env_path) if env_path else paths.default_config_path()
+
+
+def overrides_path() -> Path:
+    """Path to the user-writable overrides file, deep-merged on top of the
+    (comment-only, hand-edited) ``tldr.yaml`` template by ``get_config()``.
+
+    ``tldr.yaml`` is never written by the daemon itself — ``yaml.safe_dump``
+    would destroy its comments, which is where the backend examples live.
+    ``PATCH /config`` writes here instead. Defaults to a sibling of
+    ``config_path()``; override with ``TLDR_CONFIG_OVERRIDES`` (mirrors
+    ``TLDR_CONFIG``) so tests can point both at an isolated ``tmp_path``.
+    """
+    env_path = os.environ.get("TLDR_CONFIG_OVERRIDES")
+    if env_path:
+        return Path(env_path)
+    return config_path().parent / "tldr.local.yaml"
+
+
+def api_key_file_path() -> Path:
+    """Where ``PATCH /config`` writes the LLM API key when
+    ``api_key_storage="file"`` is selected. Lives next to
+    ``overrides_path()`` (which the override file itself points at via
+    ``llm.api_key_file``) rather than next to ``config_path()`` directly —
+    this keeps it in the same, possibly test-isolated, writable directory
+    as ``tldr.local.yaml`` instead of next to a possibly read-only
+    ``tldr.yaml`` (e.g. the checked-in example used by the test suite)."""
+    return overrides_path().parent / "llm.key"
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``overlay`` onto ``base``, returning a new dict.
+    Non-dict values in ``overlay`` replace the corresponding ``base`` value
+    outright (including replacing a dict with a scalar, or vice versa)."""
+    result = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _atomic_write_text(path: Path, text: str, mode: int) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + ``os.replace``) with
+    ``mode`` permissions, so a crash mid-write never leaves a partial file
+    and a concurrent reader never sees one either."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def read_overrides() -> dict[str, Any]:
+    """Load the raw overrides YAML (empty dict if the file doesn't exist)."""
+    path = overrides_path()
+    if not path.is_file():
+        return {}
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def write_overrides(data: dict[str, Any]) -> None:
+    """Atomically persist ``data`` as the overrides YAML, mode 0600 (it may
+    hold ``llm.api_key`` inline). Caller is responsible for validating the
+    result first — see ``validate_full_config``."""
+    text = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+    _atomic_write_text(overrides_path(), text, 0o600)
+
+
+def write_api_key_file(key: str) -> Path:
+    """Atomically write ``key`` to ``api_key_file_path()`` at mode 0600.
+    Returns the path so the caller can point ``llm.api_key_file`` at it."""
+    path = api_key_file_path()
+    _atomic_write_text(path, key, 0o600)
+    return path
+
+
+def validate_full_config(overrides: dict[str, Any]) -> Config:
+    """Validate ``overrides`` deep-merged onto the on-disk template, WITHOUT
+    touching the cached ``get_config()`` singleton or writing anything.
+
+    Used by ``PATCH /config`` to reject bad input with a 422 before
+    persisting — raises ``pydantic.ValidationError`` on failure. Env
+    overrides are re-applied on top so validation matches exactly what a
+    subsequent ``get_config()`` call would produce.
+    """
+    path = config_path()
+    raw = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
+    merged = _deep_merge(raw, overrides) if overrides else raw
+    merged = _apply_env_overrides(merged)
+    return Config.model_validate(merged)
 
 
 @lru_cache(maxsize=1)
 def get_config() -> Config:
+    path = config_path()
     env_path = os.environ.get("TLDR_CONFIG")
-    config_path = Path(env_path) if env_path else paths.default_config_path()
-    if not config_path.is_file():
+    if not path.is_file():
         if env_path:
             # An explicit path that doesn't exist is a user error — don't
             # silently create a default somewhere they pointed at.
             raise FileNotFoundError(
-                f"Config file not found at {config_path}. "
+                f"Config file not found at {path}. "
                 "Run 'task install' to copy from config/tldr.yaml.example."
             )
-        ensure_config_file(config_path)
-    raw = yaml.safe_load(config_path.read_text()) or {}
+        ensure_config_file(path)
+    raw = yaml.safe_load(path.read_text()) or {}
+    overrides = read_overrides()
+    if overrides:
+        raw = _deep_merge(raw, overrides)
     raw = _apply_env_overrides(raw)
     return Config.model_validate(raw)

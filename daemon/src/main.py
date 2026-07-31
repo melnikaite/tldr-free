@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api import ai, events, health, jobs, workers
+from src.api import config as config_api
 from src.config import DAEMON_VERSION, get_config
 from src.storage import repo
 from src.storage.db import dispose_engine, init_engine
@@ -103,3 +104,4 @@ app.include_router(ai.router)
 app.include_router(events.router)
 app.include_router(workers.router)
 app.include_router(health.router)
+app.include_router(config_api.router)

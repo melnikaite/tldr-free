@@ -108,9 +108,14 @@ def _patch_health_backend(
     *,
     response: _FakeResponse | None = None,
     raises: Exception | None = None,
+    captured_headers: dict[str, str] | None = None,
 ) -> None:
     """Replace ``httpx.AsyncClient`` (as imported in ``src.api.health``) with a
-    fake whose ``.get`` returns ``response`` or raises ``raises``."""
+    fake whose ``.get`` returns ``response`` or raises ``raises``.
+
+    When ``captured_headers`` is passed, the outgoing ``headers=`` kwarg is
+    copied into it so the test can assert on what was sent.
+    """
 
     class _FakeAsyncClient:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -122,7 +127,9 @@ def _patch_health_backend(
         async def __aexit__(self, *exc: Any) -> None:
             return None
 
-        async def get(self, url: str) -> _FakeResponse:
+        async def get(self, url: str, headers: dict[str, str] | None = None) -> _FakeResponse:
+            if captured_headers is not None and headers:
+                captured_headers.update(headers)
             if raises is not None:
                 raise raises
             assert response is not None
@@ -190,6 +197,54 @@ def test_health_degraded_when_backend_unreachable(
     assert body["status"] == "degraded"
     assert body["llm_backend_reachable"] is False
     assert body["llm_backend_models"] == []
+
+
+def test_health_sends_authorization_header_when_key_configured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cloud backends 401 without a Bearer token — /health must send one
+    whenever an (effective) API key is configured, so a real 401 shows up
+    as "unauthorized" rather than getting misreported as "unreachable"."""
+    from src.config import get_config
+
+    monkeypatch.setattr(get_config().llm, "api_key", "sk-test-123")
+
+    captured: dict[str, str] = {}
+    _patch_health_backend(
+        monkeypatch,
+        response=_FakeResponse(200, {"data": [{"id": "gpt-5"}]}),
+        captured_headers=captured,
+    )
+
+    r = client.get("/health")
+    assert r.status_code == 200, r.text
+    assert captured.get("Authorization") == "Bearer sk-test-123"
+
+
+def test_health_401_reports_unauthorized_and_degraded(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backend answers 401 (bad/missing key) → distinguished from a plain
+    network-unreachable failure via llm_backend_error, overall degraded."""
+    _patch_health_backend(monkeypatch, response=_FakeResponse(401, {}))
+
+    r = client.get("/health")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert body["llm_backend_reachable"] is False
+    assert body["llm_backend_error"] == "401 unauthorized — check llm.api_key"
+
+
+def test_health_error_field_absent_on_success(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_health_backend(
+        monkeypatch, response=_FakeResponse(200, {"data": [{"id": "gemma-4"}]})
+    )
+    r = client.get("/health")
+    assert r.status_code == 200, r.text
+    assert r.json()["llm_backend_error"] is None
 
 
 # ---------------------------------------------------------------------------

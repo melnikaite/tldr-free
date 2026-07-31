@@ -102,6 +102,12 @@ Description=TLDR daemon (page/video summaries)
 After=network-online.target
 
 [Service]
+# Optional: cloud API keys (llm.api_key et al.) can live here instead of the
+# yaml config, out of the unit file and out of `systemctl show`. The leading
+# "-" means "don't fail to start if the file is missing" — most installs
+# don't need it (local backends, or `llm.api_key_file`/`api_key_keychain`
+# already point elsewhere).
+EnvironmentFile=-%h/.config/tldr/env
 ExecStart={program}
 Restart=on-failure
 RestartSec=5

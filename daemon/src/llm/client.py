@@ -40,10 +40,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from openai.types.chat import ChatCompletionMessageParam
 
 from src.config import get_config
@@ -54,7 +55,7 @@ def _client() -> AsyncOpenAI:
     config = get_config()
     return AsyncOpenAI(
         base_url=config.llm.base_url,
-        api_key=config.llm.api_key,
+        api_key=config.llm.effective_api_key,
     )
 
 
@@ -62,20 +63,220 @@ def _model() -> str:
     return get_config().llm.model
 
 
-def _extra_body() -> dict[str, str] | None:
+def reset_caches() -> None:
+    """Drop the cached ``AsyncOpenAI`` client and dialect guess after a
+    config change (``PATCH /config``), so the next call rebuilds them from
+    the fresh ``base_url``/``api_key``/``model``/dialect-related fields.
+
+    Deliberately does NOT touch ``_llm_lock()`` — its ``asyncio.Semaphore``
+    is bound to the running event loop and can't be resized in place; a
+    changed ``max_concurrent_calls`` needs a process restart instead (see
+    ``restart_required`` in the ``/config`` API responses).
+    """
+    _client.cache_clear()
+    _dialect.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Backend "dialect" auto-detection
+#
+# Local backends (mlx-server, LocalAI, Ollama, llama.cpp) and OpenAI's
+# o-series/gpt-5 models disagree on three request-body dimensions:
+#   - the token-limit kwarg name (`max_tokens` vs `max_completion_tokens`)
+#   - whether a non-default `temperature` is accepted at all
+#   - whether `reasoning_effort` is a known field
+# Sending the wrong shape gets an HTTP 400 back. Rather than hardcode a
+# backend allowlist, we start optimistic (today's local-first defaults) and
+# flip the relevant flag the first time we see a 400 that blames it,
+# retrying the same logical call once per flip. The result is cached for the
+# rest of the process lifetime (not persisted to disk) so subsequent calls
+# don't pay the round-trip again.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Dialect:
+    token_param: str = "max_tokens"
+    send_temperature: bool = True
+    send_reasoning_effort: bool = True
+
+
+def _new_dialect() -> _Dialect:
+    """Build a starting dialect from config-pinned overrides (if any),
+    defaulting to the optimistic local-first assumptions otherwise. Exposed
+    (uncached) for callers that need a throwaway dialect scoped to a single
+    call — e.g. ``POST /config/test`` probing a candidate backend that may
+    not be the currently-configured/cached one."""
+    cfg = get_config().llm
+    dialect = _Dialect()
+    if cfg.token_param != "auto":
+        dialect.token_param = cfg.token_param
+    if cfg.send_temperature is not None:
+        dialect.send_temperature = cfg.send_temperature
+    return dialect
+
+
+@lru_cache(maxsize=1)
+def _dialect() -> _Dialect:
+    return _new_dialect()
+
+
+def _detect_400_dimension(exc: BadRequestError) -> str | None:
+    """Classify a 400 as one of the three known dialect mismatches, or None
+    if it's unrelated (in which case the caller should just propagate it)."""
+    haystack = f"{exc.param or ''} {exc}".lower()
+    if "max_tokens" in haystack:
+        return "max_tokens"
+    if "temperature" in haystack:
+        return "temperature"
+    if "reasoning_effort" in haystack:
+        return "reasoning_effort"
+    return None
+
+
+def _extra_body(dialect: _Dialect) -> dict[str, str] | None:
     """Return extra request-body fields needed by the configured backend.
 
     ``reasoning_effort`` disables chain-of-thought on models like Gemma 4 in
-    LM Studio. Without it the model exhausts ``max_tokens`` on thinking tokens
-    and emits no ``delta.content``. Set ``llm.reasoning_effort: "none"`` in
-    config/tldr.yaml to activate. Backends that don't know the field ignore it
-    (mlx-openai-server, Ollama, llama-server) or return a 400 — in which case
-    remove the key from the config for that backend.
+    LM Studio. Without it the model exhausts the token budget on thinking
+    tokens and emits no ``delta.content``. Set ``llm.reasoning_effort: "none"``
+    in config/tldr.yaml to activate. Suppressed once the dialect has learned
+    (via a 400) that the backend rejects the field.
     """
     effort = get_config().llm.reasoning_effort
-    if effort is not None:
+    if effort is not None and dialect.send_reasoning_effort:
         return {"reasoning_effort": effort}
     return None
+
+
+def _token_kwargs(dialect: _Dialect, requested_max_tokens: int) -> dict[str, int]:
+    """Build the single token-limit kwarg, applying the configured ceiling
+    and (for `max_completion_tokens`) reasoning headroom."""
+    cfg = get_config().llm
+    limit = requested_max_tokens
+    if cfg.max_output_tokens is not None:
+        limit = min(limit, cfg.max_output_tokens)
+    if dialect.token_param == "max_completion_tokens":
+        limit += cfg.reasoning_headroom_tokens
+    return {dialect.token_param: limit}
+
+
+def _build_kwargs(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    dialect: _Dialect,
+    stream: bool,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        model=model,
+        messages=cast(list[ChatCompletionMessageParam], messages),
+        extra_body=_extra_body(dialect),
+    )
+    kwargs.update(_token_kwargs(dialect, max_tokens))
+    if dialect.send_temperature:
+        kwargs["temperature"] = temperature
+    if stream:
+        kwargs["stream"] = True
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+    return kwargs
+
+
+# One attempt to LEARN each of the three known dialect dimensions
+# (token_param, send_temperature, send_reasoning_effort) + one final attempt
+# made with the fully-adapted dialect = 3 + 1 = 4. A backend that rejects
+# all three at once but reports them one violation per response (the real
+# case that motivated this: a cloud gpt-5/o-series config that still had
+# `reasoning_effort: "none"` left over from a LocalAI config) would
+# otherwise spend every attempt learning and never get a real shot with the
+# corrected dialect. If a 4th adaptable dimension is ever added, bump this
+# to 5 (dimensions + 1) — the "+1" is what guarantees a real attempt after
+# the last adaptation, not just another learning round.
+_MAX_DIALECT_ATTEMPTS = 4
+
+
+async def call_with_dialect_adaptation(
+    *,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    stream: bool,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    client: AsyncOpenAI | None = None,
+    model: str | None = None,
+    dialect: _Dialect | None = None,
+) -> Any:
+    """``chat.completions.create(...)``, auto-adapting the dialect on a 400.
+
+    By default runs against the cached prod client/model/dialect (the
+    process-lifetime-cached backend this daemon is configured to talk to).
+    Pass an explicit ``client``/``model``/``dialect`` to run the identical
+    adaptation logic against a DIFFERENT backend — e.g. ``POST /config/test``
+    probing a candidate (possibly not-yet-saved) config — without touching
+    the cached prod state. This keeps dialect-mismatch handling in exactly
+    one place instead of two diverging copies.
+
+    Must be called from INSIDE an already-acquired ``_llm_lock()`` slot when
+    operating on the cached prod client (the default) — it does not touch
+    the semaphore itself, so it's safe to retry internally without any risk
+    of double-acquire/double-release. Callers supplying their own throwaway
+    ``client`` (like the config-test probe) don't go through the semaphore
+    at all, which is fine — it exists to protect the shared prod backend,
+    not a one-off connectivity check.
+
+    For the streaming path this returns the (unconsumed) stream object: the
+    400 always happens at ``create(..., stream=True)`` time, before any
+    chunk is read, so retrying here never risks re-emitting partial output.
+    """
+    resolved_client = client if client is not None else _client()
+    resolved_model = model if model is not None else _model()
+    resolved_dialect = dialect if dialect is not None else _dialect()
+    cfg = get_config().llm
+    last_exc: BadRequestError | None = None
+    for _ in range(_MAX_DIALECT_ATTEMPTS):
+        kwargs = _build_kwargs(
+            model=resolved_model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            dialect=resolved_dialect,
+            stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        try:
+            return await resolved_client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            dimension = _detect_400_dimension(e)
+            if dimension == "max_tokens" and cfg.token_param == "auto":
+                resolved_dialect.token_param = "max_completion_tokens"
+            elif dimension == "temperature" and cfg.send_temperature is None:
+                resolved_dialect.send_temperature = False
+            elif dimension == "reasoning_effort":
+                resolved_dialect.send_reasoning_effort = False
+            else:
+                # Not one of the three known dimensions, or the relevant
+                # escape hatch is pinned by config — nothing to adapt.
+                raise
+            last_exc = e
+    if last_exc is None:
+        # Unreachable in practice: every non-returning loop iteration above
+        # either raises immediately (unknown/pinned dimension) or sets
+        # last_exc before looping again, so exhausting the loop without
+        # returning guarantees last_exc is set. Kept as an explicit check
+        # rather than `assert` because `python -O` strips asserts, which
+        # would turn this into a confusing `raise None`.
+        raise RuntimeError(
+            "call_with_dialect_adaptation exhausted attempts without capturing an exception"
+        )
+    raise last_exc
 
 
 @lru_cache(maxsize=1)
@@ -151,17 +352,14 @@ async def complete_with_messages(
     """
     await _acquire_llm_slot(respect_pause)
     try:
-        kwargs: dict[str, Any] = dict(
-            model=_model(),
-            messages=cast(list[ChatCompletionMessageParam], messages),
+        return await call_with_dialect_adaptation(
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            extra_body=_extra_body(),
+            stream=False,
+            tools=tools,
+            tool_choice=tool_choice,
         )
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
-        return await _client().chat.completions.create(**kwargs)
     finally:
         _llm_lock().release()
 
@@ -181,13 +379,11 @@ async def stream_with_messages(
     """
     await _acquire_llm_slot(respect_pause)
     try:
-        stream = await _client().chat.completions.create(
-            model=_model(),
-            messages=cast(list[ChatCompletionMessageParam], messages),
+        stream = await call_with_dialect_adaptation(
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             stream=True,
-            extra_body=_extra_body(),
         )
         chunk_timeout = get_config().llm.stream_chunk_timeout_seconds
         stream_iter = stream.__aiter__()

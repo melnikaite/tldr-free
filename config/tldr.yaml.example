@@ -9,6 +9,39 @@
 # Whisper is only needed as a last resort for YouTube videos that have no
 # official transcripts and no auto-generated captions. If you skip it those
 # videos will error at the transcription step rather than falling back.
+#
+# llm.base_url / whisper.base_url can point at a LOCAL server (the default,
+# examples right below) or a CLOUD one (examples further down, after
+# "LLM only") — same daemon, same pipeline either way.
+
+# ---------------------------------------------------------------------------
+# API key storage — applies independently to llm.* and whisper.*, in this
+# priority order (first match wins):
+#   1. Environment variable TLDR__LLM__API_KEY / TLDR__WHISPER__API_KEY —
+#      overrides everything below. Good for CI or an EnvironmentFile on the
+#      systemd unit.
+#   2. api_key_keychain (keychain service name) + api_key_keychain_account
+#      (account name) — macOS Keychain / Linux Secret Service. Needs the
+#      optional `keychain` extra (`tldr-daemon[keychain]`, or
+#      `uv tool install --force './daemon[keychain]'` natively). After
+#      `uv tool install --force` the daemon binary changes, so macOS will
+#      re-prompt for Keychain access once.
+#   3. api_key_file — path to a file containing just the key (`~` expands),
+#      permissions must be 0600. Recommended for real cloud keys.
+#   4. api_key inline below — fine for local backends that ignore the value
+#      (ollama, dummy, lm-studio, ...); avoid it for real cloud keys since
+#      this file sits in plain text (tldr.yaml itself is created 0600, but
+#      that's the only protection an inline key gets).
+#
+# Escape hatches, mostly relevant for cloud/reasoning backends — defaults
+# are usually right, the daemon auto-detects the backend's dialect from its
+# first response and retries once on an HTTP 400 (this is what makes gpt-5
+# and the o-series work with no extra config):
+#   token_param: auto                # auto | max_tokens | max_completion_tokens
+#   send_temperature: true           # default: auto-detected; some reasoning models reject temperature
+#   reasoning_headroom_tokens: 4000  # reserve output budget for hidden reasoning (gpt-5/o-series, etc.)
+#   max_output_tokens: 8000          # optional hard cap on visible output tokens
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Backend: Ollama (any OS, easiest setup) — default
@@ -140,6 +173,67 @@ whisper:
 #   context_length: 131072
 #   single_pass_token_limit: 80000
 #   max_concurrent_calls: 1
+
+# ---------------------------------------------------------------------------
+# Backend: OpenAI (cloud)
+# https://platform.openai.com/docs/api-reference
+#
+# Prefer api_key_file (or api_key_keychain) over inline api_key for a real
+# key — see "API key storage" above. context_length/single_pass_token_limit
+# should match the model you pick, not the local Gemma defaults above:
+# gpt-5's context window is much bigger than 128K. reasoning_headroom_tokens
+# covers gpt-5/o-series' hidden reasoning tokens; token_param and
+# send_temperature are auto-detected, no need to set them here.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: https://api.openai.com/v1
+#   api_key_file: ~/.config/tldr/openai.key          # or: api_key_keychain: tldr-daemon / api_key_keychain_account: openai
+#   model: gpt-5                                      # or gpt-5-mini, o4-mini, ...
+#   context_length: 400000                            # check the model's actual window
+#   single_pass_token_limit: 240000                   # ~60% of context_length
+#   max_concurrent_calls: 3                           # hosted backends tolerate more parallelism than a laptop GPU
+#
+# whisper:
+#   base_url: https://api.openai.com/v1
+#   api_key_file: ~/.config/tldr/openai.key
+#   model: whisper-1                                  # pay-per-minute; local Whisper is free
+
+# ---------------------------------------------------------------------------
+# Backend: Anthropic (cloud) — via its OpenAI-compatible endpoint
+# https://docs.anthropic.com/en/api/openai-sdk
+# No Whisper here — pair with a local Whisper backend above, or OpenAI's.
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: https://api.anthropic.com/v1
+#   api_key_file: ~/.config/tldr/anthropic.key
+#   model: claude-sonnet-4-5
+#   context_length: 200000
+#   single_pass_token_limit: 120000
+#   max_concurrent_calls: 3
+
+# ---------------------------------------------------------------------------
+# Backend: Google Gemini (cloud) — via its OpenAI-compatible endpoint
+# https://ai.google.dev/gemini-api/docs/openai
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+#   api_key_file: ~/.config/tldr/gemini.key
+#   model: gemini-2.5-flash
+#   context_length: 1000000
+#   single_pass_token_limit: 600000
+#   max_concurrent_calls: 3
+
+# ---------------------------------------------------------------------------
+# Backend: OpenRouter (cloud) — one key, routes to almost any hosted model
+# https://openrouter.ai/docs/quickstart
+# ---------------------------------------------------------------------------
+# llm:
+#   base_url: https://openrouter.ai/api/v1
+#   api_key_file: ~/.config/tldr/openrouter.key
+#   model: openai/gpt-5                               # provider/model — pick anything OpenRouter hosts
+#   context_length: 400000                            # match whichever model you route to
+#   single_pass_token_limit: 240000
+#   max_concurrent_calls: 3
 
 # ---------------------------------------------------------------------------
 # Output language. Use an ISO 639-1 code: en, ru, de, fr, es, it, pt, ja, …
