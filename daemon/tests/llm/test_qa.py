@@ -83,7 +83,7 @@ async def test_sufficient_material_skips_search(
     out = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="What happens at 00:30?", output_language="English"
+            job=job, question="What happens at 00:30?", output_language="English", from_audio=True
         )
     ]
 
@@ -131,7 +131,7 @@ async def test_falls_back_to_summary_when_raw_too_long(
         title="Long video", raw_text=big_raw, summary_md="## Краткая выжимка\n- Пункт"
     )
     async for _ in qa_mod.stream_answer(
-        job=job, question="?", output_language="English"
+        job=job, question="?", output_language="English", from_audio=True
     ):
         pass
 
@@ -159,7 +159,7 @@ async def test_handles_missing_title(monkeypatch: pytest.MonkeyPatch) -> None:
     out = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="q", output_language="English"
+            job=job, question="q", output_language="English", from_audio=True
         )
     ]
     assert [s for s in out if isinstance(s, str)] == ["ok"]
@@ -206,7 +206,7 @@ async def test_insufficient_material_triggers_search(
     items = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="how much VRAM", output_language="Russian"
+            job=job, question="how much VRAM", output_language="Russian", from_audio=True
         )
     ]
 
@@ -245,7 +245,7 @@ async def test_plan_tool_error_defaults_to_search(
     items = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="the question", output_language="English"
+            job=job, question="the question", output_language="English", from_audio=True
         )
     ]
     # Falls back to the raw question as the query and searches.
@@ -295,7 +295,7 @@ async def test_search_failure_still_answers(
     items = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="q", output_language="English"
+            job=job, question="q", output_language="English", from_audio=True
         )
     ]
     # Searching stage still emitted; answer streamed despite the failure.
@@ -330,9 +330,72 @@ async def test_malformed_plan_defaults_to_search(
     out = [
         item
         async for item in qa_mod.stream_answer(
-            job=job, question="q", output_language="English"
+            job=job, question="q", output_language="English", from_audio=True
         )
     ]
     # No query parsed → falls back to the raw question.
     assert searched == ["q"]
     assert "".join(s for s in out if isinstance(s, str)) == "ok"
+
+
+# ---------------------------------------------------------------------------
+# timestamp_rules threading — document sources must never see a timecode
+# instruction/example; transcript sources keep the inline-timecode rule.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_from_audio_true_uses_transcript_timestamp_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_complete(messages: list[dict], **kwargs: object) -> Any:
+        return _plan_completion(True, "q")
+
+    streamed: list[list[dict]] = []
+
+    async def fake_stream(messages: list[dict], **kwargs: object) -> AsyncIterator[str]:
+        streamed.append(messages)
+        yield "ok"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _FakeJob(title="T", raw_text="[00:30] hi", summary_md=None)
+    async for _ in qa_mod.stream_answer(
+        job=job, question="q", output_language="English", from_audio=True
+    ):
+        pass
+
+    prompt = streamed[0][0]["content"]
+    assert qa_mod._TIMESTAMP_RULES_TRANSCRIPT in prompt
+    assert qa_mod._TIMESTAMP_RULES_DOCUMENT not in prompt
+
+
+@pytest.mark.asyncio
+async def test_from_audio_false_uses_document_timestamp_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_complete(messages: list[dict], **kwargs: object) -> Any:
+        return _plan_completion(True, "q")
+
+    streamed: list[list[dict]] = []
+
+    async def fake_stream(messages: list[dict], **kwargs: object) -> AsyncIterator[str]:
+        streamed.append(messages)
+        yield "ok"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _FakeJob(title="T", raw_text="some article text", summary_md=None)
+    async for _ in qa_mod.stream_answer(
+        job=job, question="q", output_language="English", from_audio=False
+    ):
+        pass
+
+    prompt = streamed[0][0]["content"]
+    assert qa_mod._TIMESTAMP_RULES_DOCUMENT in prompt
+    assert qa_mod._TIMESTAMP_RULES_TRANSCRIPT not in prompt
+    # No timecode example must leak into a document prompt at all.
+    assert "[MM:SS]" in prompt or "[HH:MM:SS]" in prompt  # rule text itself
+    assert "01:30" not in prompt and "02:15" not in prompt

@@ -1,7 +1,7 @@
 """Single-job Q&A — layered answering: material → AI knowledge → web.
 
 Public surface:
-    async def stream_answer(*, job, question: str, output_language: str)
+    async def stream_answer(*, job, question: str, output_language: str, from_audio: bool)
         -> AsyncIterator[str | dict[str, Any]]
 
         Builds context = job.raw_text if it fits, else job.summary_md.
@@ -98,6 +98,22 @@ _PLAN_TOOL: dict[str, Any] = {
 # frequency penalty on generation is what stops the loop producing them.
 _MARKUP_ONLY_LINE = re.compile(r"^\s*(?:<[^>]+>\s*)+$")
 
+# Timestamp instructions for the synthesis prompt — chosen per source type so
+# a document-only job never even sees a [MM:SS] example to copy verbatim.
+_TIMESTAMP_RULES_TRANSCRIPT = (
+    "Timestamps: include a [MM:SS] or [HH:MM:SS] marker ONLY inline, right "
+    "after a sentence taken from the material's transcript, and ONLY when "
+    "the material itself contains that marker at that point. Put each "
+    'timestamp in its own bracket (e.g. "[02:15] ... [05:47]") — never '
+    'combine several inside one bracket like "[02:15, 05:47]". Never attach '
+    "a timestamp to a fact that came from your knowledge or the web, never "
+    "put one on a line by itself, and never output a list of bare timestamps."
+)
+_TIMESTAMP_RULES_DOCUMENT = (
+    "The material is a document (web page or PDF) and has NO timestamps. "
+    "Never output [MM:SS] or [HH:MM:SS] markers."
+)
+
 
 def clean_answer(text: str) -> str:
     """Strip degenerate filler a small model appends to a Q&A answer.
@@ -156,13 +172,18 @@ def _answer_messages(
     context: str,
     question: str,
     web_results: str,
+    from_audio: bool,
 ) -> list[dict[str, Any]]:
+    timestamp_rules = (
+        _TIMESTAMP_RULES_TRANSCRIPT if from_audio else _TIMESTAMP_RULES_DOCUMENT
+    )
     prompt = _load_prompt("qa.txt").format(
         output_language=output_language,
         title=title,
         context=context,
         question=question,
         web_results=web_results or "(no web search was run)",
+        timestamp_rules=timestamp_rules,
     )
     return [{"role": "user", "content": prompt}]
 
@@ -196,6 +217,7 @@ async def stream_answer(
     job: Any,
     question: str,
     output_language: str,
+    from_audio: bool,
 ) -> AsyncIterator[str | dict[str, Any]]:
     """Yield token deltas (str) or stage dicts (dict) for a QA turn.
 
@@ -247,6 +269,7 @@ async def stream_answer(
         context=context,
         question=question,
         web_results=web_results,
+        from_audio=from_audio,
     )
     async for delta in llm_client.stream_with_messages(
         messages,

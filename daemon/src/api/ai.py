@@ -19,10 +19,11 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-from src.api.schemas import AIStreamRequest, JobStatus
+from src.api.schemas import AUDIO_TRANSCRIPT_SOURCES, AIStreamRequest, JobStatus
 from src.config import get_config
 from src.llm import qa as llm_qa
 from src.storage import repo
+from src.workers import timecodes
 from src.workers.broker import (
     delta_event,
     done_event,
@@ -97,12 +98,15 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
 
     yield _sse(stage_event("thinking"))
 
+    from_audio = job.transcript_source in AUDIO_TRANSCRIPT_SOURCES
+
     parts: list[str] = []
     try:
         async for item in llm_qa.stream_answer(
             job=job,
             question=question,
             output_language=cfg.output.language_name,
+            from_audio=from_audio,
         ):
             if isinstance(item, str):
                 parts.append(item)
@@ -123,6 +127,10 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
     # degeneration cutoff above (bare [MM:SS] dumps, runs of <br>, stray tags)
     # so the stored — and reloaded — message is clean.
     answer = llm_qa.clean_answer("".join(parts).strip())
+    # Document sources (web page / PDF) have no timecodes to begin with, so
+    # any [MM:SS] marker here is a model hallucination — strip it deterministically.
+    if not from_audio:
+        answer = timecodes.strip_all_timecodes(answer)
     if not answer:
         yield _sse(error_event("LLM returned empty answer"))
         return

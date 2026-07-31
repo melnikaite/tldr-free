@@ -40,6 +40,7 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "context": "Material body.",
         "question": "What's the main point?",
         "web_results": "Search results body.",
+        "timestamp_rules": "Timestamp rule placeholder.",
     },
     "qa_plan.txt": {
         "title": "Sample title",

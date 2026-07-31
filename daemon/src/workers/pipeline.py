@@ -32,6 +32,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from src.api.schemas import (
+    AUDIO_TRANSCRIPT_SOURCES,
     DeferredReason,
     JobKind,
     JobStatus,
@@ -507,17 +508,6 @@ def _persist_extracted(
     )
 
 
-# Sources whose text comes from speech (so it may contain ASR artefacts the
-# summariser should clean up). Page/PDF sources are excluded.
-_AUDIO_TRANSCRIPT_SOURCES = frozenset(
-    {
-        TranscriptSource.WHISPER,
-        TranscriptSource.YOUTUBE_AUTO_CAPTIONS,
-        TranscriptSource.YOUTUBE_API,
-    }
-)
-
-
 async def _summarize_and_finish(
     job_id: str,
     *,
@@ -568,7 +558,7 @@ async def _summarize_and_finish(
     # artefacts: trailing outro hallucinations and misheard terms. Feed the
     # summariser a tail-cleaned copy and flag the source so it corrects obvious
     # ASR errors. The stored transcript (`text` → mark_done) is untouched.
-    from_audio = transcript_source in _AUDIO_TRANSCRIPT_SOURCES
+    from_audio = transcript_source in AUDIO_TRANSCRIPT_SOURCES
     summary_input = timecodes.strip_transcript_tail_noise(text) if from_audio else text
 
     try:

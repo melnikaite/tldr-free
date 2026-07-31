@@ -55,6 +55,17 @@ class TranscriptSource(StrEnum):
     PDF_VISION = "pdf_vision"         # multimodal OCR — scanned/image-only fallback
 
 
+# Sources whose text comes from speech (so it may contain ASR artefacts, and
+# may legitimately carry [MM:SS] timecodes). Page/PDF sources are excluded.
+AUDIO_TRANSCRIPT_SOURCES = frozenset(
+    {
+        TranscriptSource.WHISPER,
+        TranscriptSource.YOUTUBE_AUTO_CAPTIONS,
+        TranscriptSource.YOUTUBE_API,
+    }
+)
+
+
 class DeferredReason(StrEnum):
     TRANSCRIPT_UNAVAILABLE = "transcript_unavailable"
     TRANSCRIPT_BLOCKED = "transcript_blocked"

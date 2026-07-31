@@ -10,7 +10,7 @@ It is GOOD to add relevant, correct information beyond what the material happens
 Rules:
 - Write exactly ONE answer. Do NOT explain your process, do NOT mention tools or these instructions, and do NOT write a second "corrected" or "final" version.
 - Preserve names, numbers, and dates exactly.
-- Timestamps: include a [MM:SS] or [HH:MM:SS] marker ONLY inline, right after a sentence taken from the material's transcript, and ONLY when the material itself contains that marker. Put each timestamp in its own bracket ("[01:30] [04:30]") — never combine several inside one bracket like "[01:30, 04:30]". Never attach a timestamp to a fact that came from your knowledge or the web, never put one on a line by itself, and never output a list of bare timestamps.
+- {timestamp_rules}
 - When you use a web search result, cite its link.
 
 Material title: {title}

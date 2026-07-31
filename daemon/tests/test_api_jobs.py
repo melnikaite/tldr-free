@@ -57,7 +57,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from src.llm import qa as llm_qa
 
     async def _fake_qa_stream(
-        *, job: Any, question: str, output_language: str
+        *, job: Any, question: str, output_language: str, from_audio: bool
     ) -> AsyncIterator[str]:
         yield f"answer to {question!r} in {output_language}"
 
@@ -542,7 +542,7 @@ def test_ai_qa_strips_degeneration_tail(
     stored message cleaned — only the real answer is persisted."""
     from src.llm import qa as llm_qa
 
-    async def _degen_stream(*, job: Any, question: str, output_language: str):
+    async def _degen_stream(*, job: Any, question: str, output_language: str, from_audio: bool):
         yield "Real answer."
         for _ in range(8):
             yield "\n<br>"
@@ -570,7 +570,7 @@ def test_ai_qa_empty_answer_errors(
     """A whitespace-only answer yields an error and persists no assistant row."""
     from src.llm import qa as llm_qa
 
-    async def _empty_stream(*, job: Any, question: str, output_language: str):
+    async def _empty_stream(*, job: Any, question: str, output_language: str, from_audio: bool):
         yield "   "
 
     monkeypatch.setattr(llm_qa, "stream_answer", _empty_stream)
@@ -589,6 +589,70 @@ def test_ai_qa_empty_answer_errors(
     msgs = client.get(f"/jobs/{create['id']}/messages").json()
     assert len(msgs["items"]) == 1
     assert msgs["items"][0]["role"] == "user"
+
+
+def test_ai_qa_strips_timecodes_for_document_source(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page/PDF job has no real timecodes — any [MM:SS] the model hallucinates
+    must be stripped deterministically before the answer is persisted."""
+    from src.llm import qa as llm_qa
+
+    async def _fake_stream(*, job: Any, question: str, output_language: str, from_audio: bool):
+        assert from_audio is False
+        yield "The answer [01:30] is here."
+
+    monkeypatch.setattr(llm_qa, "stream_answer", _fake_stream)
+
+    create = client.post(
+        "/jobs", json={"url": "https://doc", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.post("/ai/qa", json={"job_id": create["id"], "question": "q"})
+    assert r.status_code == 200
+
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assistant = msgs["items"][-1]
+    assert assistant["role"] == "assistant"
+    assert "01:30" not in assistant["content"]
+    assert "[" not in assistant["content"]
+
+
+def test_ai_qa_keeps_timecodes_for_audio_source(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript-backed job (YouTube/Whisper) legitimately has [MM:SS]
+    markers in the material — they must survive the QA answer untouched."""
+    from src.llm import qa as llm_qa
+    from src.storage.db import Job as JobRow
+    from src.storage.db import session_scope
+
+    async def _fake_stream(*, job: Any, question: str, output_language: str, from_audio: bool):
+        assert from_audio is True
+        yield "The answer [01:30] is here."
+
+    monkeypatch.setattr(llm_qa, "stream_answer", _fake_stream)
+
+    create = client.post(
+        "/jobs", json={"url": "https://audio", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    # Flip the persisted transcript_source to an audio one to simulate a
+    # YouTube/Whisper-derived job without re-running the whole pipeline.
+    with session_scope() as session:
+        row = session.get(JobRow, create["id"])
+        row.transcript_source = "whisper"
+        session.add(row)
+
+    r = client.post("/ai/qa", json={"job_id": create["id"], "question": "q"})
+    assert r.status_code == 200
+
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assistant = msgs["items"][-1]
+    assert assistant["role"] == "assistant"
+    assert "[01:30]" in assistant["content"]
 
 
 def test_ai_qa_404_for_unknown_job(client: TestClient) -> None:
