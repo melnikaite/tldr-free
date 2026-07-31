@@ -28,3 +28,16 @@ sending to the daemon (both create and lookup). Implications:
 
 If you add a new URL family, extend `normalizeUrl` — never special-case on
 the daemon side.
+
+## Settings API writes to an overrides file, never to the template
+
+`GET /config` / `PATCH /config` / `POST /config/test`
+(`daemon/src/api/config.py`) let the extension edit backend/model/API
+key/output language without hand-editing YAML. `tldr.yaml` is a hand-edited,
+comment-heavy template — writing to it with `yaml.safe_dump` would destroy
+those comments. `PATCH` instead writes `tldr.local.yaml` (a sibling file,
+`src/config.py#overrides_path`), which `get_config()` deep-merges on top of
+the template before env-var overrides are applied (env still wins over
+both). Every `PATCH` is validated (`config.validate_full_config`) before
+anything is written. API keys are never echoed back by `GET`/`PATCH` — only
+`api_key_set` / `api_key_hint` (last 4 chars) / `api_key_source`.

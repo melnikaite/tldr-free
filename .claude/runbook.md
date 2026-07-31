@@ -255,9 +255,20 @@ on the host with a user-level autostart service.
   `uvx --from ./daemon tldr-daemon`.
 - **Config**: auto-created from the packaged template on first run at
   `~/Library/Application Support/tldr/tldr.yaml` (macOS) /
-  `$XDG_CONFIG_HOME/tldr/tldr.yaml` (Linux). `TLDR_CONFIG` overrides as
-  usual. Backend URLs are rewritten to `127.0.0.1` (no
-  `host.docker.internal` natively).
+  `$XDG_CONFIG_HOME/tldr/tldr.yaml` (Linux), created with `0600`
+  permissions. `TLDR_CONFIG` overrides as usual. Backend URLs are rewritten
+  to `127.0.0.1` (no `host.docker.internal` natively).
+- **Cloud API key**: three ways in, on top of inline `api_key` in
+  `tldr.yaml` — `api_key_file` (path, `~` expands, must be `0600`;
+  recommended), `api_key_keychain` + `api_key_keychain_account` (macOS
+  Keychain / Linux Secret Service; needs the `keychain` extra —
+  `uv tool install --force './daemon[keychain]'`; expect a Keychain
+  re-auth prompt after every `--force` reinstall since the binary
+  changes), or the `TLDR__LLM__API_KEY` env var, which for a systemd user
+  unit is best supplied via an `EnvironmentFile=` line pointing at a
+  `0600` file outside the repo. See [llm.md](llm.md) for the full
+  resolution order and the `token_param` / `reasoning_headroom_tokens`
+  escape hatches for reasoning models.
 - **Data**: `~/Library/Application Support/tldr/data` (macOS) /
   `$XDG_DATA_HOME/tldr` (Linux). A configured `data_dir: /data` is
   auto-substituted when `/data` doesn't exist (i.e. outside the container).

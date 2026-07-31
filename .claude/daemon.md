@@ -24,7 +24,7 @@ on shutdown):
    persisted — see [workers.md](workers.md)).
 5. Spawn long-running coroutines: `whisper_worker` (single, sequential) and
    `retention_worker` (sleeps 6h between sweeps).
-6. Mount API routers: `api/{jobs,ai,events,workers,health}.py`.
+6. Mount API routers: `api/{jobs,ai,events,workers,health,config}.py`.
 
 In-flight Whisper task on shutdown: the coroutine is cancelled, but the
 DB row stays in `running`. Next startup, step 4 picks it up. Idempotent.
@@ -70,6 +70,7 @@ isn't natively async, follow the same pattern — don't block the event loop.
 | Change | Where |
 |---|---|
 | New HTTP endpoint | `src/api/<file>.py` route + `src/api/schemas.py` model + mirror in `extension/src/lib/api-types.js` (same commit). See [contract.md](contract.md). |
+| New user-editable setting | Add to `LLMConfig`/`WhisperConfig`/`OutputConfig` in `src/config.py`, then surface it on the matching `*ConfigOut`/`*ConfigPatch` pair in `src/api/config.py` + `schemas.py` (`GET`/`PATCH /config`) — never write `tldr.yaml` itself, `PATCH` goes through `config.write_overrides` into `tldr.local.yaml`. See [contract.md](contract.md). |
 | New AI mode | Extend `POST /ai/stream` body in `api/ai.py` — keep the same event shapes. Add a new endpoint only if the response semantics are genuinely different. |
 | New SQLite column | Edit the v1 migration in `src/storage/migrations.py` (we wipe DB pre-1.0) + field on model in `src/storage/db.py` + helper in `repo.py`. If user-visible, add to `repo.job_summary_dict` so `/events` carries it. |
 | New repo write function | Follow the auto-emit pattern: call the `_publish_*` helper at the end so callers don't need explicit broker calls. See [events.md](events.md). |

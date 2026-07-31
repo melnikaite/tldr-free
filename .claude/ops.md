@@ -37,9 +37,13 @@ Invariants the native path must keep:
   Platform paths (`daemon/src/paths.py`) only apply when they don't.
 - **Config auto-create only at the default path.** An explicit `TLDR_CONFIG`
   pointing at a missing file still raises; the packaged template
-  (`daemon/src/assets/tldr.yaml.example`, kept in sync with
-  `config/tldr.yaml.example`) is only used for the platform default path,
-  with `host.docker.internal` rewritten to `127.0.0.1`.
+  (`daemon/src/assets/tldr.yaml.example`, kept byte-identical to
+  `config/tldr.yaml.example` — edit one, copy to the other) is only used
+  for the platform default path, with `host.docker.internal` rewritten to
+  `127.0.0.1`. Either way `tldr.yaml` is written with `0600` permissions,
+  since it may hold a plaintext cloud API key (`llm.api_key`). Prefer
+  `api_key_file` / `api_key_keychain` for real cloud keys — see
+  [llm.md](llm.md).
 - **One upgrade per start.** `src/selfupdate.py` refreshes yt-dlp +
   youtube-transcript-api at CLI startup; `docker-entrypoint.sh` exports
   `TLDR_SKIP_PKG_UPDATE=1` because it already upgrades itself. Pytest is

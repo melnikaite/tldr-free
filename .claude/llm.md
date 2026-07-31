@@ -105,3 +105,38 @@ the original via `GET /transcript` directly.
 Language codes are normalised by `llm.languages.normalize_lang`. Accepts
 ISO-639-1, ISO-639-2, English names, autonyms, and aliases; rejects
 anything unknown with a helpful 400 listing supported codes.
+
+## Cloud backends: API key resolution, dialect auto-detect, reasoning headroom
+
+`llm.base_url` (and independently `whisper.base_url`) may point at a cloud
+OpenAI-compatible endpoint instead of a local one — nothing else in the
+pipeline changes. Config fields: `api_key`, `api_key_file`,
+`api_key_keychain` + `api_key_keychain_account`, and the
+`TLDR__LLM__API_KEY` env var.
+
+- **Resolution order (first match wins): env → keychain → file → inline.**
+  This lets an operator override a committed `tldr.yaml` at deploy time
+  (env), keep the key out of any file at all (keychain, needs the optional
+  `keychain` extra), or at least keep it out of the YAML (`api_key_file`,
+  path expands `~`, must be `0600`) without touching `api_key` in plain
+  text. Whichever source wins, resolution happens once at config load —
+  changing the keychain entry or key file needs a daemon restart like any
+  other config change.
+- **Backend dialect auto-detection is cached per process.** Some
+  OpenAI-compatible backends want `max_tokens`, others (reasoning models —
+  gpt-5, o-series) require `max_completion_tokens` and reject `temperature`.
+  `token_param: auto` (default) probes this from the live backend: on the
+  first call it uses its best guess, and on an HTTP 400 it retries once
+  with the other dialect and remembers the result for the rest of the
+  process. `send_temperature` follows the same auto/cache pattern. Set
+  either explicitly only if a backend's 400 response is ambiguous enough
+  to fool the detector.
+- **`reasoning_headroom_tokens`** (default 4000) is added on top of the
+  requested output size for reasoning models, since their hidden
+  chain-of-thought consumes part of the same output-token budget before
+  the visible answer starts — without headroom, long answers get cut off
+  mid-stream on gpt-5/o-series. `max_output_tokens` is an optional hard
+  cap on the visible output, independent of headroom.
+- `tldr.yaml` is created with `0600` permissions (both the Docker
+  `task install` path and the native packaged-template path) since it may
+  contain a plaintext cloud key via `api_key`.

@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <strong>Local summaries, transcripts and Q&amp;A for web pages, PDFs, YouTube —
+  <strong>Local-first summaries, transcripts and Q&amp;A for web pages, PDFs, YouTube —
   and any audio or video your browser can see.</strong><br/>
-  Clickable timecodes. Persistent library. Open source. No API keys.
-  Nothing leaves your machine.
+  Clickable timecodes. Persistent library. Open source. Local by default —
+  bring your own cloud model if you want one.
 </p>
 
 <p align="center">
@@ -60,9 +60,10 @@ are a dime a dozen. TLDR aims at what those don't do:
 - **A persistent local library.** Summaries, transcripts, translations and
   per-item chat history live in SQLite on your machine, survive restarts
   and never expire unless you say so.
-- **Your model, your context window.** Any OpenAI-compatible backend, up to
-  128K context — a two-hour podcast summarised in one pass, not snippets
-  fed to a tiny built-in model.
+- **Your model, your context window.** Any OpenAI-compatible backend —
+  a local 128K-context model or a cloud model with a much bigger window —
+  a two-hour podcast summarised in one pass, not snippets fed to a tiny
+  built-in model.
 - **Transcripts are first-class.** Read the full text, translate it into
   your language on demand, navigate by timecode.
 
@@ -106,7 +107,9 @@ server or different ones — configure them independently in `config/tldr.yaml`.
 
 ### LLM backend (required)
 
-Any OpenAI-compatible server works. Popular choices:
+Any OpenAI-compatible server works — local or cloud. Local is the default
+and the point of the project; here are the popular local choices first,
+cloud backends further down.
 
 | Backend | Platform | LLM | Whisper | Notes |
 |---|---|---|---|---|
@@ -128,6 +131,119 @@ Any OpenAI-compatible server works. Popular choices:
 >
 > **LM Studio** — after loading the model, open its settings and set **Context Length** to `131072`.
 
+### Cloud backends (optional)
+
+`llm.base_url` can point at any OpenAI-compatible **cloud** endpoint just as
+well — same daemon, same pipeline, no code changes. Ready-made blocks for
+the usual suspects are in `config/tldr.yaml.example`; here's the gist:
+
+**OpenAI**
+```yaml
+llm:
+  base_url: https://api.openai.com/v1
+  api_key_file: ~/.config/tldr/openai.key   # see "API key storage" below
+  model: gpt-5                              # or gpt-5-mini, o4-mini, ...
+  context_length: 400000                    # check your model's window — not gemma's 128K
+  single_pass_token_limit: 240000           # ~60% of context_length
+  max_concurrent_calls: 3                   # hosted backends tolerate more parallelism than a laptop GPU
+```
+
+**Anthropic** (via its [OpenAI-compatible endpoint](https://docs.anthropic.com/en/api/openai-sdk))
+```yaml
+llm:
+  base_url: https://api.anthropic.com/v1
+  api_key_file: ~/.config/tldr/anthropic.key
+  model: claude-sonnet-4-5
+  context_length: 200000
+  single_pass_token_limit: 120000
+  max_concurrent_calls: 3
+```
+
+**Google Gemini** (via its [OpenAI-compatible endpoint](https://ai.google.dev/gemini-api/docs/openai))
+```yaml
+llm:
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  api_key_file: ~/.config/tldr/gemini.key
+  model: gemini-2.5-flash
+  context_length: 1000000
+  single_pass_token_limit: 600000
+  max_concurrent_calls: 3
+```
+
+**OpenRouter** (one key, routes to almost any hosted model)
+```yaml
+llm:
+  base_url: https://openrouter.ai/api/v1
+  api_key_file: ~/.config/tldr/openrouter.key
+  model: openai/gpt-5                       # provider/model — pick anything OpenRouter hosts
+  context_length: 400000                    # match whichever model you route to
+  single_pass_token_limit: 240000
+  max_concurrent_calls: 3
+```
+
+Whichever provider you pick, set `context_length` / `single_pass_token_limit`
+to *that model's* window, not the 128K figure the local Gemma blocks use —
+otherwise you're leaving most of a paid context window unused (or, the other
+way, tripping the backend's real limit).
+
+Reasoning models (GPT-5/o-series, and "thinking" models generally) spend
+part of their output budget on hidden reasoning before the visible answer
+starts. `reasoning_headroom_tokens` (default `4000`) reserves room for that
+so the answer doesn't get cut off partway. `token_param` (default `auto`)
+and `send_temperature` are escape hatches for when the daemon's automatic
+backend-dialect detection guesses wrong — normally you don't need to set
+them; `auto` probes the backend's dialect from its first response (and
+retries once on an HTTP 400), so GPT-5/o-series work out of the box.
+
+#### API key storage
+
+Four ways to give the daemon a key, in priority order (first match wins):
+
+1. **`TLDR__LLM__API_KEY` environment variable** — overrides everything
+   below. Good for CI, or when the key already lives in your service's
+   environment.
+2. **OS keychain** — `api_key_keychain` (service name) +
+   `api_key_keychain_account` (account name), backed by macOS Keychain or
+   the Linux Secret Service. Requires the optional `keychain` extra:
+   `uv tool install --force './daemon[keychain]'` natively, or
+   `tldr-daemon[keychain]` in the Docker image. Store the secret once —
+   ```bash
+   security add-generic-password -s tldr-daemon -a openai -w '<your-api-key>'   # macOS
+   ```
+   — then reference it:
+   ```yaml
+   api_key_keychain: tldr-daemon
+   api_key_keychain_account: openai
+   ```
+   Note: `uv tool install --force` rebuilds the daemon binary, so macOS will
+   ask you to re-approve Keychain access again the first time it runs after
+   an upgrade — that's expected, not a bug.
+3. **`api_key_file`** (recommended for real cloud keys) — a path (`~`
+   expands) to a file holding just the key, locked to `0600`:
+   ```bash
+   install -m 600 /dev/null ~/.config/tldr/openai.key
+   printf '%s' 'sk-...' > ~/.config/tldr/openai.key
+   ```
+   (or `umask 077` before creating the file by hand.)
+4. **`api_key`** inline in `tldr.yaml` — fine for local backends that ignore
+   the value (`ollama`, `dummy`, `lm-studio`, …). Avoid it for real cloud
+   keys: `tldr.yaml` is created `0600`, but a plaintext key in a config file
+   you might `cat`, screen-share, or back up is still a plaintext key.
+
+For systemd (native Linux install), an alternative to all of the above is an
+`EnvironmentFile` on the `tldr-daemon` unit setting `TLDR__LLM__API_KEY`,
+kept outside the repo with its own restrictive permissions.
+
+#### Privacy and cost, with a cloud backend
+
+Point `llm.base_url` at a cloud provider and the page text or transcript
+you process leaves your machine and goes to that provider — same as pasting
+it into their chat UI. The "nothing leaves your machine" story only holds
+for a local backend; going cloud is an explicit trade you're opting into.
+Cloud inference is billed by the provider per token, and cloud Whisper
+transcription (e.g. OpenAI's `whisper-1`) is billed per minute — both are
+the provider's cost, not TLDR's.
+
 ### Whisper backend (optional — only for YouTube without captions)
 
 Required only when `youtube-transcript-api` and yt-dlp captions both fail.
@@ -138,6 +254,7 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 | **mlx-openai-server** | macOS Apple Silicon | Already included if you use it for LLM |
 | [**faster-whisper-server**](https://github.com/fedirz/faster-whisper-server) | Any OS, CPU / GPU | `docker run -p 8000:8000 fedirz/faster-whisper-server` |
 | [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
+| **OpenAI Whisper API** | Cloud | `base_url: https://api.openai.com/v1`, `model: whisper-1` — pay-per-minute |
 
 ### Install — native, no Docker (recommended)
 
@@ -166,8 +283,13 @@ task uninstall:uv               # remove everything (keeps your data)
 Config and data live in the platform-conventional dirs —
 `~/Library/Application Support/tldr/` on macOS,
 `$XDG_CONFIG_HOME/tldr` + `$XDG_DATA_HOME/tldr` on Linux. Edit
-`tldr.yaml` there (backend URLs point at `127.0.0.1`), then restart the
-service.
+`tldr.yaml` there (backend URLs point at `127.0.0.1`, and it's created
+`0600`), then restart the service. Switching `llm.base_url` to a cloud
+provider works the same way here as in Docker — see
+[Cloud backends](#cloud-backends-optional) and
+[API key storage](#api-key-storage); on Linux, an `EnvironmentFile` on the
+`tldr-daemon` systemd unit is a good place for `TLDR__LLM__API_KEY` instead
+of putting the key in `tldr.yaml` at all.
 
 To **update**: `uv tool install --force git+https://github.com/melnikaite/tldr-free#subdirectory=daemon`
 (or `--force ./daemon` from a checkout), then restart the service. yt-dlp and
@@ -182,7 +304,8 @@ usually fixes itself with a restart.
 ```bash
 task install            # config + daemon image + extension vendor libs
 # Edit config/tldr.yaml — set llm.base_url (and whisper.base_url if needed)
-# Ready-made blocks for Ollama, LM Studio, mlx, llama-server are in the file
+# Ready-made blocks for Ollama, LM Studio, mlx, llama-server, and cloud
+# providers (OpenAI, Anthropic, Gemini, OpenRouter) are in the file
 task up                 # starts daemon (and mlx-server if you ran task install:mlx)
 task status             # health check
 ```
@@ -213,9 +336,11 @@ task test        # ruff + mypy + pytest inside the daemon container
 
 ## Configuration
 
-`config/tldr.yaml` (created from `tldr.yaml.example` on `task install`) holds
-the backend URLs, output language, retry behaviour, retention window, and
-concurrency caps.
+`config/tldr.yaml` (created from `tldr.yaml.example` on `task install`, or
+from the packaged template on first native run — see below) holds the
+backend URLs, API keys, output language, retry behaviour, retention window,
+and concurrency caps. It's created with `0600` permissions so only your user
+account can read it.
 
 `llm.base_url` and `whisper.base_url` are **independent** — point them at the
 same server or different ones:
@@ -249,9 +374,32 @@ the `context_length` field in `~/.mlx-server/config.yaml` (mlx-server).
 `single_pass_token_limit` caps the input before map-reduce kicks in; keep it
 at ~60–70% of `context_length` to leave room for the system prompt and output.
 
+**Editing settings from the extension** (backend/model/API key/output
+language) is also possible without touching YAML by hand: open it via
+`chrome://extensions` → TLDR → Details → Extension options (or right-click
+the toolbar icon → Options). The page's **Test connection** button is what
+answers "is my key even valid?" — it calls `POST /config/test` below. The
+daemon exposes `GET /config`, `PATCH /config`, and `POST /config/test` (probes
+credentials — reachability + a minimal completion — without saving). Partial
+`PATCH` writes land in `tldr.local.yaml`, a second file created next to
+`tldr.yaml` and deep-merged on top of it at load time (env var overrides
+still win over both); `tldr.yaml` itself is never rewritten, so its comments
+and backend examples stay intact. Both files are `0600`. `GET`/`PATCH`
+responses never include the API key itself — only `api_key_set` (bool),
+`api_key_hint` (last 4 chars), and `api_key_source` (`env` / `keychain` /
+`file` / `inline` / `none`). Picking `api_key_storage: file` (the default)
+or `keychain` via `PATCH` keeps the key out of both YAML files entirely.
+Changing `llm.max_concurrent_calls` needs a daemon restart to take effect —
+the response's `restart_required` flag says so.
+
 `tldr.yaml.example` has ready-made blocks for each backend combination:
 mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama, llama-server+whisper.cpp,
-and LLM-only (no Whisper).
+LLM-only (no Whisper), and the cloud providers from
+[Cloud backends](#cloud-backends-optional) above. For a cloud `llm.base_url`,
+set `context_length` / `single_pass_token_limit` to that model's context
+window, not the 128K figure the local Gemma examples use, and prefer
+`api_key_file` (or the keychain fields) over inline `api_key` — see
+[API key storage](#api-key-storage).
 
 To free the machine for foreground work, click the **Pause processing**
 button in the Library page (top-right). It pauses everything: the Whisper
