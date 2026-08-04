@@ -130,7 +130,7 @@ from src.api.schemas import Cookie
 from src.config import get_config
 from src.storage.cookies import write_netscape_cookie_file
 from src.workers.errors import FrameExtractionError
-from src.workers.ffmpeg import resolve_ffmpeg_dir
+from src.workers.ffmpeg import ensure_ffmpeg_on_path, resolve_ffmpeg_dir
 from src.workers.jsruntime import deno_runtime_opt
 
 log = logging.getLogger(__name__)
@@ -333,6 +333,13 @@ def _download_section_sync(
     on failure — the caller decides whether to fall back to a full download.
     """
     from yt_dlp.utils import download_range_func
+
+    # yt-dlp's download_ranges precheck resolves ffmpeg from PATH only and
+    # aborts before it ever reads ``ffmpeg_location`` — see
+    # ffmpeg.ensure_ffmpeg_on_path for the measurement. Under launchd the
+    # daemon's PATH is thin, so without this every section download fails with
+    # "ffmpeg is not installed" on a machine where ffmpeg is right there.
+    ensure_ffmpeg_on_path()
 
     dir.mkdir(parents=True, exist_ok=True)
     cookie_path = write_netscape_cookie_file(cookies, dir) if cookies else None

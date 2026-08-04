@@ -89,3 +89,56 @@ def test_prefetch_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", boom)
     ffmpeg.prefetch_ffmpeg()  # must not propagate
+
+
+# ---------------------------------------------------------------------------
+# ensure_ffmpeg_on_path — yt-dlp's download_ranges precheck reads PATH only
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_ffmpeg_on_path_prepends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", lambda: "/opt/ff/bin")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    assert ffmpeg.ensure_ffmpeg_on_path() == "/opt/ff/bin"
+    assert ffmpeg.os.environ["PATH"] == "/opt/ff/bin:/usr/bin:/bin"
+
+
+def test_ensure_ffmpeg_on_path_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Called per section download — must not grow PATH without bound."""
+    monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", lambda: "/opt/ff/bin")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    ffmpeg.ensure_ffmpeg_on_path()
+    ffmpeg.ensure_ffmpeg_on_path()
+    ffmpeg.ensure_ffmpeg_on_path()
+
+    assert ffmpeg.os.environ["PATH"] == "/opt/ff/bin:/usr/bin"
+
+
+def test_ensure_ffmpeg_on_path_already_present_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", lambda: "/usr/bin")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    assert ffmpeg.ensure_ffmpeg_on_path() == "/usr/bin"
+    assert ffmpeg.os.environ["PATH"] == "/usr/bin:/bin"
+
+
+def test_ensure_ffmpeg_on_path_unresolvable_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", lambda: None)
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    assert ffmpeg.ensure_ffmpeg_on_path() is None
+    assert ffmpeg.os.environ["PATH"] == "/usr/bin"
+
+
+def test_ensure_ffmpeg_on_path_empty_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg, "resolve_ffmpeg_dir", lambda: "/opt/ff/bin")
+    monkeypatch.setenv("PATH", "")
+
+    assert ffmpeg.ensure_ffmpeg_on_path() == "/opt/ff/bin"
+    assert ffmpeg.os.environ["PATH"] == "/opt/ff/bin"

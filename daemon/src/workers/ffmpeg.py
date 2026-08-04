@@ -127,4 +127,36 @@ def prefetch_ffmpeg() -> None:
         log.warning("ffmpeg: prefetch failed (%s)", exc)
 
 
-__all__ = ["resolve_ffmpeg_dir", "prefetch_ffmpeg"]
+def ensure_ffmpeg_on_path() -> str | None:
+    """Prepend the resolved ffmpeg directory to this process's ``PATH``.
+
+    Passing yt-dlp ``ffmpeg_location`` is enough for its POSTPROCESSORS, which
+    is why audio extraction has always worked. It is NOT enough for partial
+    downloads: yt-dlp's precheck for ``download_ranges`` looks ffmpeg up on
+    PATH only and aborts with "you have requested downloading the video
+    partially, but ffmpeg is not installed" before the option is consulted.
+    Under launchd/systemd the daemon's PATH is thin, so that precheck fails on
+    a machine where ffmpeg is plainly present — measured directly: with a thin
+    PATH and ``ffmpeg_location`` set the section download aborts, and with the
+    same directory prepended to PATH it succeeds.
+
+    Idempotent, and deliberately uses whatever ``resolve_ffmpeg_dir`` returns
+    rather than a fixed location — on a machine without system ffmpeg that is
+    the static build cached under the data dir, and hardcoding a system path
+    would break exactly the setup the bundled fallback exists to support.
+
+    Returns the directory that is now on PATH, or None when no ffmpeg could be
+    resolved at all.
+    """
+    location = resolve_ffmpeg_dir()
+    if not location:
+        return None
+    current = os.environ.get("PATH", "")
+    if location in current.split(os.pathsep):
+        return location
+    os.environ["PATH"] = f"{location}{os.pathsep}{current}" if current else location
+    log.info("ffmpeg: prepended %s to PATH for subprocess lookups", location)
+    return location
+
+
+__all__ = ["ensure_ffmpeg_on_path", "resolve_ffmpeg_dir", "prefetch_ffmpeg"]
