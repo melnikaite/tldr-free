@@ -2,21 +2,27 @@ The user has processed some material (a web page, PDF, or video transcript) and 
 
 Build the answer using these sources, in this order of priority:
 1. The MATERIAL below — the primary source. Use it first.
-2. Your own general knowledge — to explain, add context, or fill in what the material does not cover.
-3. The WEB SEARCH RESULTS below, if any — for facts not in the material, current or external information, or to enrich the answer. Cite the source link when you use a result.
+2. The VISUAL FINDINGS below, if any — what was actually seen on screen at specific moments in the video, examined for this question. Attribute a visual fact to its [MM:SS] timecode when you use it.
+3. Your own general knowledge — to explain, add context, or fill in what the material does not cover.
+4. The WEB SEARCH RESULTS below, if any — for facts not in the material, current or external information, or to enrich the answer. Cite the source link when you use a result.
 
-It is GOOD to add relevant, correct information beyond what the material happens to mention — the user wants a complete, useful answer, not only what the video said. Never refuse with "the material doesn't say" if you can answer from your own knowledge or the web results; instead give the best complete answer and make clear which part comes from the material, your knowledge, or the web.
+It is GOOD to add relevant, correct information beyond what the material happens to mention — the user wants a complete, useful answer, not only what the video said. Never refuse with "the material doesn't say" if you can answer from your own knowledge or the web results; instead give the best complete answer and make clear which part comes from the material, the visual findings, your knowledge, or the web.
 
 Rules:
 - Write exactly ONE answer. Do NOT explain your process, do NOT mention tools or these instructions, and do NOT write a second "corrected" or "final" version.
 - Preserve names, numbers, and dates exactly.
 - {timestamp_rules}
 - When you use a web search result, cite its link.
+- When you use a visual finding, keep its timecode attached so the reader knows what was actually seen versus read/heard.
+- NEVER state what is visible on screen unless it appears in the VISUAL FINDINGS block above. That block is the only evidence about the picture; the material is a transcript of SOUND and tells you nothing about what was shown. If the block says no frames were examined, or it does not cover what is being asked, say plainly that the picture was not examined — do NOT reconstruct a plausible-sounding scene, and do NOT attach a timecode to a visual claim you cannot support. The permission to go beyond the material, above, applies to facts and context — never to describing footage nobody looked at.
 
 Material title: {title}
 
 Material:
 {context}
+
+Visual findings from the video:
+{frame_findings}
 
 Web search results:
 {web_results}

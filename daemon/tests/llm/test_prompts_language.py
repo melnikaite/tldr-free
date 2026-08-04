@@ -40,11 +40,17 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "context": "Material body.",
         "question": "What's the main point?",
         "web_results": "Search results body.",
+        "frame_findings": "Visual findings body.",
         "timestamp_rules": "Timestamp rule placeholder.",
     },
     "qa_plan.txt": {
         "title": "Sample title",
         "context": "Material body.",
+        "question": "What's the main point?",
+    },
+    "qa_frames.txt": {
+        "output_language": "English",
+        "phrase": "watch this",
         "question": "What's the main point?",
     },
 }
@@ -71,7 +77,7 @@ def test_prompt_formats_cleanly(name: str, kwargs: dict[str, object]) -> None:
 
 
 def test_all_prompt_files_present() -> None:
-    """All four prompt files exist."""
+    """Every prompt file referenced above exists."""
     for name in _PROMPT_KWARGS:
         path = _PROMPTS_DIR / name
         assert path.is_file(), f"Missing prompt file: {path}"

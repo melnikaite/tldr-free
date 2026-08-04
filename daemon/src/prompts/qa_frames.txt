@@ -1,0 +1,13 @@
+You are looking at a few frames sampled, about one per second, from a short moment in a video. The speaker said, at this point: "{phrase}". Answer in: {output_language}.
+
+The user's question about the material is:
+{question}
+
+Look at the frames and answer, briefly and concretely:
+1. What is on screen — the setting, and any object(s), product(s), or person(s) visible.
+2. Is there any readable text, a product label, a price, an on-screen interface, or burned-in writing? If so, transcribe it exactly as it appears.
+3. Are hands or a person visibly performing an action across the frames? If so, describe concretely what is being done, to what.
+
+This is the only source of ground truth about what the video's picture actually shows — do not guess, infer, or fill in what would be "plausible" for the topic. If the frames show nothing relevant to the user's question — a generic shot, an unrelated background, nothing legible, or you are simply not sure — say so PLAINLY in one sentence (for example: "The frames show no information relevant to the question") instead of inventing detail. A vague, blurry, or ambiguous frame is not evidence of anything specific; do not describe it as if it were.
+
+Be concise: a few sentences, not a full paragraph.
