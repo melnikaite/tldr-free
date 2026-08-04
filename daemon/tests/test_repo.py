@@ -301,3 +301,84 @@ def test_delete_jobs_older_than_removes_old_keeps_recent(isolated_db) -> None:
     assert deleted == 1
     assert repo.get_job(old.id) is None
     assert repo.get_job(new.id) is not None
+
+
+def test_delete_jobs_older_than_unlinks_audio_file(isolated_db, tmp_path) -> None:
+    """Retention sweeps used to drop rows only, leaving multi-MB audio behind."""
+    audio = tmp_path / "old-audio.wav"
+    audio.write_bytes(b"fake audio data")
+
+    old = repo.create_job(url="https://old", kind="media")
+    repo.set_audio(old.id, audio_path=str(audio))
+    kept = repo.create_job(url="https://new", kind="media")
+    kept_audio = tmp_path / "kept-audio.wav"
+    kept_audio.write_bytes(b"still needed")
+    repo.set_audio(kept.id, audio_path=str(kept_audio))
+
+    raw = isolated_db.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(
+            "UPDATE job SET created_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", old.id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    assert repo.delete_jobs_older_than(datetime(2020, 1, 1)) == 1
+    assert not audio.exists(), "swept job's audio should be unlinked"
+    assert kept_audio.exists(), "surviving job's audio must be left alone"
+
+
+# ---------------------------------------------------------------------------
+# Frame cleanup — both deletion paths must reach workers.frames
+# ---------------------------------------------------------------------------
+
+
+def test_delete_job_deletes_frames(isolated_db, monkeypatch) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(
+        "src.workers.frames.delete_job_frames", lambda jid: called.append(jid)
+    )
+
+    j = repo.create_job(url="https://x", kind="youtube")
+    assert repo.delete_job(j.id) is True
+    assert called == [j.id]
+
+
+def test_delete_jobs_older_than_deletes_frames(isolated_db, monkeypatch) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(
+        "src.workers.frames.delete_job_frames", lambda jid: called.append(jid)
+    )
+
+    old = repo.create_job(url="https://old", kind="youtube")
+    raw = isolated_db.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(
+            "UPDATE job SET created_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", old.id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    assert repo.delete_jobs_older_than(datetime(2020, 1, 1)) == 1
+    assert called == [old.id]
+
+
+def test_frame_cleanup_failure_does_not_block_row_deletion(
+    isolated_db, monkeypatch
+) -> None:
+    """Frames are optional; a cleanup error must never keep the row alive."""
+
+    def boom(_jid: str) -> None:
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("src.workers.frames.delete_job_frames", boom)
+
+    j = repo.create_job(url="https://x", kind="youtube")
+    assert repo.delete_job(j.id) is True
+    assert repo.get_job(j.id) is None

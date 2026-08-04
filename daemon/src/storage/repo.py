@@ -479,8 +479,9 @@ def find_pending_for_restart() -> list[Job]:
 def delete_job(job_id: str) -> bool:
     """Delete the Job row. FTS triggers and Message FK cascade handle cleanup.
 
-    Also unlinks any cached audio file (``job.audio_path``) so we don't leave
-    orphaned multi-MB files on disk after the row is gone.
+    Also unlinks any cached audio file (``job.audio_path``) and any video
+    frames fetched for this job, so we don't leave orphaned multi-MB files on
+    disk after the row is gone.
 
     Emits ``job_event("deleted", {"id": …})``. Returns True if a row was
     deleted, False if the id was not found.
@@ -493,8 +494,24 @@ def delete_job(job_id: str) -> bool:
         session.delete(job)
     if cached_audio:
         _safe_unlink(Path(cached_audio))
+    _delete_job_frames(job_id)
     _emit_deleted(job_id)
     return True
+
+
+def _delete_job_frames(job_id: str) -> None:
+    """Best-effort removal of a job's fetched video frames.
+
+    Imported locally: ``workers`` is a higher layer than ``storage``, and a
+    module-level import here would invert that. Frames are optional and their
+    absence is the common case, so a failure must never block deleting a row.
+    """
+    try:
+        from src.workers.frames import delete_job_frames
+
+        delete_job_frames(job_id)
+    except Exception:
+        log.warning("repo: failed to delete frames for job %s", job_id)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -555,7 +572,12 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
     Returns the number of jobs deleted. Message rows are removed by FK
     cascade (foreign_keys pragma is ON). Emits one ``job_event("deleted", …)``
     per row so any open Library updates immediately.
+
+    Unlinks each job's cached audio and fetched frames, same as
+    ``delete_job``. This path used to drop the rows only, which left orphaned
+    multi-MB audio files behind on every retention sweep.
     """
+    cached_audio: list[str] = []
     with session_scope() as session:
         stmt = select(Job.id).where(Job.created_at < cutoff)
         ids = list(session.exec(stmt).all())
@@ -565,13 +587,18 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
         for job_id in ids:
             job = session.get(Job, job_id)
             if job is not None:
+                if job.audio_path:
+                    cached_audio.append(job.audio_path)
                 # Clear linked rows explicitly — keep behaviour stable across
                 # SQLite pragma states (matches delete_job).
                 session.exec(
                     Message.__table__.delete().where(Message.job_id == job_id)  # type: ignore[attr-defined]
                 )
                 session.delete(job)
+    for path in cached_audio:
+        _safe_unlink(Path(path))
     for job_id in ids:
+        _delete_job_frames(job_id)
         _emit_deleted(job_id)
     return len(ids)
 

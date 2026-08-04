@@ -55,8 +55,29 @@ class ExhaustedRetriesError(TranscriptError):
         self.last = last
 
 
+class FrameExtractionError(Exception):
+    """Raised by ``workers.frames`` when a video-section download (yt-dlp) or
+    the subsequent frame extraction (ffmpeg) fails.
+
+    ``code`` reuses ``DeferredReason.NETWORK_ERROR`` ("network_error") — the
+    closest existing fit, not a perfect one. Both failure modes this class
+    covers (yt-dlp refusing/failing the section download, or ffmpeg being
+    handed an empty/corrupt segment because the fetch didn't really succeed)
+    trace back to "couldn't get usable video data from the remote host",
+    which is what ``network_error`` already means elsewhere in this file.
+    There is no ``DeferredReason`` member for "frame extraction" specifically
+    — adding one would mean editing ``api.schemas.DeferredReason``, which is
+    out of scope for the change that introduced this class. Flagged here
+    deliberately so a reviewer can decide whether a dedicated code is worth
+    adding later.
+    """
+
+    code: str = "network_error"
+
+
 __all__ = [
     "ExhaustedRetriesError",
+    "FrameExtractionError",
     "NetworkTranscriptError",
     "PermanentTranscriptError",
     "TranscriptError",
