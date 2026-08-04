@@ -81,6 +81,15 @@ of an identical sentence, a 57-segment run of "Ja.". YouTube caption
 segments never show this (measured 0-5% duplicate lines, longest run 1-2),
 so it's a Whisper-only failure mode.
 
+Note the boundary: this defect and its fix are independent of which chat
+model is configured — it happens in the transcription step and is a property
+of the transcript, so it needs no per-model verification (unlike the marker
+cap below, where behaviour genuinely varies by model). It was verified by
+running `collapse_repeated_segments` over every stored `raw_segments_json`
+in the live DB: the two polluted Whisper transcripts collapse 595→95 and
+656→387 segments, while all seven YouTube-sourced transcripts lose only
+byte-identical duplicates.
+
 `workers/timecodes.collapse_repeated_segments(segments)` collapses
 CONSECUTIVE exact-or-near-duplicate runs down to their first occurrence
 (kept as-is; the rest of the run is dropped). Near-duplicates are caught via
@@ -110,8 +119,9 @@ from `youtube-transcript-api`/yt-dlp and is measured clean.
 
 The LLM sometimes attaches every timecode it saw near a point to one
 summary bullet (e.g. 9 markers on one line) instead of picking one, making
-it unclear which link to click. Prompt wording is off the table (two prior
-attempts backfired), so this is enforced deterministically in code:
+it unclear which link to click. Prompt wording is off the table — see
+"Why not the prompt" below for what was tried and how each attempt failed
+on both models — so this is enforced deterministically in code:
 `workers/timecodes.cap_markers_per_line(text, max_markers=1)` keeps only the
 first (earliest, leftmost) `max_markers` markers per line and strips the
 rest, reusing `_tidy_after_bracket_removal` for whitespace cleanup. Default
@@ -136,7 +146,8 @@ whole LINES instead (simpler, and `cap_markers_per_line` — the non-streaming
 primitive, used as-is elsewhere — could be reused directly on each completed
 line), but that regressed real streaming latency badly: measured real
 summaries have their single LONGEST line as the very FIRST thing the model
-generates (the "## Обзор"/Overview paragraph, 613-706 chars measured) — with
+generates (the "## Обзор"/Overview paragraph, 613-706 chars measured) —
+with
 line-level buffering the side panel sat empty for 3-5s (gemma, ~50 tok/s) to
 7-8s (qwen3-vl, ~21 tok/s) at the most-watched moment of the whole UX, then
 dumped a wall of text at once. Marker-granularity holdback fixes that:
@@ -163,6 +174,53 @@ as before: the extension has no test runner at all (no way to verify JS
 changes via `task test`), and the project already centralizes timecode
 logic in Python (`build_marked_text` is the other example) — the "one
 place" principle above extends naturally to capping.
+
+### Why not the prompt — measured on two models
+
+Everything below was measured against two locally-served backends through
+LocalAI's llama.cpp backend: `gemma-4-e4b-it-qat-q4_0` (QAT Q4_0) and
+`qwen3-vl-8b-instruct` (post-training Q4_K_M). Both were driven through the
+production prompts and the production call shape, on real material from the
+live SQLite DB rather than synthetic text.
+
+Marker density is not a stable property of the prompt — it is a property of
+the model, and the two disagree. With the production prompt unchanged, gemma
+sat at 1-2 markers per bullet across runs, while qwen produced a maximum of
+1, 3 and 9 on the *same* material in three separate runs. So no observation
+from a single model generalises, and "it looked fine when I tried it" is not
+evidence.
+
+Three prompt rewrites were tried on the timestamp rule in
+`prompts/summary_single.txt`. Each moved the failure somewhere else, and the
+two models failed the same wording in *opposite* directions:
+
+- Appending a cap to the end of the existing conditional rule ("attach at
+  most one … never three or more"): no effect on qwen (still 3 per bullet);
+  gemma unchanged, since it was already compliant.
+- Leading with an unconditional imperative ("EXACTLY ONE timestamp per key
+  point"): fixed density on both models (max 1, four runs of four) but made
+  them FABRICATE markers on sources that contain none — gemma emitted 8 on
+  the "Attention Is All You Need" PDF, qwen 10 on the same PDF in a separate
+  run. Two different models, same wording, same new defect: the leading
+  imperative overrides the exception for untimed sources further down.
+- Leading with the condition instead ("first decide whether the source
+  contains markers …"): fixed the document case on both, but then qwen
+  emitted ZERO markers on a video that does have them (26 bullets, no
+  markers at all) — strictly worse, because jump-to-moment is the feature.
+
+Hence the deterministic cap. Known limitation to keep in mind: the cap
+bounds markers *per line*, so it does not fix fabrication. On untimed
+sources with the production prompt (three runs each), qwen emitted no
+markers in 6 of 6 runs, but gemma emitted 9 on a Wikipedia page in 1 of 6 —
+and a capped version of that is 1 spurious marker per line, not none.
+Removing markers from material that never had timestamps is a separate
+concern; `strip_all_timecodes` already exists for the QA path and is the
+natural tool if this needs closing on the summary path too.
+
+Scope caveat: two models, both quantised, both served by the same llama.cpp
+build. A different backend or a cloud model may behave differently — treat
+the numbers above as evidence that model-level behaviour varies, not as a
+characterisation of any model in general.
 
 ## Transcript translation
 
