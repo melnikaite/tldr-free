@@ -55,6 +55,7 @@ from typing import Any
 import httpx
 
 from src.config import get_config
+from src.workers.timecodes import collapse_repeated_segments
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +97,20 @@ async def transcribe_audio(
     Raises ``httpx.HTTPStatusError`` on server-side failure (caller turns that
     into a friendly error). Returns an empty-segments result when the server
     reports success but didn't transcribe anything (e.g. silent audio).
+
+    Before returning, collapses consecutive Whisper repetition-loop segments
+    (see ``timecodes.collapse_repeated_segments``) — hallucination loops over
+    noisy/silent audio can otherwise leave hundreds of duplicate lines in
+    every downstream consumer of ``segments``: ``build_marked_text`` (feeds
+    the summary), the persisted ``raw_segments_json`` (Transcript tab via
+    ``api/jobs._build_segments_text``), and ``workers/translator.py``
+    (translation source). Applying it here, once, after chunked transcription
+    has already merged all chunks back together, means a repetition loop
+    spanning a chunk boundary is still caught, and every consumer downstream
+    of this function is automatically clean — no changes needed in
+    ``runner.py`` or elsewhere. This is Whisper-only by construction: the
+    YouTube caption fast path (``pipeline.py``) builds its segments directly
+    from ``youtube-transcript-api``/yt-dlp and never calls this function.
     """
     cfg = get_config().whisper
     max_bytes = max(1, cfg.max_upload_mb) * 1024 * 1024
@@ -103,10 +118,16 @@ async def transcribe_audio(
 
     if size <= max_bytes:
         payload = await _post_audio(audio_path)
-        return _parse_payload(payload, total_duration=total_duration)
+        result = _parse_payload(payload, total_duration=total_duration)
+    else:
+        result = await _transcribe_chunked(
+            audio_path, total_duration=total_duration, max_bytes=max_bytes
+        )
 
-    return await _transcribe_chunked(
-        audio_path, total_duration=total_duration, max_bytes=max_bytes
+    return TranscribeResult(
+        segments=collapse_repeated_segments(result.segments),
+        language=result.language,
+        duration_seconds=result.duration_seconds,
     )
 
 

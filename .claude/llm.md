@@ -72,6 +72,98 @@ flavours depending on the job:
 Page (HTML) and PDF jobs don't get `[MM:SS]` markers from the LLM in the
 first place, so the post-processing short-circuits naturally for them.
 
+## Whisper repetition-loop collapse
+
+Whisper-family models occasionally decode-loop over noisy/silent audio,
+emitting the same sentence (or a slowly-drifting near-copy) as dozens to
+hundreds of consecutive segments — measured on real jobs: a 291-segment run
+of an identical sentence, a 57-segment run of "Ja.". YouTube caption
+segments never show this (measured 0-5% duplicate lines, longest run 1-2),
+so it's a Whisper-only failure mode.
+
+`workers/timecodes.collapse_repeated_segments(segments)` collapses
+CONSECUTIVE exact-or-near-duplicate runs down to their first occurrence
+(kept as-is; the rest of the run is dropped). Near-duplicates are caught via
+`difflib.SequenceMatcher` ratio ≥ `_NEAR_DUP_RATIO` (0.82) on top of
+exact-match, since hallucination loops often drift slightly each repeat
+rather than repeating byte-for-byte. The collapse threshold scales with
+segment length — `_SHORT_SEGMENT_RUN_THRESHOLD` (6) for short segments
+(≤ `_SHORT_SEGMENT_MAX_CHARS`, 12 chars) so a legitimate short dialogue
+repeat ("Ja." ×3-5) survives, vs. `_LONG_SEGMENT_RUN_THRESHOLD` (1) for
+longer segments, since a full sentence repeating even twice back-to-back is
+essentially never real speech. Only consecutive runs collapse — this is
+never a global dedup; the same sentence recurring later, separated by other
+content, is untouched.
+
+Hook point: `workers/transcribe.transcribe_audio()`, applied to the final
+`segments` list right before returning `TranscribeResult` — after chunked
+transcription has already merged all chunks back together, so a loop
+spanning a chunk boundary is still caught. This is upstream of every
+consumer of Whisper segments (`build_marked_text` for the summary, the
+persisted `raw_segments_json` for the Transcript tab, `workers/translator.py`
+for translation source) so they all see clean segments automatically — no
+changes needed in `runner.py` or elsewhere. Intentionally NOT applied to the
+YouTube caption fast path (`pipeline.py`), which builds segments directly
+from `youtube-transcript-api`/yt-dlp and is measured clean.
+
+## Marker-per-line cap
+
+The LLM sometimes attaches every timecode it saw near a point to one
+summary bullet (e.g. 9 markers on one line) instead of picking one, making
+it unclear which link to click. Prompt wording is off the table (two prior
+attempts backfired), so this is enforced deterministically in code:
+`workers/timecodes.cap_markers_per_line(text, max_markers=1)` keeps only the
+first (earliest, leftmost) `max_markers` markers per line and strips the
+rest, reusing `_tidy_after_bracket_removal` for whitespace cleanup. Default
+is 1 — even 2 leaves ambiguity for the reported worst case, and the earliest
+marker is always the most defensible seek target. No-op by construction on
+marker-less text and on lines at-or-under the cap.
+
+Streaming/stored consistency: both summary streaming call sites
+(`pipeline._summarize_and_finish` and `runner`'s inline whisper-worker loop)
+wrap the raw LLM delta stream in `workers/timecodes.cap_markers_in_stream`
+instead of consuming `llm_summary.stream_summarize(...)` directly. This
+guarantees what's PUBLISHED as a delta and what's ACCUMULATED into `parts`
+(→ stored `summary_md`) are the literal same capped text at every point in
+the stream — not just once at the end — so there's no visible "snap" from
+an uncapped live view down to a capped final view when `done` fires.
+
+Buffering granularity is per-MARKER, not per-line. `_MarkerCapState` (a
+small char-fed state machine) holds text back only while it might still be
+a `[MM:SS]`/`[HH:MM:SS]`-shaped bracket — bounded to ~10-11 chars — and lets
+everything else through immediately, unbuffered. A first version buffered
+whole LINES instead (simpler, and `cap_markers_per_line` — the non-streaming
+primitive, used as-is elsewhere — could be reused directly on each completed
+line), but that regressed real streaming latency badly: measured real
+summaries have their single LONGEST line as the very FIRST thing the model
+generates (the "## Обзор"/Overview paragraph, 613-706 chars measured) — with
+line-level buffering the side panel sat empty for 3-5s (gemma, ~50 tok/s) to
+7-8s (qwen3-vl, ~21 tok/s) at the most-watched moment of the whole UX, then
+dumped a wall of text at once. Marker-granularity holdback fixes that:
+ordinary text streams char-by-char exactly as before, and only a
+bracket-shaped run of characters is ever delayed, resolving a handful of
+characters later either as a genuine marker or (via one extra lookahead
+character, mirroring `_TIMECODE_MARKER`'s `(?!\(` guard) as an untouched,
+uncounted markdown link.
+
+Invariant, not a trade-off: `cap_markers_in_stream` and `cap_markers_per_line`
+produce byte-identical output for the same input, checked directly by a
+parametrized test in `test_timecodes.py` (several representative shapes ×
+chunk sizes 1/3/7). In particular, when a marker beyond the cap is dropped,
+`_MarkerCapState` also drops the whitespace run immediately preceding it
+(held in `ws_hold`, itself bounded — it can only ever precede a `[`, never
+grow line-length) — it isn't just cosmetic to skip this: two-or-more spaces
+immediately before a newline is a Markdown hard line break (`<br>`), and a
+bullet ending in several markers (the single most common shape of the
+problem this cap exists to fix) is exactly where the dropped marker's
+leading space would otherwise land right before the trailing `\n`.
+
+This was kept server-side (not a `markdown.js` mirror) for the same reason
+as before: the extension has no test runner at all (no way to verify JS
+changes via `task test`), and the project already centralizes timecode
+logic in Python (`build_marked_text` is the other example) — the "one
+place" principle above extends naturally to capping.
+
 ## Transcript translation
 
 `workers/translator.py` translates `Job.raw_text` into a target language,

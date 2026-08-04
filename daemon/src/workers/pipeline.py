@@ -562,11 +562,20 @@ async def _summarize_and_finish(
     summary_input = timecodes.strip_transcript_tail_noise(text) if from_audio else text
 
     try:
-        async for delta in llm_summary.stream_summarize(
-            summary_input,
-            title=title,
-            output_language=cfg.output.language_name,
-            from_audio_transcript=from_audio,
+        # cap_markers_in_stream holds text back only long enough to resolve a
+        # [MM:SS]-shaped bracket (never a whole line), capping markers per
+        # line as each one resolves, so what's published here and what's
+        # accumulated into `parts` (-> stored summary_md) are always the same
+        # capped text at every point in the stream — not just once at the
+        # end. See timecodes.cap_markers_in_stream for the full rationale
+        # (incl. why this is a code-level fix, not a prompt change).
+        async for delta in timecodes.cap_markers_in_stream(
+            llm_summary.stream_summarize(
+                summary_input,
+                title=title,
+                output_language=cfg.output.language_name,
+                from_audio_transcript=from_audio,
+            )
         ):
             parts.append(delta)
             buf.append(delta)

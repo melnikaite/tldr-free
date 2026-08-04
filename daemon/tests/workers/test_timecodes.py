@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import AsyncIterator
+
+import pytest
+
 from src.workers.timecodes import (
     build_marked_text,
+    cap_markers_in_stream,
+    cap_markers_per_line,
+    collapse_repeated_segments,
     format_segments_as_marked_text,
     strip_all_timecodes,
     strip_bare_timecode_lines,
@@ -352,3 +360,292 @@ def test_tail_noise_noop_when_clean() -> None:
 
 def test_tail_noise_empty() -> None:
     assert strip_transcript_tail_noise("") == ""
+
+
+# --- collapse_repeated_segments ----------------------------------------------
+# Whisper hallucination-loop collapse. Fixtures mirror the real measured
+# shapes: a 291-run of an identical long sentence, a 57-run of a short "Ja.",
+# a near-duplicate drifting trio, and a short legitimate dialogue repeat that
+# must survive.
+
+
+def _segs(texts: list[str], *, step: float = 1.0, start: float = 0.0) -> list[dict]:
+    return [
+        {"start": start + i * step, "end": start + i * step + step, "text": t}
+        for i, t in enumerate(texts)
+    ]
+
+
+def test_collapse_291_run_of_identical_long_sentence() -> None:
+    text = "I'm not sure if I'm doing that right."
+    segs = _segs([text] * 291)
+    out = collapse_repeated_segments(segs)
+    assert len(out) == 1
+    assert out[0] == segs[0]
+
+
+def test_collapse_57_run_of_short_ja() -> None:
+    segs = _segs(["Ja."] * 57)
+    out = collapse_repeated_segments(segs)
+    assert len(out) == 1
+    assert out[0] == segs[0]
+
+
+def test_collapse_near_duplicate_drifting_trio() -> None:
+    # Measured hallucination drift: the sentence mutates slightly each repeat
+    # while remaining recognizably "the same" — exact-match would miss this.
+    segs = _segs(
+        [
+            "He was a young man who was very interested in the world of "
+            "science and technology.",
+            "He was also a young man who was interested in the world of "
+            "science and technology.",
+            "He was also interested in the world of science and technology.",
+        ]
+    )
+    out = collapse_repeated_segments(segs)
+    assert len(out) == 1
+    assert out[0] == segs[0]
+
+
+def test_collapse_near_dup_pair_never_collapses() -> None:
+    # Real measured false positive (job BeRoZoPrbhnT, youtube_api): a
+    # two-speaker question/confirmation exchange scores 0.84 on
+    # _NEAR_DUP_RATIO (just above the 0.82 threshold) purely because the
+    # sentences are structurally similar — it is NOT a hallucination loop.
+    # A near-dup run of length 2 must never collapse, unlike an exact-dup
+    # pair of long segments (which does, per _LONG_SEGMENT_RUN_THRESHOLD).
+    segs = _segs([">> That's locked in?", ">> It's locked in."])
+    out = collapse_repeated_segments(segs)
+    assert out == segs
+
+
+def test_collapse_short_dialogue_survives() -> None:
+    # 5 consecutive "Ja." is real call-and-response dialogue, not a
+    # hallucination loop — short-segment threshold tolerates this.
+    segs = _segs(["Ja."] * 5)
+    out = collapse_repeated_segments(segs)
+    assert out == segs
+
+
+def test_collapse_noop_when_no_repetition() -> None:
+    segs = _segs(["First sentence here.", "Second sentence here.", "Third one."])
+    out = collapse_repeated_segments(segs)
+    assert out == segs
+
+
+def test_collapse_empty_segments() -> None:
+    assert collapse_repeated_segments([]) == []
+
+
+def test_collapse_non_consecutive_repeats_survive() -> None:
+    # Same long text recurring later, separated by other content, is NOT a
+    # consecutive run — collapse_repeated_segments never dedupes globally.
+    text = "This sentence legitimately recurs in the transcript."
+    segs = _segs([text, "Unrelated middle content here.", text])
+    out = collapse_repeated_segments(segs)
+    assert out == segs
+
+
+# --- cap_markers_per_line -----------------------------------------------------
+
+
+def test_cap_nine_markers_keeps_first() -> None:
+    line = (
+        "Key point [07:55] [08:05] [08:09] [08:29] [08:31] [08:33] "
+        "[08:37] [08:40] [08:45]"
+    )
+    assert cap_markers_per_line(line) == "Key point [07:55]"
+
+
+def test_cap_line_with_no_markers_unchanged() -> None:
+    line = "Just a plain bullet with no timecodes."
+    assert cap_markers_per_line(line) is line
+
+
+def test_cap_line_with_exactly_max_markers_unchanged() -> None:
+    line = "A point [01:00]"
+    assert cap_markers_per_line(line, max_markers=1) is line
+
+
+def test_cap_line_with_exactly_two_max_markers_unchanged() -> None:
+    line = "A point [01:00] [02:00]"
+    assert cap_markers_per_line(line, max_markers=2) == line
+
+
+def test_cap_noop_on_document_with_no_markers_anywhere() -> None:
+    # PDF/web-page safety: pure no-op on marker-less text.
+    text = "# Title\n\n- First point.\n- Second point.\n- Third point.\n"
+    assert cap_markers_per_line(text) is text
+
+
+def test_cap_only_touches_lines_that_exceed_the_cap() -> None:
+    text = (
+        "- Fine line [00:10]\n"
+        "- Overloaded line [01:00] [02:00] [03:00]\n"
+        "- Another fine line, no marker\n"
+    )
+    out = cap_markers_per_line(text)
+    assert out == (
+        "- Fine line [00:10]\n"
+        "- Overloaded line [01:00]\n"
+        "- Another fine line, no marker\n"
+    )
+
+
+# --- cap_markers_in_stream ----------------------------------------------------
+# Marker-granularity holdback: text is buffered ONLY long enough to decide
+# whether it's a [MM:SS]-shaped bracket (bounded to ~10-11 chars), never
+# until a whole line completes — see the module docstring on
+# cap_markers_in_stream for why line-level buffering was rejected (it
+# regressed real streaming latency on the longest, first-generated line of
+# every summary — the Overview paragraph, measured 613-706 chars).
+
+
+async def _fake_stream(chunks: list[str]) -> AsyncIterator[str]:
+    for c in chunks:
+        yield c
+
+
+async def _collect(chunks: list[str], max_markers: int = 1) -> list[str]:
+    return [
+        d async for d in cap_markers_in_stream(_fake_stream(chunks), max_markers=max_markers)
+    ]
+
+
+async def test_stream_marker_split_across_three_deltas_stays_intact() -> None:
+    chunks = ["before [0", "4:3", "0] after\n"]
+    published = await _collect(chunks)
+    assert "".join(published) == "before [04:30] after\n"
+
+
+async def test_stream_markdown_link_split_across_deltas_untouched_and_uncounted() -> None:
+    # A marker-shaped bracket immediately followed by "(" is a markdown link
+    # (the (?!\() guard case), not a timecode — must survive verbatim and
+    # must NOT count against the per-line marker cap.
+    chunks = ["see [01", ":30](ur", "l) and [09:00] too\n"]
+    published = await _collect(chunks)
+    # The link is untouched AND uncounted, so the real marker after it
+    # ([09:00]) still survives — if the link had been miscounted as the
+    # first marker, [09:00] would have been dropped instead.
+    assert "".join(published) == "see [01:30](url) and [09:00] too\n"
+
+
+async def test_stream_non_marker_bracket_split_across_deltas_untouched() -> None:
+    chunks = ["[Not sp", "ecified] and [te", "xt](url)\n"]
+    published = await _collect(chunks)
+    assert "".join(published) == "[Not specified] and [text](url)\n"
+
+
+async def test_stream_excess_markers_on_one_line_dropped_surrounding_text_intact() -> None:
+    chunks = ["A [00:01] B [00:02] C [00:03] D\n"]
+    published = await _collect(chunks)
+    joined = "".join(published)
+    # First marker survives; the other two are dropped (their bracket text
+    # only — the letters A/B/C/D around them all survive, in order).
+    assert "[00:01]" in joined
+    assert "[00:02]" not in joined
+    assert "[00:03]" not in joined
+    for token in ("A", "B", "C", "D"):
+        assert token in joined
+    assert joined.index("A") < joined.index("[00:01]") < joined.index("B")
+    assert joined.index("B") < joined.index("C") < joined.index("D")
+
+
+async def test_stream_marker_cap_resets_per_line() -> None:
+    # The per-line marker allowance must reset on "\n" — a marker dropped on
+    # line 1 for exceeding the cap must not carry over and suppress line 2's
+    # own first marker, which gets its own fresh allowance.
+    chunks = ["A [00:01] [00:02]\n", "B [00:03] [00:04]\n"]
+    published = await _collect(chunks)
+    joined = "".join(published)
+    line1, line2 = joined.split("\n")[:2]
+    assert "[00:01]" in line1
+    assert "[00:02]" not in line1
+    assert "[00:03]" in line2
+    assert "[00:04]" not in line2
+
+
+async def test_stream_long_line_with_markers_streams_in_small_pieces() -> None:
+    # Regression guard for the bug being fixed: a long single line (matching
+    # the measured real-world Overview-paragraph shape, 613-706 chars) that
+    # ALSO carries several [MM:SS] markers must still stream progressively —
+    # no yielded piece is anywhere near a whole-line size — while still
+    # capping down to the first marker on the line.
+    pad = "word " * 100  # 500 chars of marker-free padding
+    line = f"{pad}[00:05] {pad}[00:12] {pad}[00:47] end\n"
+    assert len(line) > 700
+    chunks = [line[i : i + 3] for i in range(0, len(line), 3)]
+    published = await _collect(chunks)
+    joined = "".join(published)
+    assert joined.count("word") == 300  # all the padding text survives
+    assert len(re.findall(r"\[\d{2}:\d{2}\]", joined)) == 1
+    assert "[00:05]" in joined
+    assert "[00:12]" not in joined
+    assert "[00:47]" not in joined
+    assert all(len(piece) < 15 for piece in published)
+
+
+async def test_stream_long_marker_free_line_streams_in_small_pieces() -> None:
+    # Proves this doesn't regress back into line-level buffering: a ~700
+    # char marker-free line (matching the real Overview-paragraph shape)
+    # fed in small deltas must come back out in small pieces, not one big
+    # chunk held until the trailing newline.
+    line = ("word " * 140)[:700] + "\n"
+    chunks = [line[i : i + 4] for i in range(0, len(line), 4)]
+    published = await _collect(chunks)
+    assert "".join(published) == line
+    assert all(len(piece) < 15 for piece in published)
+
+
+async def test_stream_caps_trailing_partial_line_without_newline() -> None:
+    chunks = ["- Only line [00:01] [00:02] [00:03]"]  # no trailing "\n"
+    published = await _collect(chunks)
+    joined = "".join(published)
+    assert "[00:01]" in joined
+    assert "[00:02]" not in joined
+    assert "[00:03]" not in joined
+
+
+async def test_stream_passes_through_marker_less_text_unchanged() -> None:
+    chunks = ["Hello ", "world, ", "no markers here.\n"]
+    published = await _collect(chunks)
+    assert "".join(published) == "Hello world, no markers here.\n"
+
+
+# --- cap_markers_in_stream == cap_markers_per_line, for any chunking -------
+# The two primitives must be byte-identical on the same input — a dropped
+# marker's preceding whitespace run has to vanish in the streaming path
+# exactly like ``_tidy_after_bracket_removal`` erases it in the non-streaming
+# one. Two-or-more trailing spaces before a newline is a Markdown hard line
+# break (`<br>`), so leaving one behind is a rendering bug, not cosmetics.
+# Covers: a dropped marker at line-end (trailing-space case), a dropped
+# marker sandwiched between real words, a markdown-link-shaped bracket next
+# to a dropped marker, three consecutive markers with only the first kept,
+# a marker cluster at the very start of a line (nothing precedes it), a
+# second line getting its own cap allowance, and a line with no trailing
+# newline at all.
+_EQUIVALENCE_CASES = [
+    "- Ежедневная сторона выросла на 20% [11:12] [11:24] [11:30]\n",
+    "- A [00:01] B [00:02] C\n",
+    "- см. [04:30](https://x/y) и маркер [05:00] [06:00]\n",
+    "A [00:01] [00:02] [00:03] B\n",
+    "[00:01] [00:02]\n",
+    "text [Not specified] and [text](url) and [09:00] [10:00]\n",
+    "Line one [00:01] [00:02]\nLine two [00:03] [00:04]\n",
+    "- Only line [00:01] [00:02] [00:03]",
+    "Just plain text with no markers at all.\n",
+]
+
+
+def _chunk(text: str, size: int) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+@pytest.mark.parametrize("text", _EQUIVALENCE_CASES)
+async def test_stream_matches_per_line_for_any_chunking(
+    text: str, chunk_size: int
+) -> None:
+    published = await _collect(_chunk(text, chunk_size))
+    assert "".join(published) == cap_markers_per_line(text)

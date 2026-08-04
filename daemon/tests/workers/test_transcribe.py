@@ -116,3 +116,66 @@ async def test_large_file_routes_to_chunked(
 
     result = await transcribe.transcribe_audio(audio, total_duration=10.0)
     assert result.duration_seconds == 1.0
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_collapses_repeated_segments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The single-request path collapses a Whisper repetition-loop run."""
+    audio = tmp_path / "a.opus"
+    audio.write_bytes(b"x" * 1024)  # under the cap → single-request path
+
+    loop_text = "I'm not sure if I'm doing that right."
+    segments = [
+        {"start": float(i), "end": float(i + 1), "text": loop_text} for i in range(10)
+    ]
+
+    async def fake_post(_path: Path) -> dict:
+        return _payload(segments)
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    result = await transcribe.transcribe_audio(audio, total_duration=10.0)
+    assert result.segments == [segments[0]]
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_collapses_across_chunk_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The chunked path merges first, THEN collapses — a hallucination loop
+    that straddles a chunk split (identical trailing/leading segments) is
+    still caught because collapse runs on the merged, offset-shifted list."""
+    audio = tmp_path / "big.opus"
+    audio.write_bytes(b"x" * (2 * 1024 * 1024))
+
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "max_upload_mb", 1)
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+
+    c0, c1 = tmp_path / "c0.opus", tmp_path / "c1.opus"
+    c0.write_bytes(b"0")
+    c1.write_bytes(b"1")
+    monkeypatch.setattr(
+        transcribe, "_split_audio", lambda *a, **k: [(c0, 0.0), (c1, 10.0)]
+    )
+    monkeypatch.setattr(transcribe, "_probe_duration", lambda _p: 20.0)
+
+    loop_text = "Ja."
+
+    async def fake_post(path: Path) -> dict:
+        if path == c0:
+            # Chunk 0 ends with a loop tail.
+            segs = [{"start": 5.0 + i, "end": 6.0 + i, "text": loop_text} for i in range(3)]
+        else:
+            # Chunk 1 starts with more of the same loop, offset by the chunk
+            # boundary — after merge this becomes one long consecutive run.
+            segs = [{"start": i * 1.0, "end": i * 1.0 + 1.0, "text": loop_text} for i in range(4)]
+        return _payload(segs)
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    result = await transcribe.transcribe_audio(audio, total_duration=None)
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == loop_text

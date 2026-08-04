@@ -224,11 +224,18 @@ async def _process_one(
         # следует…" outro hallucinations) — the stored transcript keeps them.
         summary_input = timecodes.strip_transcript_tail_noise(raw_text)
         parts: list[str] = []
-        async for delta in llm_summary.stream_summarize(
-            summary_input,
-            title=title,
-            output_language=cfg.output.language_name,
-            from_audio_transcript=True,
+        # cap_markers_in_stream holds text back only long enough to resolve a
+        # [MM:SS]-shaped bracket (never a whole line), capping markers as
+        # each one resolves, so the published delta and the accumulated
+        # `parts` (-> stored summary) are always the same capped text — see
+        # timecodes.cap_markers_in_stream for the full rationale.
+        async for delta in timecodes.cap_markers_in_stream(
+            llm_summary.stream_summarize(
+                summary_input,
+                title=title,
+                output_language=cfg.output.language_name,
+                from_audio_transcript=True,
+            )
         ):
             parts.append(delta)
             broker.publish(task_job_id, delta_event(delta))
