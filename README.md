@@ -114,6 +114,14 @@ of it, keep it, and keep it private."*
   until you click Resume. Q&A stays responsive throughout.
 - **Auto retry of failed jobs** — keeps the cached audio file so the slow
   yt-dlp step is skipped on retry.
+- **Move a library between machines.** Tick any number of finished jobs in
+  the Library page and export them as one zip: summaries, transcripts with
+  their timings, cached translations, chat history, and the video frames
+  answers were read from. Import it elsewhere and they come back as ordinary
+  jobs; anything already there is skipped rather than duplicated. Reading a
+  bundle needs no model at all, so a machine that can't run one — or
+  shouldn't pay a cloud one — still gets the summary and the transcript, and
+  only new questions need a backend.
 - **No build step for the extension.** Vanilla JS + ES modules. Edit a file,
   click the reload icon.
 

@@ -246,3 +246,28 @@ detail GET pulls those via `get_job(id)`.
 A periodic background coroutine (`workers.retention.retention_worker`)
 deletes jobs older than `config.storage.retention_days` (default 365)
 every 6 hours. Set to 0 to disable.
+
+### Export / import
+
+`POST /jobs/export {ids}` packs the `done` subset of those ids into a zip
+(`storage/bundle.py`): `manifest.json`, plus per job a `job.json` with
+every machine-independent column, the chat history, the transcript
+translations that actually finished, and a copy of the job's frame JPEGs.
+Deliberately absent — the job's id, `status`, `error`, `progress_stage`,
+`audio_path`, `audio_duration_seconds`: those describe this machine, not
+the work.
+
+`POST /jobs/import` takes the raw zip bytes as the request body (not
+multipart — `python-multipart` is not a dependency) and validates the whole
+archive before writing anything anywhere: format and version, every member
+name against a fixed shape, and both a per-member and a total size cap.
+Each job then imports as its own transaction under a freshly minted id —
+never the exported one — which is why every `frame_url` in the chat history
+is re-rooted at the new id on the way in. A job whose URL is already here
+in `done` is skipped rather than duplicated; a job that throws is recorded
+and the rest of the bundle still lands. Imported rows emit the usual
+`job_event("created", …)`, so an open Library page fills in live.
+
+Nothing on this path touches an LLM, which is the point: a machine with no
+backend configured at all can still read imported summaries and
+transcripts. Only new questions need one.

@@ -20,6 +20,27 @@ frame_url) is one instance of this rule, not an exception to it:
 JSDoc typedefs are kept in step the same manual way as everything else
 mirrored here.
 
+## The export bundle is a second, slower-moving contract
+
+`storage/bundle.py`'s zip format has its own `version` in `manifest.json`,
+independent of `DAEMON_API_VERSION`. It has to be: an API version says what
+two live processes agree on right now, while a bundle is read by a daemon
+that may be months newer or older than the one that wrote it, on another
+machine.
+
+So `job.json`'s shape is not free to drift with the ORM. Adding a field is
+safe — the importer ignores what it doesn't know, and an older bundle
+simply arrives without it. Renaming or repurposing one is not: bump
+`BUNDLE_VERSION`, and keep reading the old shape unless you're willing to
+tell people their exports are now unreadable. The importer rejects a
+`version` above its own precisely so that a newer bundle fails loudly
+instead of importing half of itself.
+
+The member-name patterns in that module are a security boundary, not
+formatting: they're what stops a hostile zip from writing outside a job's
+own frame directory. Widen them only with the containment check in
+`_copy_frames` in mind.
+
 ## URL normalization
 
 The extension normalizes every URL through `lib/url.js#normalizeUrl` before

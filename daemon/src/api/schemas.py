@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -219,6 +219,56 @@ class JobDetails(JobSummary):
 class JobListResponse(BaseModel):
     items: list[JobSummary]
     total: int
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/export, POST /jobs/import — moving a library between machines,
+# and letting a machine that can't run local models still read summaries/
+# transcripts produced elsewhere. See ``storage.bundle`` for the pack/unpack
+# implementation and the zip layout it reads and writes.
+# ---------------------------------------------------------------------------
+
+
+class JobExportRequest(BaseModel):
+    """Body for ``POST /jobs/export``. The client is expected to have
+    already filtered ``ids`` down to jobs it believes are exportable
+    (``status == "done"``) — the daemon re-checks independently and
+    silently skips anything that isn't, rather than erroring on a client
+    list that went stale between the check and the request."""
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class ImportedJob(BaseModel):
+    """One job actually inserted by ``POST /jobs/import``, under a freshly
+    minted id — the id it had on the exporting machine is never reused
+    (see ``storage.bundle.import_bundle``)."""
+    job_id: str
+    url: str
+    title: str | None
+
+
+class ImportIssue(BaseModel):
+    """One job from the bundle that was NOT inserted — either because a
+    ``done`` job with the same URL already exists on this machine
+    (``reason="duplicate"``) or because something about that job's entry
+    raised while importing (``reason`` carries the exception message; the
+    rest of the bundle still gets imported — each job is its own
+    transaction, see ``storage.bundle.import_bundle``)."""
+    url: str
+    title: str | None
+    reason: str
+
+
+class JobImportResponse(BaseModel):
+    """Always HTTP 200 — a bundle can be partially imported (some jobs
+    duplicate, some malformed) without that being a request-level
+    failure. Only a bundle that fails validation BEFORE any per-job work
+    starts (bad zip, no manifest, wrong format/version, unsafe member
+    names, oversized upload) is rejected with 400 instead — see
+    ``POST /jobs/import``."""
+    imported: list[ImportedJob]
+    skipped: list[ImportIssue]
+    failed: list[ImportIssue]
 
 
 # ---------------------------------------------------------------------------

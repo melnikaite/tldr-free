@@ -17,7 +17,7 @@ import { openSidePanel } from "../lib/browser-compat.js";
 // stage/delta chatter from running pipelines.
 const eventStream = openEventStream({ types: ["job", "workers", "done", "error"] });
 
-/** @import { JobSummary, JobStatus } from "../lib/api-types.js" */
+/** @import { JobImportResponse, JobSummary, JobStatus } from "../lib/api-types.js" */
 
 const tbody = /** @type {HTMLElement} */ (
   document.querySelector("#jobs tbody")
@@ -33,6 +33,204 @@ let allJobs = [];
 
 filterStatus.addEventListener("change", () => refetch());
 filterKind.addEventListener("change", () => refetch());
+
+// ---------------------------------------------------------------------------
+// Multi-select (export bundle) — selection is a Set of job ids kept here in
+// module state. render() rebuilds tbody.innerHTML from scratch each time, so
+// the checked state is re-applied (renderRow) and the set pruned (render)
+// on every pass rather than trusting the DOM to remember it.
+// ---------------------------------------------------------------------------
+
+/** @type {Set<string>} */
+const selectedIds = new Set();
+// Job id of the last row checkbox the user clicked directly (not via
+// shift-range) — the anchor for shift-click range selection. Stored as an
+// id, not an index: the Library is live (handleJobEvent does
+// `allJobs.unshift(j)` for newly created jobs), so an index captured at one
+// click can point at a different row by the next click. Resolved back to an
+// index at click time instead.
+/** @type {string | null} */
+let lastClickedId = null;
+
+const selectAllCheckbox = /** @type {HTMLInputElement | null} */ (
+  document.getElementById("select-all")
+);
+const selectionBar = document.getElementById("selection-bar");
+const selectionCountEl = document.getElementById("selection-count");
+const selectionWarningEl = document.getElementById("selection-warning");
+const exportBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("export-btn")
+);
+const clearSelectionBtn = document.getElementById("clear-selection-btn");
+let exportInFlight = false;
+
+selectAllCheckbox?.addEventListener("change", () => {
+  if (selectAllCheckbox.checked) {
+    for (const j of allJobs) selectedIds.add(j.id);
+  } else {
+    for (const j of allJobs) selectedIds.delete(j.id);
+  }
+  render();
+});
+
+clearSelectionBtn?.addEventListener("click", () => {
+  selectedIds.clear();
+  lastClickedId = null;
+  render();
+});
+
+exportBtn?.addEventListener("click", async () => {
+  const exportableIds = allJobs
+    .filter((j) => selectedIds.has(j.id) && j.status === "done")
+    .map((j) => j.id);
+  if (exportableIds.length === 0 || exportInFlight) return;
+  exportInFlight = true;
+  updateSelectionBar();
+  try {
+    const blob = await daemon.exportJobs(exportableIds);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tldr-export-${todayDateStamp()}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Don't revoke immediately: `a.click()` only *starts* the download —
+    // Chrome hands it off to the download manager asynchronously, and an
+    // object URL revoked before that handoff completes can end up pointing
+    // at nothing, silently dropping the download (worst on the large
+    // bundles this matters most for). A short delay lets the browser grab
+    // the bytes first; the object URL is cheap to keep alive that long.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    selectedIds.clear();
+    lastClickedId = null;
+    render();
+  } catch (err) {
+    alert(`Export failed: ${stringifyError(err)}`);
+  } finally {
+    exportInFlight = false;
+    updateSelectionBar();
+  }
+});
+
+function todayDateStamp() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Recompute the header checkbox's checked/indeterminate state and the
+ * selection bar's visibility/labels from `selectedIds` + the currently
+ * rendered `allJobs`. Called after every render() and after the selection
+ * changes without a full re-render (export in-flight toggle).
+ */
+function updateSelectionBar() {
+  if (selectAllCheckbox) {
+    if (allJobs.length === 0) {
+      selectAllCheckbox.checked = false;
+      selectAllCheckbox.indeterminate = false;
+    } else {
+      const selectedCount = allJobs.filter((j) => selectedIds.has(j.id)).length;
+      selectAllCheckbox.checked = selectedCount === allJobs.length;
+      selectAllCheckbox.indeterminate =
+        selectedCount > 0 && selectedCount < allJobs.length;
+    }
+  }
+  if (!selectionBar || !selectionCountEl || !exportBtn || !selectionWarningEl) return;
+  const n = selectedIds.size;
+  if (n === 0) {
+    selectionBar.classList.add("hidden");
+    return;
+  }
+  selectionBar.classList.remove("hidden");
+  const selectedJobs = allJobs.filter((j) => selectedIds.has(j.id));
+  const doneCount = selectedJobs.filter((j) => j.status === "done").length;
+  const unfinishedCount = selectedJobs.length - doneCount;
+  selectionCountEl.textContent = `${n} selected`;
+  exportBtn.textContent = `Export ${doneCount}`;
+  exportBtn.disabled = doneCount === 0 || exportInFlight;
+  selectionWarningEl.textContent =
+    unfinishedCount > 0 ? `${unfinishedCount} unfinished won't be exported` : "";
+}
+
+/**
+ * Row checkbox click handler — plain click toggles just that row; shift-click
+ * extends the last explicitly-clicked row's new state across the range
+ * between it and this row (inclusive), same as the familiar file-manager
+ * convention.
+ * @param {MouseEvent} ev
+ */
+function onRowCheckboxClick(ev) {
+  const cb = /** @type {HTMLInputElement} */ (ev.target);
+  const id = cb.dataset.id;
+  if (!id) return;
+  const idx = allJobs.findIndex((j) => j.id === id);
+  if (idx === -1) return;
+  const checked = cb.checked;
+  // Resolve the anchor to an index NOW, not when it was recorded — allJobs
+  // can shift (new jobs unshift onto the front) between the anchor click
+  // and this one, so a stale index would range over the wrong rows.
+  const anchorIdx =
+    lastClickedId !== null ? allJobs.findIndex((j) => j.id === lastClickedId) : -1;
+  if (ev.shiftKey && anchorIdx !== -1) {
+    const [start, end] = [anchorIdx, idx].sort((a, b) => a - b);
+    for (let i = start; i <= end; i++) {
+      const jid = allJobs[i].id;
+      if (checked) selectedIds.add(jid);
+      else selectedIds.delete(jid);
+    }
+  } else if (checked) {
+    selectedIds.add(id);
+  } else {
+    selectedIds.delete(id);
+  }
+  lastClickedId = id;
+  render();
+}
+
+// ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+const importBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("import-btn")
+);
+const importFileInput = /** @type {HTMLInputElement | null} */ (
+  document.getElementById("import-file")
+);
+
+importBtn?.addEventListener("click", () => importFileInput?.click());
+
+importFileInput?.addEventListener("change", async () => {
+  const file = importFileInput.files?.[0];
+  if (!file) return;
+  if (importBtn) importBtn.disabled = true;
+  try {
+    const resp = await daemon.importJobs(file);
+    await refetch();
+    reportImportResult(resp);
+  } catch (err) {
+    alert(`Import failed: ${stringifyError(err)}`);
+  } finally {
+    if (importBtn) importBtn.disabled = false;
+    // Reset so re-picking the exact same file still fires `change`.
+    importFileInput.value = "";
+  }
+});
+
+/** @param {JobImportResponse} resp */
+function reportImportResult(resp) {
+  const importedN = resp.imported?.length || 0;
+  const skippedN = resp.skipped?.length || 0;
+  const failedN = resp.failed?.length || 0;
+  const lines = [`Imported ${importedN} job${importedN === 1 ? "" : "s"}`];
+  if (skippedN) {
+    lines.push(`${skippedN} duplicate${skippedN === 1 ? "" : "s"} skipped`);
+  }
+  if (failedN) {
+    lines.push(`${failedN} failed`);
+  }
+  showToast(lines.join("\n"), 6000);
+}
 
 // ---------------------------------------------------------------------------
 // Whisper queue pause/resume
@@ -163,8 +361,15 @@ async function refetch() {
 }
 
 function render() {
+  // Prune ids that no longer exist (deleted jobs, or filtered out of the
+  // currently fetched set) before recomputing anything selection-related.
+  const existingIds = new Set(allJobs.map((j) => j.id));
+  for (const id of selectedIds) {
+    if (!existingIds.has(id)) selectedIds.delete(id);
+  }
   if (allJobs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" class="empty">No jobs found.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">No jobs found.</td></tr>`;
+    updateSelectionBar();
     return;
   }
   tbody.innerHTML = allJobs.map(renderRow).join("");
@@ -180,16 +385,25 @@ function render() {
       );
     });
   }
+  // Row selection checkboxes.
+  for (const cb of tbody.querySelectorAll("input.row-select")) {
+    cb.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      onRowCheckboxClick(/** @type {MouseEvent} */ (ev));
+    });
+  }
   // Row click → open.
   for (const row of tbody.querySelectorAll("tr[data-id]")) {
     row.addEventListener("click", (ev) => {
-      // Ignore clicks that originated on a button or link.
+      // Ignore clicks that originated on a button, link, checkbox, or label
+      // (the leftmost select-column shouldn't open the side panel).
       const target = /** @type {HTMLElement} */ (ev.target);
-      if (target.closest("button, a")) return;
+      if (target.closest("button, a, input, label")) return;
       const id = /** @type {HTMLElement} */ (row).dataset.id;
       if (id) openInSidePanel(id).catch((err) => alert(stringifyError(err)));
     });
   }
+  updateSelectionBar();
 }
 
 /** @param {JobSummary} j */
@@ -201,8 +415,12 @@ function renderRow(j) {
   const titleAttr = escapeHtml(titleText);
   const urlAttr = escapeHtml(j.url);
   const { label, cls } = renderStatusBadge(j);
+  const checked = selectedIds.has(j.id) ? "checked" : "";
   return `
     <tr data-id="${escapeHtml(j.id)}">
+      <td class="select-col">
+        <input type="checkbox" class="row-select" data-id="${escapeHtml(j.id)}" ${checked} />
+      </td>
       <td class="kind" title="${j.kind}">${kindIcon}</td>
       <td class="title">
         <div class="title-text">${titleAttr}</div>
@@ -317,18 +535,23 @@ async function openInSidePanel(id) {
   }
 }
 
-/** @param {string} text */
-function showToast(text) {
+/**
+ * @param {string} text  - may contain `\n`; CSS (`white-space: pre-line`)
+ *   renders it as a line break, for the multi-part import summary.
+ * @param {number} [duration]  - ms before auto-dismiss; default matches the
+ *   original single-line 3s toast.
+ */
+function showToast(text, duration = 3000) {
   const t = document.createElement("div");
   t.className = "toast";
   t.textContent = text;
   document.body.appendChild(t);
-  setTimeout(() => t.remove(), 3000);
+  setTimeout(() => t.remove(), duration);
 }
 
 /** @param {unknown} err */
 function renderError(err) {
-  tbody.innerHTML = `<tr><td colspan="5" class="empty error">Failed to load jobs: ${escapeHtml(stringifyError(err))}</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="6" class="empty error">Failed to load jobs: ${escapeHtml(stringifyError(err))}</td></tr>`;
 }
 
 /** @param {string} iso */

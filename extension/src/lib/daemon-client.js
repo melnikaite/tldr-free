@@ -10,6 +10,7 @@
  *   JobCreateRequest,
  *   JobCreateResponse,
  *   JobDetails,
+ *   JobImportResponse,
  *   JobListResponse,
  *   JobStatus,
  *   MessagesListResponse,
@@ -168,6 +169,58 @@ export const daemon = {
    * @returns {Promise<void>}
    */
   deleteJob: (id) => request(`/jobs/${id}`, { method: "DELETE" }),
+
+  /**
+   * Export a set of jobs as a downloadable zip bundle, for moving a library
+   * between machines or handing summaries/transcripts to a machine that
+   * can't run local models. Only `status: "done"` jobs are actually
+   * included — the daemon silently skips the rest, and 400s if nothing in
+   * `ids` qualifies. The response is raw zip bytes (not JSON), so this
+   * bypasses `request()` (which forces `Content-Type: application/json` and
+   * parses the body as JSON) and returns the raw `Blob` instead.
+   *
+   * @param {string[]} ids
+   * @returns {Promise<Blob>}
+   */
+  exportJobs: async (ids) => {
+    const baseUrl = await getBaseUrl();
+    const res = await fetch(`${baseUrl}/jobs/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${res.statusText}: ${body}`);
+    }
+    return res.blob();
+  },
+
+  /**
+   * Import a previously-exported zip bundle. The request body is the raw
+   * zip bytes with `Content-Type: application/zip` — NOT multipart, NOT
+   * JSON — so this bypasses `request()` the same way `exportJobs` does.
+   * Imported jobs arrive with fresh ids and the daemon emits the usual
+   * `job` created events, so an open Library tab updates itself through the
+   * existing event stream; callers should still `refetch()` afterwards in
+   * case an event was missed.
+   *
+   * @param {Blob | File} fileOrBlob
+   * @returns {Promise<JobImportResponse>}
+   */
+  importJobs: async (fileOrBlob) => {
+    const baseUrl = await getBaseUrl();
+    const res = await fetch(`${baseUrl}/jobs/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/zip" },
+      body: fileOrBlob,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${res.statusText}: ${body}`);
+    }
+    return res.json();
+  },
 
   /**
    * Re-run the pipeline for a failed job. Preserves the job id (and any

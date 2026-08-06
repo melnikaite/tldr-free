@@ -46,6 +46,15 @@ def _new_id() -> str:
     return str(_nanoid_generate(size=_ID_LENGTH))
 
 
+def generate_job_id() -> str:
+    """Public wrapper around ``_new_id`` for callers outside this module
+    that need to mint a job id BEFORE the row exists — currently only
+    ``storage.bundle``'s import path, which must know the new id up front
+    to rewrite frame_url references and place frame files under it before
+    the row itself is inserted (see ``insert_imported_job``)."""
+    return _new_id()
+
+
 # ---------------------------------------------------------------------------
 # Create / update
 # ---------------------------------------------------------------------------
@@ -86,6 +95,118 @@ def create_job(
         session.flush()
         session.refresh(job)
         # Detach so the returned object is usable after the session closes.
+        session.expunge(job)
+    _emit_created(job.id)
+    return job
+
+
+def insert_imported_job(
+    *,
+    job_id: str,
+    url: str,
+    kind: str,
+    title: str | None,
+    duration_seconds: int | None,
+    created_at: datetime,
+    completed_at: datetime | None,
+    raw_text: str | None,
+    summary_md: str | None,
+    transcript_source: str | None,
+    video_id: str | None,
+    transcript_language: str | None,
+    raw_segments_json: str | None,
+    alt_media_candidates_json: str | None,
+    messages: list[dict[str, Any]],
+    translations: list[dict[str, Any]],
+) -> Job:
+    """Insert a fully-formed Job (plus its Messages + TranscriptTranslations)
+    as one atomic transaction — used by ``storage.bundle`` when importing an
+    exported bundle onto a new machine.
+
+    ``job_id`` is caller-minted (see ``generate_job_id``) rather than
+    generated here: the caller (``bundle.import_bundle``) needs the new id
+    up front to rewrite frame_url references and place frame files on disk
+    BEFORE this call, so the id has to exist before the row does.
+
+    Always ``status="done"`` / ``progress_stage=None`` / ``error=None`` —
+    the contract guarantees only ``status=="done"`` jobs are ever exported
+    (see ``bundle.export_jobs``), so anything reaching here is, by
+    definition, a finished job being replayed onto a new machine, not one
+    resuming in-flight work it never actually did here.
+
+    ``created_at`` is taken from the bundle, preserving "when the material
+    was processed" on the exporting machine rather than resetting it to
+    the moment of import.
+
+    ``messages`` is a list of ``{"role", "content", "created_at",
+    "frame_refs_json"}`` dicts, already in the order they should get
+    (ascending) ids in — this function inserts them in list order inside
+    the same transaction as the Job row, so autoincrement ids come out
+    monotonic. ``translations`` is a list of ``{"language_code", "text",
+    "created_at", "updated_at"}`` dicts, always inserted with
+    ``status="done"``/``progress_percent=100`` (only ``done`` translations
+    are ever exported — see ``list_done_translations``).
+
+    All-or-nothing: if anything inside the transaction raises, the Job and
+    every Message/TranscriptTranslation for it roll back together — no
+    half-written job survives. The caller is expected to call this once
+    per job and catch failures per-job so one bad job in a batch doesn't
+    abort the rest (see ``bundle.import_bundle``).
+
+    Emits ``job_event("created", …)`` same as ``create_job`` so an open
+    Library page renders the imported row live.
+    """
+    from src.storage.db import TranscriptTranslation
+
+    now = datetime.utcnow()
+    job = Job(
+        id=job_id,
+        url=url,
+        kind=kind,
+        status="done",
+        title=title,
+        duration_seconds=duration_seconds,
+        created_at=created_at,
+        updated_at=now,
+        completed_at=completed_at,
+        error=None,
+        progress_stage=None,
+        raw_text=raw_text,
+        summary_md=summary_md,
+        transcript_source=transcript_source,
+        video_id=video_id,
+        transcript_language=transcript_language,
+        raw_segments_json=raw_segments_json,
+        alt_media_candidates_json=alt_media_candidates_json,
+    )
+    with session_scope() as session:
+        session.add(job)
+        session.flush()  # job.id becomes a valid FK target for what follows
+
+        for m in messages:
+            session.add(
+                Message(
+                    job_id=job.id,
+                    role=m["role"],
+                    content=m["content"],
+                    created_at=m.get("created_at") or now,
+                    frame_refs_json=m.get("frame_refs_json"),
+                )
+            )
+        for t in translations:
+            session.add(
+                TranscriptTranslation(
+                    job_id=job.id,
+                    language_code=t["language_code"],
+                    status="done",
+                    text=t.get("text"),
+                    progress_percent=100,
+                    created_at=t.get("created_at") or now,
+                    updated_at=t.get("updated_at") or now,
+                )
+            )
+        session.flush()
+        session.refresh(job)
         session.expunge(job)
     _emit_created(job.id)
     return job
@@ -361,6 +482,37 @@ def get_translation(job_id: str, language_code: str) -> dict[str, Any] | None:
         }
 
 
+def list_done_translations(job_id: str) -> list[dict[str, Any]]:
+    """Return this job's cached translations that are actually ``done`` —
+    together with the full ``text`` and both timestamps.
+
+    Used only by ``storage.bundle`` when packing an export bundle: the
+    sidepanel-facing ``list_translations``/``get_translation`` above
+    intentionally omit ``text`` (list) or timestamps (both) because
+    nothing in the live UI needs them; the export format needs both, and
+    only ever wants translations that carry actual text (queued/running/
+    failed rows have none worth exporting).
+    """
+    from src.storage.db import TranscriptTranslation
+
+    with session_scope() as session:
+        rows = session.exec(
+            select(TranscriptTranslation).where(
+                TranscriptTranslation.job_id == job_id,
+                TranscriptTranslation.status == "done",
+            )
+        ).all()
+        return [
+            {
+                "language_code": r.language_code,
+                "text": r.text,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Event publishing — every write function below runs one of these as a
 # side effect so callers don't have to remember. Late import keeps the
@@ -628,7 +780,10 @@ __all__ = [
     "delete_job",
     "delete_jobs_older_than",
     "find_pending_for_restart",
+    "generate_job_id",
     "get_job",
+    "insert_imported_job",
+    "list_done_translations",
     "list_jobs",
     "list_messages",
     "mark_done",

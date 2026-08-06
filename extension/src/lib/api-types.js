@@ -126,6 +126,60 @@
  */
 
 // ---------------------------------------------------------------------------
+// POST /jobs/export, POST /jobs/import — moving a library between machines,
+// or letting a machine that can't run local models read summaries/
+// transcripts imported from elsewhere.
+//
+// POST /jobs/export takes `{ids: string[]}` and responds with raw
+// `application/zip` bytes (a `Content-Disposition: attachment` filename is
+// set, but there's no JSON body to type — daemon-client.js hands callers a
+// `Blob`). Only `status: "done"` jobs are actually exportable; the daemon
+// silently skips the rest and 400s if nothing in the selection qualifies.
+//
+// POST /jobs/import takes the raw zip bytes as the request body
+// (`Content-Type: application/zip` — NOT multipart, NOT JSON) and responds
+// with JobImportResponse below.
+// ---------------------------------------------------------------------------
+
+/**
+ * One job actually written into the daemon by a bundle import. `job_id` is
+ * ALWAYS a freshly assigned id (never whatever id the job had in the
+ * exporting daemon) — the importing daemon emits the usual `job` created
+ * event for it, same as any other new job.
+ *
+ * @typedef {object} ImportedJob
+ * @property {string} job_id
+ * @property {string} url
+ * @property {string | null} title
+ */
+
+/**
+ * One bundle entry that was NOT imported as a new job — either it duplicated
+ * a job already present (`reason: "duplicate"`) or the import failed for it
+ * (`reason` is then a free-form human-readable message, not a fixed enum).
+ *
+ * @typedef {object} ImportIssue
+ * @property {string} url
+ * @property {string | null} title
+ * @property {string} reason
+ */
+
+/**
+ * Response of `POST /jobs/import`, HTTP 200. A malformed or oversized bundle
+ * is rejected with 400 before this shape is ever produced.
+ *
+ * Imported jobs arrive with fresh ids and the daemon emits the usual `job`
+ * created events, so an open Library tab updates itself through the
+ * existing event stream — callers should still `refetch()` explicitly
+ * afterwards in case an event was missed.
+ *
+ * @typedef {object} JobImportResponse
+ * @property {ImportedJob[]} imported
+ * @property {ImportIssue[]} skipped
+ * @property {ImportIssue[]} failed
+ */
+
+// ---------------------------------------------------------------------------
 // Chat history (per-job Q&A persistence)
 // ---------------------------------------------------------------------------
 

@@ -17,11 +17,15 @@ import binascii
 import contextlib
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from src.api.schemas import (
     DeixisMoment,
@@ -31,6 +35,8 @@ from src.api.schemas import (
     JobCreateRequest,
     JobCreateResponse,
     JobDetails,
+    JobExportRequest,
+    JobImportResponse,
     JobKind,
     JobListResponse,
     JobStatus,
@@ -42,7 +48,7 @@ from src.api.schemas import (
 from src.api.schemas import (
     Message as MessageModel,
 )
-from src.storage import repo
+from src.storage import bundle, repo
 from src.workers import deixis, frames, pipeline, timecodes, youtube
 from src.workers.broker import get_stream_buffer
 from src.workers.deixis import DeixisCategory
@@ -326,6 +332,127 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
 
     body = JobCreateResponse(id=job.id, kind=kind, status=JobStatus.RUNNING)
     return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
+
+
+# ---------------------------------------------------------------------------
+# Export / import — moving a library between machines. Declared BEFORE the
+# `/{job_id}` routes below: FastAPI/Starlette matches routes in registration
+# order, and `/{job_id}` would otherwise swallow `/export`/`/import` as if
+# `job_id == "export"`.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/export")
+def export_jobs(req: JobExportRequest) -> FileResponse:
+    """Pack the ``status == "done"`` subset of ``req.ids`` into a zip and
+    return it as a download. Declared as plain ``def`` (not ``async def``)
+    so FastAPI runs this blocking, disk-bound work in a threadpool instead
+    of on the event loop — see ``storage.bundle.export_jobs``.
+
+    The zip is written to a tempfile rather than built in memory (bundles
+    can carry megabytes of transcript text plus frame JPEGs) and unlinked
+    via ``BackgroundTask`` once the response finishes streaming it out.
+
+    No custom response headers beyond ``Content-Disposition`` (set by
+    ``FileResponse``'s ``filename=``) — the extension can't read custom
+    headers through CORS, so nothing else is added.
+
+    400 if nothing in ``req.ids`` turned out exportable (unknown ids and
+    non-``done`` jobs are silently skipped, not individually erred on —
+    see ``bundle.export_jobs``).
+    """
+    try:
+        zip_path, count = bundle.export_jobs(req.ids)
+    except bundle.BundleError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"tldr-export-{count}-jobs.zip",
+        background=BackgroundTask(zip_path.unlink, missing_ok=True),
+    )
+
+
+def _reject_oversized_content_length(request: Request) -> None:
+    """Reject up front when the client's own ``Content-Length`` header
+    already declares more than the upload cap — no point reading a single
+    byte in that case. Not the primary guard (a client can omit or lie
+    about this header); ``_stream_body_to_file`` enforces the real cap
+    against bytes actually received."""
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return
+    try:
+        declared_bytes = int(declared)
+    except ValueError:
+        return
+    if declared_bytes > bundle.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"upload declares {declared_bytes} bytes, over the "
+            f"{bundle.MAX_UPLOAD_BYTES}-byte limit",
+        )
+
+
+async def _stream_body_to_file(request: Request, fd: int) -> None:
+    """Stream the request body into the already-open file descriptor
+    ``fd``, enforcing the upload size cap against bytes ACTUALLY received.
+
+    ``await request.body()`` would buffer the whole upload into memory
+    before any size check ever ran — a 512 MiB (or larger, lying-header)
+    upload would already have cost the memory by the time the cap fired.
+    Streaming via ``request.stream()`` into a tempfile means the cap is
+    enforced as bytes arrive, aborting mid-upload instead of after.
+    """
+    written = 0
+    with os.fdopen(fd, "wb") as out:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > bundle.MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"upload exceeded the {bundle.MAX_UPLOAD_BYTES}-byte limit "
+                    "while streaming",
+                )
+            out.write(chunk)
+
+
+@router.post("/import", response_model=JobImportResponse)
+async def import_jobs(request: Request) -> JobImportResponse:
+    """Import a zip bundle produced by ``POST /jobs/export`` (or a
+    compatible one). Body is the raw zip bytes — deliberately NOT
+    ``UploadFile``/multipart (``python-multipart`` is not a dependency of
+    this daemon), so the bytes are streamed straight off the Starlette
+    ``Request`` into a tempfile (see ``_stream_body_to_file``) rather than
+    buffered into memory via ``request.body()``.
+
+    The actual unzip/validate/insert work runs off the event loop via
+    ``asyncio.to_thread`` — a large upload's worth of zip validation and
+    frame-file copying would otherwise block every other request for the
+    duration.
+
+    400 (nothing written) for: an upload over the size cap (rejected by
+    ``Content-Length`` up front when present, or mid-stream otherwise), a
+    non-zip payload, a missing/malformed manifest, an unsupported
+    format/version, or any member name that doesn't match the bundle's own
+    strict shape (zip-slip guard) or blows the size limits (zip-bomb
+    guard). Per-job problems (duplicate URL, malformed job entry, invalid
+    kind) are NOT request-level failures — they land in the response's
+    ``skipped``/``failed`` lists instead, see ``storage.bundle.import_bundle``.
+    """
+    _reject_oversized_content_length(request)
+
+    fd, tmp_name = tempfile.mkstemp(prefix="tldr-import-", suffix=".zip")
+    tmp_path = Path(tmp_name)
+    try:
+        await _stream_body_to_file(request, fd)
+        try:
+            return await asyncio.to_thread(bundle.import_bundle, tmp_path)
+        except bundle.BundleError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 # NB: read endpoints below are plain `def`, not `async def`. FastAPI runs

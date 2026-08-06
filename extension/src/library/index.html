@@ -22,6 +22,13 @@
           <option value="youtube">YouTube</option>
         </select>
         <span class="spacer"></span>
+        <button id="import-btn" type="button">Import…</button>
+        <input
+          id="import-file"
+          type="file"
+          accept=".zip,application/zip"
+          hidden
+        />
         <button id="queue-toggle" type="button" title="Whisper queue control">
           <span id="queue-toggle-label">Queue: …</span>
         </button>
@@ -29,9 +36,19 @@
     </header>
 
     <main>
+      <div id="selection-bar" class="selection-bar hidden">
+        <span id="selection-count"></span>
+        <button id="export-btn" type="button">Export</button>
+        <button id="clear-selection-btn" type="button">Clear</button>
+        <span id="selection-warning" class="muted small"></span>
+        <span class="spacer"></span>
+      </div>
       <table id="jobs">
         <thead>
           <tr>
+            <th class="select-col">
+              <input id="select-all" type="checkbox" title="Select all" />
+            </th>
             <th></th>
             <th>Title</th>
             <th>Status</th>

@@ -771,6 +771,31 @@ async def fetch_frames(
     return frames
 
 
+def job_frames_dir_if_exists(job_id: str) -> Path | None:
+    """The on-disk directory holding this job's frame JPEGs (see module
+    docstring "Storage and retention"), or ``None`` if it doesn't exist —
+    i.e. no frames were ever fetched for this job.
+
+    Read-only: unlike ``_job_frames_dir`` this never creates the
+    directory. A caller that only wants to know "does this job have
+    frames worth copying" (``storage.bundle``'s export path) must not have
+    the side effect of creating an empty one just by asking.
+    """
+    p = _frames_root_dir() / job_id
+    return p if p.is_dir() else None
+
+
+def ensure_job_frames_dir(job_id: str) -> Path:
+    """Public alias for ``_job_frames_dir`` — creates (if needed) and
+    returns the per-job frame directory.
+
+    Exposed for ``storage.bundle``'s import path, which writes frame files
+    under a NEWLY MINTED job id that was never real until this import (so
+    nothing else could have created the directory yet).
+    """
+    return _job_frames_dir(job_id)
+
+
 def resolve_frame_path(job_id: str, rel_path: str) -> Path | None:
     """Resolve a frame JPEG's on-disk path for ``GET /jobs/{id}/frames/...``,
     or ``None`` if it doesn't exist or ``rel_path`` tries to escape the
@@ -833,6 +858,8 @@ __all__ = [
     "MAX_FRAMES_PER_CALL",
     "MAX_FRAMES_PER_JOB",
     "delete_job_frames",
+    "ensure_job_frames_dir",
     "fetch_frames",
+    "job_frames_dir_if_exists",
     "resolve_frame_path",
 ]
