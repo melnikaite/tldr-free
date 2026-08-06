@@ -184,12 +184,13 @@ async def test_delete_jobs_older_than_emits_one_event_per_row(isolated_db: Any) 
     b = repo.create_job(url="https://b", kind="page")
     repo.create_job(url="https://c", kind="page")  # stays
 
-    # Backdate a + b so they're caught by the cutoff.
+    # Backdate a + b's added_at so they're caught by the cutoff — the sweep
+    # reads added_at, not created_at (see repo.delete_jobs_older_than).
     raw = isolated_db.raw_connection()
     try:
         cur = raw.cursor()
         old = (datetime.utcnow() - timedelta(days=10)).isoformat()
-        cur.execute("UPDATE job SET created_at=? WHERE id IN (?, ?)", (old, a.id, b.id))
+        cur.execute("UPDATE job SET added_at=? WHERE id IN (?, ?)", (old, a.id, b.id))
         raw.commit()
     finally:
         raw.close()

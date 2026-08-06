@@ -30,6 +30,11 @@ const filterKind = /** @type {HTMLSelectElement} */ (
 );
 /** @type {JobSummary[]} */
 let allJobs = [];
+// Total matching jobs on the daemon, from the last JobListResponse.total —
+// may exceed allJobs.length since listJobs() caps at 500. Used only to
+// caveat "everything loaded is selected" in the selection bar; never to
+// drive a "select everything" action.
+let lastTotal = 0;
 
 filterStatus.addEventListener("change", () => refetch());
 filterKind.addEventListener("change", () => refetch());
@@ -62,7 +67,11 @@ const exportBtn = /** @type {HTMLButtonElement | null} */ (
   document.getElementById("export-btn")
 );
 const clearSelectionBtn = document.getElementById("clear-selection-btn");
+const bulkDeleteBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("bulk-delete-btn")
+);
 let exportInFlight = false;
+let bulkDeleteInFlight = false;
 
 selectAllCheckbox?.addEventListener("change", () => {
   if (selectAllCheckbox.checked) {
@@ -113,6 +122,33 @@ exportBtn?.addEventListener("click", async () => {
   }
 });
 
+bulkDeleteBtn?.addEventListener("click", async () => {
+  const ids = allJobs.filter((j) => selectedIds.has(j.id)).map((j) => j.id);
+  if (ids.length === 0 || bulkDeleteInFlight) return;
+  // Unlike Export, bulk delete applies to every selected job regardless of
+  // status — the confirm needs to say so unambiguously since it's the
+  // irreversible action sitting right next to the harmless one.
+  if (!confirm(`Delete ${ids.length} job${ids.length === 1 ? "" : "s"}? This cannot be undone.`)) {
+    return;
+  }
+  bulkDeleteInFlight = true;
+  updateSelectionBar();
+  try {
+    await daemon.deleteJobs(ids);
+    selectedIds.clear();
+    lastClickedId = null;
+    // The daemon's `deleted` job events (via /events) should already prune
+    // these rows; refetch() is the backstop in case an event was missed,
+    // same pattern as the import flow.
+    await refetch();
+  } catch (err) {
+    alert(`Delete failed: ${stringifyError(err)}`);
+  } finally {
+    bulkDeleteInFlight = false;
+    updateSelectionBar();
+  }
+});
+
 function todayDateStamp() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -145,11 +181,24 @@ function updateSelectionBar() {
   const selectedJobs = allJobs.filter((j) => selectedIds.has(j.id));
   const doneCount = selectedJobs.filter((j) => j.status === "done").length;
   const unfinishedCount = selectedJobs.length - doneCount;
-  selectionCountEl.textContent = `${n} selected`;
+  // Honesty check: listJobs() caps at 500 rows, and the header checkbox
+  // only ever selects what's loaded. If everything loaded is selected but
+  // the daemon has more matching jobs than that, say so — rather than
+  // implying "all jobs" were selected. No "select everything" affordance
+  // is offered; this is purely a disclosure.
+  const allLoadedSelected = allJobs.length > 0 && selectedJobs.length === allJobs.length;
+  selectionCountEl.textContent =
+    allLoadedSelected && lastTotal > allJobs.length
+      ? `${allJobs.length} of ${lastTotal} loaded selected`
+      : `${n} selected`;
   exportBtn.textContent = `Export ${doneCount}`;
   exportBtn.disabled = doneCount === 0 || exportInFlight;
   selectionWarningEl.textContent =
     unfinishedCount > 0 ? `${unfinishedCount} unfinished won't be exported` : "";
+  if (bulkDeleteBtn) {
+    bulkDeleteBtn.textContent = `Delete ${n}`;
+    bulkDeleteBtn.disabled = n === 0 || bulkDeleteInFlight;
+  }
 }
 
 /**
@@ -354,6 +403,7 @@ async function refetch() {
     };
     const resp = await daemon.listJobs(params);
     allJobs = resp.items || [];
+    lastTotal = typeof resp.total === "number" ? resp.total : allJobs.length;
     render();
   } catch (err) {
     renderError(err);
@@ -410,6 +460,13 @@ function render() {
 function renderRow(j) {
   const kindIcon = j.kind === "youtube" ? "▶" : "📄";
   const created = formatDate(j.created_at);
+  // Filesystem convention: show the import date only when it actually says
+  // something the Created date doesn't — i.e. never for locally processed
+  // jobs, where added_at === created_at.
+  const importedLine =
+    j.added_at && !isSameCalendarDay(j.created_at, j.added_at)
+      ? `<div class="muted small imported-note">imported ${escapeHtml(formatDate(j.added_at))}</div>`
+      : "";
   const titleText = j.title || j.url;
   const actions = renderActions(j);
   const titleAttr = escapeHtml(titleText);
@@ -427,7 +484,7 @@ function renderRow(j) {
         <div class="url muted small" title="${urlAttr}">${urlAttr}</div>
       </td>
       <td><span class="status-badge status-${cls}">${label}</span></td>
-      <td class="muted small">${escapeHtml(created)}</td>
+      <td class="muted small">${escapeHtml(created)}${importedLine}</td>
       <td class="actions">${actions}</td>
     </tr>
   `;
@@ -552,6 +609,25 @@ function showToast(text, duration = 3000) {
 /** @param {unknown} err */
 function renderError(err) {
   tbody.innerHTML = `<tr><td colspan="6" class="empty error">Failed to load jobs: ${escapeHtml(stringifyError(err))}</td></tr>`;
+}
+
+/**
+ * Whether two ISO datetime strings fall on the same local calendar day —
+ * used to decide whether the Created column needs its "imported …"
+ * sub-line at all. Malformed input is treated as "same day" (i.e. suppress
+ * the sub-line) so a parse failure never surfaces a bogus date.
+ * @param {string} isoA
+ * @param {string} isoB
+ */
+function isSameCalendarDay(isoA, isoB) {
+  const a = new Date(isoA);
+  const b = new Date(isoB);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return true;
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
 }
 
 /** @param {string} iso */

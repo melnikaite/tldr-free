@@ -1,12 +1,18 @@
 """Tests for src.workers.retention — periodic job-retention sweep.
 
 The worker loops forever, so we break the loop by making the monkeypatched
-``asyncio.sleep`` raise a sentinel exception after the first iteration. The
-actual DB delete (``repo.delete_jobs_older_than``) is stubbed so we can assert
-on call args / cutoff math without standing up a database.
+``asyncio.sleep`` raise a sentinel exception after the first (or Nth)
+iteration. The actual DB delete (``repo.delete_jobs_older_than``) is stubbed
+so we can assert on call args / cutoff math without standing up a database.
 
 Covers:
-  - retention disabled when retention_days <= 0 (==0 and negative)
+  - retention_days re-read from config EVERY cycle, not once before the loop
+    — a change (e.g. via PATCH /config) takes effect on the next cycle
+    without a daemon restart.
+  - disabled (retention_days <= 0) skips the sweep but keeps looping —
+    the worker must NEVER return, since a value that's 0 today could be
+    turned back on tomorrow via the options page, and nothing re-spawns
+    this coroutine after it exits.
   - cutoff is computed as now - retention_days
   - sweep runs and logs deletions vs no deletions
   - asyncio.CancelledError propagates (clean shutdown)
@@ -32,13 +38,31 @@ def _patch_config(monkeypatch: pytest.MonkeyPatch, days: int) -> None:
     monkeypatch.setattr(cfg.storage, "retention_days", days)
 
 
+def _stop_after(n: int):
+    """Return an ``asyncio.sleep`` stand-in that raises ``_StopLoop`` on the
+    Nth call (1-indexed) so a test can let the loop run a fixed number of
+    cycles before terminating it."""
+    calls = 0
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls >= n:
+            raise _StopLoop
+
+    return fake_sleep
+
+
 # ---------------------------------------------------------------------------
-# disabled retention
+# disabled retention — must skip the sweep but NEVER return (see module
+# docstring: a value edited via PATCH /config must be able to re-enable
+# retention without a daemon restart, which requires the coroutine to still
+# be running).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_disabled_when_retention_days_zero(
+async def test_disabled_skips_sweep_but_keeps_looping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_config(monkeypatch, 0)
@@ -50,9 +74,12 @@ async def test_disabled_when_retention_days_zero(
         return 0
 
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
-    # Returns immediately without ever sweeping or sleeping.
-    await retention.retention_worker()
+    # Must NOT return on its own — the sentinel from the patched sleep is
+    # what actually terminates the loop.
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
     assert called is False
 
 
@@ -66,8 +93,50 @@ async def test_disabled_when_retention_days_negative(
         raise AssertionError("should not sweep when disabled")
 
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
-    await retention.retention_worker()
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
+
+
+@pytest.mark.asyncio
+async def test_config_reread_each_cycle_can_re_enable_without_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug this fixes: reading config once before the loop meant a
+    retention_days that was 0 at startup could never be turned back on. The
+    fix re-reads get_config() every cycle — simulate a PATCH /config landing
+    between two cycles and confirm the very next cycle picks it up."""
+    cfg = retention.get_config()
+    monkeypatch.setattr(cfg.storage, "retention_days", 0)
+
+    cutoffs: list[datetime] = []
+
+    def fake_delete(cutoff: datetime) -> int:
+        cutoffs.append(cutoff)
+        return 0
+
+    cycle = 0
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal cycle
+        cycle += 1
+        if cycle == 1:
+            # Simulate an admin flipping retention back on via the options
+            # page in between the first and second cycle.
+            monkeypatch.setattr(cfg.storage, "retention_days", 14)
+        else:
+            raise _StopLoop
+
+    monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
+    monkeypatch.setattr(retention.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
+
+    # First cycle (disabled) swept nothing; second cycle (re-enabled)
+    # actually called delete_jobs_older_than.
+    assert len(cutoffs) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +155,8 @@ async def test_sweep_runs_with_correct_cutoff(
         cutoffs.append(cutoff)
         return 3
 
-    async def fake_sleep(_seconds: float) -> None:
-        raise _StopLoop
-
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
-    monkeypatch.setattr(retention.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
     before = datetime.utcnow()
     with pytest.raises(_StopLoop):
@@ -116,11 +182,8 @@ async def test_sweep_with_zero_deletions_still_loops(
         calls += 1
         return 0
 
-    async def fake_sleep(_seconds: float) -> None:
-        raise _StopLoop
-
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
-    monkeypatch.setattr(retention.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
     with pytest.raises(_StopLoop):
         await retention.retention_worker()
@@ -180,13 +243,8 @@ async def test_generic_exception_swallowed_and_retries(
         calls += 1
         raise RuntimeError("db is down")
 
-    async def fake_sleep(_seconds: float) -> None:
-        # The loop must reach sleep even though the sweep raised — proving the
-        # generic exception was caught. Break out on the first sleep.
-        raise _StopLoop
-
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
-    monkeypatch.setattr(retention.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
     with pytest.raises(_StopLoop):
         await retention.retention_worker()
@@ -211,20 +269,11 @@ async def test_loop_survives_error_then_succeeds_next_iteration(
         deletes.append(result)
         return result
 
-    sleep_calls = 0
-
-    async def fake_sleep(_seconds: float) -> None:
-        nonlocal sleep_calls
-        sleep_calls += 1
-        if sleep_calls >= 2:
-            raise _StopLoop
-
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
-    monkeypatch.setattr(retention.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(2))
 
     with pytest.raises(_StopLoop):
         await retention.retention_worker()
 
     # Second iteration succeeded with 2 deletions.
     assert deletes == [2]
-    assert sleep_calls == 2

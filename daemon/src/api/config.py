@@ -96,6 +96,7 @@ from src.api.schemas import (
     ConfigTestWhisperOverrides,
     LLMConfigOut,
     OutputConfigOut,
+    StorageConfigOut,
     WhisperConfigOut,
 )
 from src.config import Config, _ApiKeyConfigMixin, get_config
@@ -183,6 +184,7 @@ def _to_response(cfg: Config) -> ConfigResponse:
             api_key_source=whisper_source,  # type: ignore[arg-type]
         ),
         output=OutputConfigOut(language=cfg.output.language),
+        storage=StorageConfigOut(retention_days=cfg.storage.retention_days),
         config_path=str(config_module.config_path()),
         overrides_path=str(config_module.overrides_path()),
         keychain_available=config_module.keychain_backend_available(),
@@ -309,6 +311,7 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     llm_overrides = dict(overrides.get("llm") or {})
     whisper_overrides = dict(overrides.get("whisper") or {})
     output_overrides = dict(overrides.get("output") or {})
+    storage_overrides = dict(overrides.get("storage") or {})
 
     # Set only when this PATCH actually (re)writes the API key for that
     # section — that's the one case worth a write-then-read-back check (see
@@ -377,11 +380,15 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     if body.output is not None:
         output_overrides.update(body.output.model_dump(exclude_unset=True))
 
+    if body.storage is not None:
+        storage_overrides.update(body.storage.model_dump(exclude_unset=True))
+
     new_overrides: dict[str, Any] = dict(overrides)
     for section_name, section_val in (
         ("llm", llm_overrides),
         ("whisper", whisper_overrides),
         ("output", output_overrides),
+        ("storage", storage_overrides),
     ):
         if section_val:
             new_overrides[section_name] = section_val

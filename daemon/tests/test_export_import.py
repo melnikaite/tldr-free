@@ -14,6 +14,7 @@ import io
 import json
 import zipfile
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -306,6 +307,76 @@ def test_export_import_round_trip(client: TestClient) -> None:
     assert translations[0]["status"] == "done"
     transcript = client.get(f"/jobs/{new_id}/transcript?lang=en").json()
     assert transcript["text"] == "Hello world (en)"
+
+
+# ---------------------------------------------------------------------------
+# 1b. added_at — machine-local, must never leave the exporting machine, and
+# the importing machine must set its own rather than inherit the bundle's
+# created_at for retention purposes.
+# ---------------------------------------------------------------------------
+
+
+def test_export_bundle_omits_added_at(client: TestClient) -> None:
+    """added_at is machine-local (Job.added_at docstring / bundle.py module
+    docstring's "deliberately NOT included" list) — it must never appear in
+    job.json, unlike every other Job field this export/import path carries."""
+    done = _make_done_job(client, "https://export-no-added-at.example")
+    job_id = done["id"]
+
+    r = client.post("/jobs/export", json={"ids": [job_id]})
+    assert r.status_code == 200
+
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        job_json = json.loads(zf.read(f"jobs/{job_id}/job.json"))
+
+    assert "added_at" not in job_json
+
+
+def test_imported_job_gets_added_at_now_and_survives_retention_that_would_catch_created_at(
+    client: TestClient,
+) -> None:
+    """An imported job keeps the bundle's (old) created_at but gets
+    added_at=now on the importing machine — so a retention cutoff that
+    would have swept the old created_at must NOT sweep it, since the sweep
+    reads added_at (repo.delete_jobs_older_than)."""
+    done = _make_done_job(client, "https://export-retention-immune.example")
+    job_id = done["id"]
+
+    # Back-date created_at to simulate material that was actually processed
+    # years ago on the exporting machine.
+    old_created_at = "2015-01-01T00:00:00"
+    with session_scope() as session:
+        from src.storage.db import Job
+
+        job_row = session.get(Job, job_id)
+        assert job_row is not None
+        job_row.created_at = datetime.fromisoformat(old_created_at)
+        session.add(job_row)
+
+    r = client.post("/jobs/export", json={"ids": [job_id]})
+    assert r.status_code == 200
+    zip_bytes = r.content
+
+    assert client.delete(f"/jobs/{job_id}").status_code == 204
+
+    r2 = client.post("/jobs/import", content=zip_bytes)
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["failed"] == []
+    assert body["skipped"] == []
+    new_id = body["imported"][0]["job_id"]
+
+    new_detail = client.get(f"/jobs/{new_id}").json()
+    assert new_detail["created_at"].startswith("2015-01-01")
+    assert not new_detail["added_at"].startswith("2015-01-01")
+
+    # A cutoff that would have caught the old created_at many times over —
+    # the imported job must survive because retention reads added_at.
+    cutoff = datetime(2020, 1, 1)
+    deleted = repo.delete_jobs_older_than(cutoff)
+
+    assert deleted == 0
+    assert repo.get_job(new_id) is not None
 
 
 # ---------------------------------------------------------------------------

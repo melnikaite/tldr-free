@@ -270,6 +270,65 @@ def test_get_job_404(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# POST /jobs/delete — bulk delete
+# ---------------------------------------------------------------------------
+
+
+def test_bulk_delete_mixed_known_and_unknown_ids(client: TestClient) -> None:
+    a = client.post(
+        "/jobs", json={"url": "https://bulk-a", "kind": "page", "page_text": "a"}
+    ).json()
+    b = client.post(
+        "/jobs", json={"url": "https://bulk-b", "kind": "page", "page_text": "b"}
+    ).json()
+    _wait_until_done(client, a["id"])
+    _wait_until_done(client, b["id"])
+
+    r = client.post(
+        "/jobs/delete", json={"ids": [a["id"], b["id"], "no-such-job-id"]}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": 2}
+
+    assert client.get(f"/jobs/{a['id']}").status_code == 404
+    assert client.get(f"/jobs/{b['id']}").status_code == 404
+
+
+def test_bulk_delete_all_unknown_ids_deletes_zero(client: TestClient) -> None:
+    r = client.post("/jobs/delete", json={"ids": ["nope-1", "nope-2"]})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": 0}
+
+
+def test_bulk_delete_removes_frame_directories(client: TestClient) -> None:
+    """Bulk delete goes through repo.delete_job per id, same as a single
+    DELETE /jobs/{id} — frame directories must go with the row."""
+    from src.config import get_config
+
+    create = client.post(
+        "/jobs", json={"url": "https://bulk-frames", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    frame_dir = Path(get_config().storage.data_dir) / "frames" / create["id"] / "t12"
+    frame_dir.mkdir(parents=True)
+    (frame_dir / "frame_01.jpg").write_bytes(b"\xff\xd8\xff\xe0fake")
+    job_frame_root = frame_dir.parent
+    assert job_frame_root.exists()
+
+    r = client.post("/jobs/delete", json={"ids": [create["id"]]})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": 1}
+
+    assert not job_frame_root.exists()
+
+
+def test_bulk_delete_rejects_empty_ids_list(client: TestClient) -> None:
+    r = client.post("/jobs/delete", json={"ids": []})
+    assert r.status_code == 422, r.text
+
+
 def test_get_transcript_serves_original_text(client: TestClient) -> None:
     """Without ``?lang=`` the endpoint returns Job.raw_text directly."""
     create = client.post(

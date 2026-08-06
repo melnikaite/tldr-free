@@ -80,6 +80,9 @@
  * @property {string | null} progress_stage
  * @property {TranscriptSource | null} transcript_source
  * @property {string} created_at  ISO datetime string
+ * @property {string} added_at    ISO datetime string - when this job appeared
+ *   on THIS machine. Equal to created_at for everything processed locally;
+ *   for a job that arrived through a bundle import it's the import moment.
  * @property {string} updated_at
  * @property {string | null} completed_at
  */
@@ -123,6 +126,24 @@
  * @typedef {object} JobListResponse
  * @property {JobSummary[]} items
  * @property {number} total
+ */
+
+// ---------------------------------------------------------------------------
+// POST /jobs/delete — bulk delete, used by the Library's selection-bar
+// Delete action. Unlike single DELETE /jobs/{id}, this applies regardless
+// of job status. The daemon emits the usual `job` deleted event per id, so
+// an open Library/side-panel tab updates itself through /events; callers
+// should still refetch() as a backstop the same way the import flow does.
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {object} JobDeleteRequest
+ * @property {string[]} ids   - max 1000 per call
+ */
+
+/**
+ * @typedef {object} JobDeleteResponse
+ * @property {number} deleted
  */
 
 // ---------------------------------------------------------------------------
@@ -376,10 +397,18 @@
  */
 
 /**
+ * @typedef {object} StorageConfigOut
+ * @property {number} retention_days   - days after a job is ADDED to this
+ *   library (JobSummary.added_at, not created_at) before it's auto-deleted
+ *   by the daemon's retention timer. 0 = automatic deletion is off.
+ */
+
+/**
  * @typedef {object} ConfigResponse
  * @property {LLMConfigOut} llm
  * @property {WhisperConfigOut} whisper
  * @property {OutputConfigOut} output
+ * @property {StorageConfigOut} storage
  * @property {string} config_path      - absolute path to tldr.yaml (read-only template)
  * @property {string} overrides_path   - absolute path to tldr.local.yaml (PATCH target)
  * @property {boolean} keychain_available - whether the OS keychain backend is actually
@@ -425,10 +454,18 @@
  */
 
 /**
+ * Same shape and behaviour as OutputConfigPatch — see its comment.
+ *
+ * @typedef {object} StorageConfigPatch
+ * @property {number} [retention_days]   - >= 0; 0 turns automatic deletion off
+ */
+
+/**
  * @typedef {object} ConfigPatchRequest
  * @property {LLMConfigPatch} [llm]
  * @property {WhisperConfigPatch} [whisper]
  * @property {OutputConfigPatch} [output]
+ * @property {StorageConfigPatch} [storage]
  */
 
 /**

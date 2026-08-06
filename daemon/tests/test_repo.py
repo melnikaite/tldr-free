@@ -44,6 +44,12 @@ def test_create_job_assigns_id_and_default_status(isolated_db) -> None:
     assert job.title == "Example"
 
 
+def test_create_job_sets_added_at_equal_to_created_at(isolated_db) -> None:
+    job = repo.create_job(url="https://example.com", kind="page")
+    assert job.added_at is not None
+    assert job.added_at == job.created_at
+
+
 def test_get_job_returns_none_for_missing(isolated_db) -> None:
     assert repo.get_job("nope") is None
 
@@ -284,12 +290,14 @@ def test_delete_jobs_older_than_removes_old_keeps_recent(isolated_db) -> None:
     old = repo.create_job(url="https://old", kind="page")
     new = repo.create_job(url="https://new", kind="page")
 
-    # Back-date the old job.
+    # Back-date the old job's added_at — retention sweeps on added_at, not
+    # created_at (see test_delete_jobs_older_than_sweeps_on_added_at_not_
+    # created_at below for the regression this distinction guards).
     raw = isolated_db.raw_connection()
     try:
         cur = raw.cursor()
         cur.execute(
-            "UPDATE job SET created_at = ? WHERE id = ?",
+            "UPDATE job SET added_at = ? WHERE id = ?",
             ("2000-01-01T00:00:00", old.id),
         )
         raw.commit()
@@ -302,6 +310,100 @@ def test_delete_jobs_older_than_removes_old_keeps_recent(isolated_db) -> None:
     assert deleted == 1
     assert repo.get_job(old.id) is None
     assert repo.get_job(new.id) is not None
+
+
+def test_delete_jobs_older_than_sweeps_on_added_at_not_created_at(isolated_db) -> None:
+    """The regression this whole added_at column exists to prevent: a job
+    whose created_at is old (material processed long ago) but whose
+    added_at is recent (e.g. just imported from a bundle) must NOT be swept
+    — and, symmetrically, a job with a recent created_at but an old
+    added_at (shouldn't happen in practice, but proves the sweep really
+    reads added_at and not created_at) IS swept."""
+    old_material_recently_added = repo.create_job(url="https://old-material", kind="page")
+    raw = isolated_db.raw_connection()
+    try:
+        cur = raw.cursor()
+        # created_at far in the past, added_at left at "now" (untouched).
+        cur.execute(
+            "UPDATE job SET created_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", old_material_recently_added.id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    cutoff = datetime(2020, 1, 1)
+    deleted = repo.delete_jobs_older_than(cutoff)
+
+    assert deleted == 0
+    assert repo.get_job(old_material_recently_added.id) is not None
+
+
+def test_insert_imported_job_sets_added_at_now_keeps_bundle_created_at(
+    isolated_db,
+) -> None:
+    """storage.bundle.import_bundle calls insert_imported_job with the
+    EXPORTING machine's created_at. added_at must still be "now" on THIS
+    machine — that's the whole point (see Job.added_at docstring)."""
+    bundle_created_at = datetime(2015, 6, 1)
+    before = datetime.utcnow()
+    job = repo.insert_imported_job(
+        job_id=repo.generate_job_id(),
+        url="https://imported.example",
+        kind="page",
+        title="Old material",
+        duration_seconds=None,
+        created_at=bundle_created_at,
+        completed_at=None,
+        raw_text="hello",
+        summary_md="**hi**",
+        transcript_source="trafilatura",
+        video_id=None,
+        transcript_language=None,
+        raw_segments_json=None,
+        alt_media_candidates_json=None,
+        messages=[],
+        translations=[],
+    )
+    after = datetime.utcnow()
+
+    assert job.created_at == bundle_created_at
+    assert job.added_at is not None
+    assert before <= job.added_at <= after
+
+
+def test_imported_job_not_swept_by_cutoff_that_would_catch_its_created_at(
+    isolated_db,
+) -> None:
+    """An imported job's created_at can be years old — that must not make
+    it eligible for the retention sweep on its very next pass, since
+    added_at (what the sweep actually reads) is "now"."""
+    bundle_created_at = datetime(2015, 6, 1)
+    job = repo.insert_imported_job(
+        job_id=repo.generate_job_id(),
+        url="https://imported-old.example",
+        kind="page",
+        title="Old material",
+        duration_seconds=None,
+        created_at=bundle_created_at,
+        completed_at=None,
+        raw_text="hello",
+        summary_md="**hi**",
+        transcript_source="trafilatura",
+        video_id=None,
+        transcript_language=None,
+        raw_segments_json=None,
+        alt_media_candidates_json=None,
+        messages=[],
+        translations=[],
+    )
+
+    # A cutoff that would have caught bundle_created_at (2015) many times over.
+    cutoff = datetime(2020, 1, 1)
+    deleted = repo.delete_jobs_older_than(cutoff)
+
+    assert deleted == 0
+    assert repo.get_job(job.id) is not None
 
 
 def test_delete_jobs_older_than_unlinks_audio_file(isolated_db, tmp_path) -> None:
@@ -320,7 +422,7 @@ def test_delete_jobs_older_than_unlinks_audio_file(isolated_db, tmp_path) -> Non
     try:
         cur = raw.cursor()
         cur.execute(
-            "UPDATE job SET created_at = ? WHERE id = ?",
+            "UPDATE job SET added_at = ? WHERE id = ?",
             ("2000-01-01T00:00:00", old.id),
         )
         raw.commit()
@@ -359,7 +461,7 @@ def test_delete_jobs_older_than_deletes_frames(isolated_db, monkeypatch) -> None
     try:
         cur = raw.cursor()
         cur.execute(
-            "UPDATE job SET created_at = ? WHERE id = ?",
+            "UPDATE job SET added_at = ? WHERE id = ?",
             ("2000-01-01T00:00:00", old.id),
         )
         raw.commit()

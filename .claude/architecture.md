@@ -245,7 +245,17 @@ detail GET pulls those via `get_job(id)`.
 
 A periodic background coroutine (`workers.retention.retention_worker`)
 deletes jobs older than `config.storage.retention_days` (default 365)
-every 6 hours. Set to 0 to disable.
+every 6 hours. Set to 0 to disable — the coroutine keeps looping and
+re-reads the setting each cycle, so `PATCH /config` can turn it off and
+back on without a restart.
+
+Age is measured on `Job.added_at` — when the row appeared on THIS machine —
+not `Job.created_at`, which is when the material was processed and which an
+import carries over from the exporting machine. Sweeping on `created_at`
+would delete a freshly imported archive of old material on the next pass.
+The two are equal for everything processed locally, and v7 backfilled
+`added_at = created_at` for every row that predates the column, so an
+existing database behaves exactly as it did before.
 
 ### Export / import
 

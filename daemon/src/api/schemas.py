@@ -171,6 +171,13 @@ class JobSummary(BaseModel):
     progress_stage: str | None     # "extracting" | "transcribing" | "summarizing" | None when idle/done
     transcript_source: TranscriptSource | None
     created_at: datetime
+    # When this row appeared ON THIS MACHINE — distinct from created_at (when
+    # the material was processed). Equal to created_at for every normally
+    # created job; differs only for a job brought in via POST /jobs/import,
+    # which preserves the exporting machine's created_at but sets
+    # added_at=now. The Library can show "imported <date>" on rows where the
+    # two differ. See Job.added_at / repo.delete_jobs_older_than.
+    added_at: datetime
     updated_at: datetime
     completed_at: datetime | None
 
@@ -269,6 +276,26 @@ class JobImportResponse(BaseModel):
     imported: list[ImportedJob]
     skipped: list[ImportIssue]
     failed: list[ImportIssue]
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/delete — bulk delete, e.g. from a Library multi-select.
+# ---------------------------------------------------------------------------
+
+
+class JobDeleteRequest(BaseModel):
+    """Body for ``POST /jobs/delete``. Ids that no longer exist are counted
+    as not-deleted rather than raising — same "client's own list may have
+    gone stale" tolerance as ``JobExportRequest``."""
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class JobDeleteResponse(BaseModel):
+    """Always HTTP 200. ``deleted`` counts only ids that actually matched a
+    row — each is removed via ``repo.delete_job`` (same audio/frame/event
+    cleanup as a single ``DELETE /jobs/{id}``), an unknown id simply doesn't
+    add to the count."""
+    deleted: int
 
 
 # ---------------------------------------------------------------------------
@@ -515,10 +542,18 @@ class OutputConfigOut(BaseModel):
     language: str
 
 
+class StorageConfigOut(BaseModel):
+    """Retention setting as reported by ``GET /config`` / ``PATCH /config``.
+    ``0`` means the retention sweep is disabled — see
+    ``workers.retention.retention_worker``."""
+    retention_days: int
+
+
 class ConfigResponse(BaseModel):
     llm: LLMConfigOut
     whisper: WhisperConfigOut
     output: OutputConfigOut
+    storage: StorageConfigOut
     config_path: str        # absolute path to tldr.yaml (read-only template)
     overrides_path: str     # absolute path to tldr.local.yaml (PATCH target)
     # Whether the OS keychain backend is actually usable (a real backend,
@@ -564,10 +599,23 @@ class OutputConfigPatch(BaseModel):
     language: str | None = None
 
 
+# 10 years — generous enough that no real user needs more, tight enough to
+# reject a fat-fingered value (e.g. accidentally typing a year like "2025")
+# that would effectively disable retention by accident.
+_MAX_RETENTION_DAYS = 3650
+
+
+class StorageConfigPatch(BaseModel):
+    """Partial update for ``storage``. ``0`` disables the retention sweep
+    entirely and must stay expressible (not treated as "unset")."""
+    retention_days: int | None = Field(default=None, ge=0, le=_MAX_RETENTION_DAYS)
+
+
 class ConfigPatchRequest(BaseModel):
     llm: LLMConfigPatch | None = None
     whisper: WhisperConfigPatch | None = None
     output: OutputConfigPatch | None = None
+    storage: StorageConfigPatch | None = None
 
 
 class ConfigPatchResponse(ConfigResponse):

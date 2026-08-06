@@ -34,6 +34,8 @@ from src.api.schemas import (
     FrameRef,
     JobCreateRequest,
     JobCreateResponse,
+    JobDeleteRequest,
+    JobDeleteResponse,
     JobDetails,
     JobExportRequest,
     JobImportResponse,
@@ -121,6 +123,7 @@ def _to_summary(job: Any) -> JobSummary:
             TranscriptSource(job.transcript_source) if job.transcript_source else None
         ),
         created_at=job.created_at,
+        added_at=getattr(job, "added_at", None) or job.created_at,
         updated_at=job.updated_at,
         completed_at=job.completed_at,
     )
@@ -181,6 +184,7 @@ def _to_details(job: Any) -> JobDetails:
             TranscriptSource(job.transcript_source) if job.transcript_source else None
         ),
         created_at=job.created_at,
+        added_at=getattr(job, "added_at", None) or job.created_at,
         updated_at=job.updated_at,
         completed_at=job.completed_at,
         summary_md=job.summary_md,
@@ -453,6 +457,28 @@ async def import_jobs(request: Request) -> JobImportResponse:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/delete", response_model=JobDeleteResponse)
+async def bulk_delete_jobs(req: JobDeleteRequest) -> JobDeleteResponse:
+    """Delete every id in ``req.ids`` — a Library multi-select "delete
+    selected" affordance. Declared BEFORE ``/{job_id}`` (same reason as
+    export/import above: route matching is registration-order, and
+    ``/{job_id}`` would otherwise swallow this as ``job_id == "delete"``).
+
+    Each id goes through ``repo.delete_job`` individually — same audio
+    unlink, frame-directory cleanup, and per-row ``job_event("deleted", …)``
+    as a single ``DELETE /jobs/{id}`` call. An id that doesn't match any row
+    is simply not counted; it is NOT a request-level error, so one stale id
+    in a batch (already deleted elsewhere, or never existed) doesn't stop
+    the rest from being processed.
+
+    async because ``repo.delete_job`` publishes a job_event via the broker,
+    and ``asyncio.Queue.put_nowait`` is unsafe from a threadpool thread —
+    same reasoning as the single-job ``DELETE /{job_id}`` route below.
+    """
+    deleted = sum(1 for job_id in req.ids if repo.delete_job(job_id))
+    return JobDeleteResponse(deleted=deleted)
 
 
 # NB: read endpoints below are plain `def`, not `async def`. FastAPI runs

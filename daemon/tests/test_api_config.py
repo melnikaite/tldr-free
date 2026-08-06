@@ -495,6 +495,71 @@ def test_patch_invalidates_llm_client_cache(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# storage.retention_days — editable from the options page (Part 2)
+# ---------------------------------------------------------------------------
+
+
+def test_get_config_reports_default_retention_days(client: TestClient) -> None:
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    # StorageConfig default (config.py) — the fixture's _MINIMAL_YAML never
+    # sets storage.retention_days, so this is the class default.
+    assert r.json()["storage"]["retention_days"] == 365
+
+
+def test_patch_retention_days_round_trips_through_get(
+    client: TestClient, tmp_path: Path
+) -> None:
+    r = client.patch("/config", json={"storage": {"retention_days": 30}})
+    assert r.status_code == 200, r.text
+    assert r.json()["storage"]["retention_days"] == 30
+
+    assert client.get("/config").json()["storage"]["retention_days"] == 30
+
+    # Written to the overrides file, never the template.
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert overrides["storage"]["retention_days"] == 30
+
+
+def test_patch_retention_days_zero_round_trips_and_stays_in_overrides(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """0 means "disabled" and must stay expressible — not dropped as a
+    falsy/unset value anywhere along the PATCH -> overrides-file -> GET path."""
+    r = client.patch("/config", json={"storage": {"retention_days": 0}})
+    assert r.status_code == 200, r.text
+    assert r.json()["storage"]["retention_days"] == 0
+
+    assert client.get("/config").json()["storage"]["retention_days"] == 0
+
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert overrides["storage"]["retention_days"] == 0
+
+
+def test_patch_retention_days_negative_rejected(client: TestClient, tmp_path: Path) -> None:
+    r = client.patch("/config", json={"storage": {"retention_days": -1}})
+    assert r.status_code == 422, r.text
+    assert not (tmp_path / "tldr.local.yaml").exists()
+
+
+def test_patch_retention_days_above_upper_bound_rejected(
+    client: TestClient, tmp_path: Path
+) -> None:
+    r = client.patch("/config", json={"storage": {"retention_days": 100_000}})
+    assert r.status_code == 422, r.text
+    assert not (tmp_path / "tldr.local.yaml").exists()
+
+
+def test_patch_retention_days_leaves_template_untouched(
+    client: TestClient, tmp_path: Path
+) -> None:
+    template_before = (tmp_path / "tldr.yaml").read_text()
+    r = client.patch("/config", json={"storage": {"retention_days": 7}})
+    assert r.status_code == 200, r.text
+    assert (tmp_path / "tldr.yaml").read_text() == template_before
+
+
+# ---------------------------------------------------------------------------
 # POST /config/test — probes without saving, always 200
 # ---------------------------------------------------------------------------
 

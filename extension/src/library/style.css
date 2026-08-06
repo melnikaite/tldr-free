@@ -86,6 +86,19 @@ h1 { margin: 0 0 1rem; }
 }
 .selection-bar button:hover:not(:disabled) { background: var(--bg); }
 .selection-bar button:disabled { opacity: 0.5; cursor: default; }
+.selection-bar .spacer { flex: 1; }
+/* Destructive action: pushed to the far end of the bar (via the spacer
+   above) and given its own left margin, rather than sitting in a tidy row
+   of identical buttons next to the harmless Export/Clear. */
+.selection-bar button.danger {
+  margin-left: 1rem;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.selection-bar button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
 
 table {
   width: 100%;
@@ -152,6 +165,7 @@ td.title {
 
 .muted { color: var(--muted); }
 .small { font-size: 0.85em; }
+.imported-note { margin-top: 0.15rem; }
 
 .status-badge {
   display: inline-block;

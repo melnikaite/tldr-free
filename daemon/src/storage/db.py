@@ -50,6 +50,16 @@ class Job(SQLModel, table=True):
     title: str | None = None
     duration_seconds: int | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    # When this row appeared ON THIS MACHINE — distinct from created_at (when
+    # the material was actually processed). Equal to created_at for every
+    # normally-created job; diverges only for a job brought in via
+    # ``POST /jobs/import`` (see storage/bundle.py), which preserves the
+    # exporting machine's created_at but sets added_at=now. Retention sweeps
+    # by added_at (repo.delete_jobs_older_than) so a freshly imported archive
+    # can't be deleted on its very next pass just because the material itself
+    # is old. created_at stays what the Library shows and sorts by. Backfilled
+    # to created_at for every pre-existing row by migration v7.
+    added_at: datetime = Field(default_factory=datetime.utcnow, index=True)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: datetime | None = None
     error: str | None = None

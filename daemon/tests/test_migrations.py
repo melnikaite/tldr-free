@@ -51,7 +51,7 @@ def _trigger_names(engine) -> set[str]:
 def test_migrations_create_core_tables(fresh_engine) -> None:
     """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1, 2, 3, 4, 5, 6]
+    assert applied == [1, 2, 3, 4, 5, 6, 7]
 
     tables = _table_names(fresh_engine)
     for required in ("job", "message", "transcript_translation", "_migrations"):
@@ -78,12 +78,14 @@ def test_migrations_create_core_tables(fresh_engine) -> None:
     assert "alt_media_candidates_json" in job_cols
     # v6 added message.frame_refs_json
     assert "frame_refs_json" in message_cols
+    # v7 added job.added_at
+    assert "added_at" in job_cols
 
 
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1, 2, 3, 4, 5, 6]
+    assert first == [1, 2, 3, 4, 5, 6, 7]
     assert second == []  # nothing new to apply
 
     tables = _table_names(fresh_engine)
@@ -109,8 +111,10 @@ def test_migration_runner_is_idempotent(fresh_engine) -> None:
 
 def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
-    v5 (as if this code predated v6), then upgrade — only v6 should apply,
-    and frame_refs_json must land without touching anything else."""
+    v5 (as if this code predated v6), then upgrade — v6 (and, since this
+    fixture stops at v5, v7 right behind it — there's nothing between them
+    to stop at) should apply, and frame_refs_json must land without
+    touching anything else."""
     v1_through_v5 = [m for m in MIGRATIONS if m[0] <= 5]
     assert [v for v, _ in v1_through_v5] == [1, 2, 3, 4, 5]
 
@@ -137,9 +141,9 @@ def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
         raw.close()
     assert "frame_refs_json" not in cols_before
 
-    # The upgrade: only v6 is new.
+    # The upgrade: v6 and v7 are both new from this v5 baseline.
     applied = run_migrations(fresh_engine)
-    assert applied == [6]
+    assert applied == [6, 7]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -170,6 +174,89 @@ def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
     [stored] = repo.list_messages(job.id)
     assert stored.id == msg.id
     assert json.loads(stored.frame_refs_json) == frame_refs
+
+
+# ---------------------------------------------------------------------------
+# v7 regression — same class of bug the v6 test above guards against: a DB
+# that already ran v1-v6 (every real pre-existing install as of the
+# added_at feature) must pick up ONLY v7 on the next start, AND the backfill
+# (added_at = created_at) must land per-row using EACH row's own created_at,
+# not one shared value — a naive backfill using a single "now" timestamp
+# for every row would silently make every pre-existing job look like it was
+# just imported, defeating the entire point of the column.
+# ---------------------------------------------------------------------------
+
+
+def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
+    fresh_engine,
+) -> None:
+    """Simulates every real pre-existing daemon install: stop the runner at
+    v6 (as if this code predated v7), insert several rows with DIFFERENT
+    created_at values using only the v1-v6 schema (no added_at column exists
+    yet), then upgrade — only v7 should apply, and every row's added_at
+    must equal ITS OWN created_at, not a single backfill-time value."""
+    v1_through_v6 = [m for m in MIGRATIONS if m[0] <= 6]
+    assert [v for v, _ in v1_through_v6] == [1, 2, 3, 4, 5, 6]
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(_MIGRATIONS_TABLE_DDL)
+        cur.close()
+        for version, migration in v1_through_v6:
+            migration(raw)
+            _record_applied(raw, version)
+        raw.commit()
+
+        # Insert rows with distinct created_at values directly — the v1-v6
+        # schema has no added_at column, so this must go through raw SQL
+        # rather than the Job ORM model (which already declares added_at).
+        cur = raw.cursor()
+        rows = [
+            ("job-old", "https://old.example", "2010-03-14T00:00:00"),
+            ("job-mid", "https://mid.example", "2018-07-04T12:00:00"),
+            ("job-new", "https://new.example", "2023-11-30T23:59:59"),
+        ]
+        for job_id, url, created_at in rows:
+            cur.execute(
+                "INSERT INTO job (id, url, kind, status, created_at, updated_at) "
+                "VALUES (?, ?, 'page', 'done', ?, ?)",
+                (job_id, url, created_at, created_at),
+            )
+        raw.commit()
+        cur.close()
+    finally:
+        raw.close()
+
+    # Sanity check: no added_at column yet, matching a real pre-v7 database.
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_before = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "added_at" not in cols_before
+
+    applied = run_migrations(fresh_engine)
+    assert applied == [7]
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_after = {row[1] for row in cur.fetchall()}
+        cur.execute("SELECT id, created_at, added_at FROM job ORDER BY id")
+        by_id = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    finally:
+        raw.close()
+
+    assert "added_at" in cols_after
+    for job_id, _url, created_at in rows:
+        stored_created_at, stored_added_at = by_id[job_id]
+        assert stored_created_at == created_at
+        # Backfilled to ITS OWN created_at, not a single shared timestamp.
+        assert stored_added_at == created_at
 
 
 def test_pragmas_are_applied(fresh_engine) -> None:

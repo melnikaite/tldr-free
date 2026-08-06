@@ -88,6 +88,7 @@ def create_job(
         progress_stage=progress_stage,
         alt_media_candidates_json=alt_media_candidates_json,
         created_at=now,
+        added_at=now,
         updated_at=now,
     )
     with session_scope() as session:
@@ -134,9 +135,13 @@ def insert_imported_job(
     definition, a finished job being replayed onto a new machine, not one
     resuming in-flight work it never actually did here.
 
-    ``created_at`` is taken from the bundle, preserving "when the material
-    was processed" on the exporting machine rather than resetting it to
-    the moment of import.
+    ``created_at`` is taken from the bundle (preserves "when the material
+    was processed" on the exporting machine); ``added_at`` is always set to
+    ``now`` here — this row is appearing on THIS machine right now,
+    regardless of how old the material is. That's what keeps the retention
+    sweep (which now runs on ``added_at``, see ``delete_jobs_older_than``)
+    from deleting a freshly imported archive of old jobs on its very next
+    pass.
 
     ``messages`` is a list of ``{"role", "content", "created_at",
     "frame_refs_json"}`` dicts, already in the order they should get
@@ -167,6 +172,7 @@ def insert_imported_job(
         title=title,
         duration_seconds=duration_seconds,
         created_at=created_at,
+        added_at=now,
         updated_at=now,
         completed_at=completed_at,
         error=None,
@@ -431,6 +437,7 @@ def job_summary_dict(job: Job) -> dict[str, Any]:
         "transcript_source": job.transcript_source,
         "transcript_language": getattr(job, "transcript_language", None),
         "created_at": job.created_at.isoformat() if job.created_at else None,
+        "added_at": job.added_at.isoformat() if getattr(job, "added_at", None) else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
     }
@@ -738,7 +745,17 @@ def list_messages(job_id: str) -> list[Message]:
 
 
 def delete_jobs_older_than(cutoff: datetime) -> int:
-    """Delete jobs whose ``created_at`` is strictly before ``cutoff``.
+    """Delete jobs whose ``added_at`` — when the row appeared ON THIS
+    MACHINE, not when the material was processed — is strictly before
+    ``cutoff``.
+
+    Deliberately NOT ``created_at``: an imported bundle (see
+    ``storage.bundle``) preserves the exporting machine's ``created_at``,
+    so sweeping on that column could delete a freshly imported archive of
+    old material on its very next pass. ``added_at`` answers "how long has
+    this been sitting on THIS machine", which is what retention is actually
+    supposed to measure. ``created_at`` keeps its own meaning untouched —
+    it's still what the Library shows and sorts by.
 
     Returns the number of jobs deleted. Message rows are removed by FK
     cascade (foreign_keys pragma is ON). Emits one ``job_event("deleted", …)``
@@ -750,7 +767,7 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
     """
     cached_audio: list[str] = []
     with session_scope() as session:
-        stmt = select(Job.id).where(Job.created_at < cutoff)
+        stmt = select(Job.id).where(Job.added_at < cutoff)
         ids = list(session.exec(stmt).all())
         if not ids:
             return 0

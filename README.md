@@ -587,6 +587,12 @@ storage:
   retention_days: 365                              # 0 disables auto-cleanup
 ```
 
+Retention counts from the day a job was **added to this machine**, not the
+day the material was processed — so importing a bundle of year-old videos
+doesn't hand them straight to the next sweep. It's also editable from the
+extension's options page, along with an off switch, so this one doesn't
+need hand-editing.
+
 **`context_length` must match what the backend actually loaded** — a mismatch
 causes "n_keep >= n_ctx" errors. Check with `lms ps` (LM Studio) or look at
 the `context_length` field in `~/.mlx-server/config.yaml` (mlx-server).

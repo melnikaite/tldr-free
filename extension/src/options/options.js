@@ -102,6 +102,16 @@ const outputLanguageInput = /** @type {HTMLInputElement} */ (
   document.getElementById("output-language")
 );
 
+const storageRetentionDaysInput = /** @type {HTMLInputElement} */ (
+  document.getElementById("storage-retention-days")
+);
+const storageNeverDeleteCheckbox = /** @type {HTMLInputElement} */ (
+  document.getElementById("storage-never-delete")
+);
+// Fallback value offered when the user unchecks "Never delete automatically"
+// starting from retention_days === 0 (nothing sensible to restore to).
+const DEFAULT_RETENTION_DAYS = 365;
+
 const saveSettingsBtn = /** @type {HTMLButtonElement} */ (
   document.getElementById("save-settings")
 );
@@ -231,7 +241,42 @@ function renderConfig(cfg) {
   renderApiKeySection("whisper", cfg.whisper, keychainAvailable);
 
   outputLanguageInput.value = cfg.output?.language ?? "";
+
+  renderStorageSection(cfg);
 }
+
+/**
+ * Populate the Storage section's "never delete" checkbox + retention-days
+ * input from a GET/PATCH /config response. `retention_days === 0` means
+ * automatic deletion is off — surfaced as a checked "Never delete
+ * automatically" box (disabling the number input) rather than expecting
+ * the user to know 0 is the magic off value.
+ */
+function renderStorageSection(cfg) {
+  const days = cfg.storage?.retention_days;
+  if (days === 0) {
+    storageNeverDeleteCheckbox.checked = true;
+    storageRetentionDaysInput.value = String(DEFAULT_RETENTION_DAYS);
+    storageRetentionDaysInput.disabled = true;
+  } else {
+    storageNeverDeleteCheckbox.checked = false;
+    storageRetentionDaysInput.value = days != null ? String(days) : "";
+    storageRetentionDaysInput.disabled = false;
+  }
+}
+
+storageNeverDeleteCheckbox.addEventListener("change", () => {
+  const checked = storageNeverDeleteCheckbox.checked;
+  storageRetentionDaysInput.disabled = checked;
+  if (!checked) {
+    const current = Number(storageRetentionDaysInput.value);
+    if (!storageRetentionDaysInput.value || !Number.isFinite(current) || current <= 0) {
+      storageRetentionDaysInput.value = String(
+        lastConfig?.storage?.retention_days || DEFAULT_RETENTION_DAYS,
+      );
+    }
+  }
+});
 
 /** Diff helper: string field, changed only if the trimmed value differs. */
 function addStringDiff(target, key, rawValue, oldValue) {
@@ -321,6 +366,21 @@ function buildPatch() {
   const outputPatch = {};
   addStringDiff(outputPatch, "language", outputLanguageInput.value, lastConfig.output?.language);
   if (Object.keys(outputPatch).length) patch.output = outputPatch;
+
+  const storagePatch = {};
+  if (storageNeverDeleteCheckbox.checked) {
+    // "Never delete automatically" sends 0 regardless of whatever is
+    // (disabled) in the number input.
+    if ((lastConfig.storage?.retention_days ?? null) !== 0) storagePatch.retention_days = 0;
+  } else {
+    addNumberDiff(
+      storagePatch,
+      "retention_days",
+      storageRetentionDaysInput.value,
+      lastConfig.storage?.retention_days,
+    );
+  }
+  if (Object.keys(storagePatch).length) patch.storage = storagePatch;
 
   return patch;
 }

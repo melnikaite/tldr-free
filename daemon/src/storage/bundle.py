@@ -25,7 +25,9 @@ Bundle layout
 
 ``job.json`` — the whole job, machine-independent fields only. Deliberately
 NOT included: ``id``, ``status``, ``error``, ``progress_stage``,
-``audio_path``, ``audio_duration_seconds`` (host-local), and translations
+``audio_path``, ``audio_duration_seconds`` (host-local), ``added_at``
+(machine-local — "when this row appeared on THIS machine"; the importing
+machine sets its own, see ``repo.insert_imported_job``), and translations
 whose status isn't ``done`` (they carry no text worth shipping).
 
 Frame nesting

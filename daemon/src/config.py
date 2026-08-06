@@ -242,8 +242,11 @@ class StorageConfig(BaseModel):
     data_dir: str = "/data"
     db_filename: str = "tldr.db"
     # Periodic retention sweep — delete jobs older than this many days.
-    # 0 disables the sweep entirely.
-    retention_days: int = 365
+    # 0 disables the sweep entirely. Upper bound (10 years) is a sanity cap,
+    # not a real-world expectation — matches api/schemas.py's
+    # StorageConfigPatch so a value valid via PATCH is also valid read
+    # straight from tldr.yaml/tldr.local.yaml.
+    retention_days: int = Field(default=365, ge=0, le=3650)
 
     @model_validator(mode="after")
     def _resolve_data_dir(self) -> StorageConfig:

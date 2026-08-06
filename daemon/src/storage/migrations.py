@@ -280,6 +280,42 @@ def _migration_v6(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v7 — Job.added_at (machine-local "when did this row appear here")
+# ---------------------------------------------------------------------------
+# ``created_at`` means "when the material was processed" and keeps that
+# meaning — it's what the Library shows and sorts by. But importing a bundle
+# (see storage/bundle.py) preserves the EXPORTING machine's created_at, and
+# the retention sweep deletes by age — so a freshly imported archive of old
+# material could get swept on its very next pass. ``added_at`` answers a
+# different question ("when did this row land on THIS machine") and is what
+# retention now sweeps on instead (see repo.delete_jobs_older_than).
+#
+# Backfill is the point of the whole design: every pre-existing row gets
+# ``added_at = created_at`` (the row already existed on this machine as of
+# its created_at — nothing was imported before this column existed), so
+# after this migration no query anywhere needs a COALESCE or an "if
+# imported" branch, and an existing database behaves exactly as it did
+# before. New rows set both explicitly (repo.create_job: added_at =
+# created_at = now; repo.insert_imported_job: created_at from the bundle,
+# added_at = now).
+
+_V7_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN added_at TEXT",
+    "UPDATE job SET added_at = created_at WHERE added_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS ix_job_added_at ON job (added_at)",
+)
+
+
+def _migration_v7(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V7_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -291,6 +327,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (4, _migration_v4),
     (5, _migration_v5),
     (6, _migration_v6),
+    (7, _migration_v7),
 ]
 
 

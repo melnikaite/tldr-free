@@ -18,6 +18,27 @@
       }
       section:last-of-type { border-bottom: none; }
       label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+      label.sentence-field {
+        font-weight: 400;
+        line-height: 1.7;
+      }
+      label.sentence-field input[type="number"] {
+        width: 5em;
+        display: inline-block;
+        margin: 0 0.35rem;
+        vertical-align: baseline;
+      }
+      label.checkbox-label {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-weight: 400;
+        margin-top: 0.75rem;
+      }
+      label.checkbox-label input[type="checkbox"] {
+        width: auto;
+        margin: 0;
+      }
       input, select { width: 100%; padding: 0.5rem; font: inherit; box-sizing: border-box; }
       input:disabled, select:disabled, button:disabled { opacity: 0.6; cursor: not-allowed; }
       button { margin-top: 1rem; padding: 0.5rem 1rem; font: inherit; }
@@ -130,6 +151,25 @@
 
         <label for="output-language">Language</label>
         <input id="output-language" type="text" placeholder="en, auto, …" />
+      </section>
+
+      <section>
+        <h2>Storage</h2>
+
+        <label class="sentence-field" for="storage-retention-days">
+          Delete jobs
+          <input id="storage-retention-days" type="number" min="1" step="1" />
+          days after they're added to this library
+        </label>
+        <p class="hint">
+          Imported jobs count from the day you imported them, not the day the
+          video was processed.
+        </p>
+
+        <label class="checkbox-label" for="storage-never-delete">
+          <input id="storage-never-delete" type="checkbox" />
+          Never delete automatically
+        </label>
       </section>
 
       <button id="save-settings" type="button">Save settings</button>

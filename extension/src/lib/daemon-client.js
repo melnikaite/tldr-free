@@ -9,6 +9,7 @@
  *   HealthResponse,
  *   JobCreateRequest,
  *   JobCreateResponse,
+ *   JobDeleteResponse,
  *   JobDetails,
  *   JobImportResponse,
  *   JobListResponse,
@@ -171,6 +172,23 @@ export const daemon = {
   deleteJob: (id) => request(`/jobs/${id}`, { method: "DELETE" }),
 
   /**
+   * Bulk delete jobs by id (max 1000 per call) — backs the Library's
+   * selection-bar Delete action. Unlike single `deleteJob`, this applies
+   * regardless of job status. The daemon emits the usual `job` deleted
+   * event per id, so an open Library/side-panel tab updates itself
+   * through /events; callers should still `refetch()` afterwards as a
+   * backstop, same as the import flow does.
+   *
+   * @param {string[]} ids
+   * @returns {Promise<JobDeleteResponse>}
+   */
+  deleteJobs: (ids) =>
+    request("/jobs/delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+
+  /**
    * Export a set of jobs as a downloadable zip bundle, for moving a library
    * between machines or handing summaries/transcripts to a machine that
    * can't run local models. Only `status: "done"` jobs are actually
@@ -324,12 +342,13 @@ export const daemon = {
 
   /**
    * Fetch the daemon's current configuration: LLM backend, Whisper
-   * backend, output language, and config file paths. Neither API key is
-   * ever returned — only `api_key_set` (bool), `api_key_hint` (last 4
-   * chars or null), and `api_key_source` (`"env" | "keychain" | "file"
-   * | "inline" | "none"`), reported independently for `llm` and `whisper`.
-   * May 404 on an older daemon that predates this endpoint — callers
-   * (options page) should treat that the same as a network failure.
+   * backend, output language, retention policy, and config file paths.
+   * Neither API key is ever returned — only `api_key_set` (bool),
+   * `api_key_hint` (last 4 chars or null), and `api_key_source`
+   * (`"env" | "keychain" | "file" | "inline" | "none"`), reported
+   * independently for `llm` and `whisper`. May 404 on an older daemon that
+   * predates this endpoint — callers (options page) should treat that the
+   * same as a network failure.
    *
    * Shape (subset):
    * ```
@@ -340,6 +359,7 @@ export const daemon = {
    *   whisper: { base_url, model, max_upload_mb, api_key_set,
    *              api_key_hint, api_key_source },
    *   output: { language },
+   *   storage: { retention_days },  // 0 = automatic deletion off
    *   config_path, overrides_path
    * }
    * ```
@@ -350,8 +370,8 @@ export const daemon = {
 
   /**
    * Partially update the daemon configuration — send only the fields
-   * that changed, nested under `llm` / `whisper` / `output` as returned
-   * by `getConfig()`. Two additional write-only fields under EACH of
+   * that changed, nested under `llm` / `whisper` / `output` / `storage`
+   * as returned by `getConfig()`. Two additional write-only fields under EACH of
    * `llm` and `whisper` (fully independent per section):
    *   - `api_key` — the raw new key string. Only send this when the user
    *     typed a new key; omit entirely to leave the stored key untouched
