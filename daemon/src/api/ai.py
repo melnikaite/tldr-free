@@ -101,6 +101,12 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
     from_audio = job.transcript_source in AUDIO_TRANSCRIPT_SOURCES
 
     parts: list[str] = []
+    # Collected from any `{"type": "frames", "items": [...]}` event the LOOK
+    # step emits (see llm/qa.py's stream_answer) — persisted alongside the
+    # assistant message below so reopening this job's chat renders the same
+    # thumbnails without redoing the LOOK step. Stays empty when the LOOK
+    # step never ran, or ran but found nothing relevant.
+    frame_refs: list[dict[str, Any]] = []
     try:
         async for item in llm_qa.stream_answer(
             job=job,
@@ -115,6 +121,9 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
                 # don't keep streaming junk to the client or burning tokens.
                 if _DEGEN_TAIL_RE.search("".join(parts)[-400:]):
                     break
+            elif item.get("type") == "frames":
+                frame_refs.extend(item.get("items") or [])
+                yield _sse(item)
             else:
                 # Stage event from tool use (e.g. {"type": "stage", "stage": "searching"}).
                 yield _sse(item)
@@ -136,7 +145,9 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
         return
 
     try:
-        assistant = repo.add_message(job_id, role="assistant", content=answer)
+        assistant = repo.add_message(
+            job_id, role="assistant", content=answer, frame_refs=frame_refs or None
+        )
         message_id = assistant.id
     except Exception:
         log.exception("failed to persist assistant message for job %s", job_id)

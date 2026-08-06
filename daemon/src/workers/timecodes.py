@@ -83,6 +83,21 @@ def _format_marker(seconds: int, *, use_hours: bool) -> str:
     return _MM_SS.format(m=m, s=s)
 
 
+def format_timecode(seconds: float) -> str:
+    """Render ONE timestamp as ``MM:SS`` (or ``H:MM:SS`` past the hour
+    mark) — rounds to the nearest second and clamps negative input to 0.
+
+    Public wrapper around ``_format_marker`` for callers that format a
+    single, standalone timestamp outside of a full transcript (unlike
+    ``build_marked_text``, which marks every line of one). Used by
+    ``llm/qa.py`` (LOOK-step stage messages) and ``api/jobs.py`` (the
+    ``GET /jobs/{id}/moments`` / ``POST /jobs/{id}/frames`` on-demand frame
+    affordance) so both render a deixis moment's timestamp identically.
+    """
+    total = max(0, int(round(seconds)))
+    return _format_marker(total, use_hours=total >= 3600)
+
+
 def _segment_start(seg: Mapping[str, Any]) -> float:
     start = seg.get("start")
     if start is None:
@@ -782,6 +797,7 @@ __all__ = [
     "cap_markers_per_line",
     "collapse_repeated_segments",
     "format_segments_as_marked_text",
+    "format_timecode",
     "strip_all_timecodes",
     "strip_bare_timecode_lines",
     "strip_timecode_placeholders",

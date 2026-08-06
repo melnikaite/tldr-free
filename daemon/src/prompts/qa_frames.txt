@@ -1,13 +1,24 @@
-You are looking at a few frames sampled, about one per second, from a short moment in a video. The speaker said, at this point: "{phrase}". Answer in: {output_language}.
-
-The user's question about the material is:
-{question}
+You are looking at a few frames sampled, about one per second, from a short moment in a video. The speaker said, at this point: "{phrase}".
 
 Look at the frames and answer, briefly and concretely:
 1. What is on screen — the setting, and any object(s), product(s), or person(s) visible.
 2. Is there any readable text, a product label, a price, an on-screen interface, or burned-in writing? If so, transcribe it exactly as it appears.
 3. Are hands or a person visibly performing an action across the frames? If so, describe concretely what is being done, to what.
 
-This is the only source of ground truth about what the video's picture actually shows — do not guess, infer, or fill in what would be "plausible" for the topic. If the frames show nothing relevant to the user's question — a generic shot, an unrelated background, nothing legible, or you are simply not sure — say so PLAINLY in one sentence (for example: "The frames show no information relevant to the question") instead of inventing detail. A vague, blurry, or ambiguous frame is not evidence of anything specific; do not describe it as if it were.
+Name a thing only as specifically as the picture itself supports: "a flat object on the desk", not "a tablet"; "something in her hand", not "a stylus" — unless you can genuinely tell which it is.
 
-Be concise: a few sentences, not a full paragraph.
+This is the only source of ground truth about what the video's picture actually shows — do not guess, infer, or fill in what would be "plausible" for the topic. A vague, blurry, or ambiguous frame is not evidence of anything specific; do not describe it as if it were.
+
+Then add ONE closing sentence on which part of what you just described bears on the question below. That question comes from someone who has NOT seen these frames. It tells you where to look; it is never evidence about what is there. Its wording may take for granted objects, tools, devices, screens, or actions that are simply not in the picture — if it names something you cannot see, say it is not visible rather than describing it, and never let a word from the question put an object into your description. If the frames show nothing relevant to it — a generic shot, an unrelated background, nothing legible, or you are simply not sure — say so PLAINLY instead of inventing detail: "The frames show no information relevant to the question".
+
+The question:
+{question}
+
+Be concise: a few sentences, not a full paragraph. Write your answer in: {output_language}.
+
+The frames above are given to you in order, numbered 1 to however many you were sent — frame 1 is the earliest.
+
+Report your answer by calling the tool with these fields:
+- finding: your full answer above (points 1-3, plus the closing sentence). The same rules from above still apply here, in full — in particular: name a thing only as specifically as the picture supports, and if the question names an object, tool, or device you cannot actually see (a laptop, a brush, a stylus, an on-screen interface, etc.), state plainly that it is not visible. Filling in this field is not itself evidence that the named thing exists — do not let it talk you into confirming something the question merely assumed.
+- relevant: true only if the closing sentence genuinely bears on the question — false for the "The frames show no information relevant to the question" case.
+- best_frame_index: the number, from the frame numbering above, of the single frame to SHOW A PERSON as the evidence for what you described. This frame gets displayed on its own, so judge it on two things, in this order. First, it has to actually show the thing — the object, the readable text, the moment of the action. Second, among the frames that do, pick the one that is well captured: reject a frame where someone is caught mid-blink or with eyes shut, the head is turned away, the mouth hangs open mid-word, the body is in an awkward halfway pose, motion has smeared the picture, or the thing being shown is cut off by the edge of the frame. If every frame fails that second test, still pick the one that shows the thing best — a badly caught frame that shows it beats a handsome frame that doesn't. Give your best guess even when relevant is false.

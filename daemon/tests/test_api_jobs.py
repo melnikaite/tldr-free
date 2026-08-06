@@ -660,6 +660,127 @@ def test_ai_qa_404_for_unknown_job(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# frame_refs — LOOK-step thumbnails persisted with the assistant message
+# ---------------------------------------------------------------------------
+
+
+def test_ai_qa_forwards_and_persists_frame_refs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `{"type": "frames", ...}` event from stream_answer is forwarded over
+    SSE AND persisted on the assistant Message row — so reopening the chat
+    later renders the identical thumbnail (see FrameRef / api/jobs.py's
+    `_to_message`)."""
+    from src.llm import qa as llm_qa
+
+    frame_item = {
+        "seconds": 12.0,
+        "timecode": "00:12",
+        "phrase": "this cream",
+        "frame_url": "/jobs/whatever/frames/t12/frame_02.jpg",
+    }
+
+    async def _fake_stream(*, job: Any, question: str, output_language: str, from_audio: bool):
+        yield {"type": "frames", "items": [frame_item]}
+        yield "the cream is ACME brand"
+
+    monkeypatch.setattr(llm_qa, "stream_answer", _fake_stream)
+
+    create = client.post(
+        "/jobs", json={"url": "https://frames-test", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.post("/ai/qa", json={"job_id": create["id"], "question": "what cream?"})
+    assert r.status_code == 200
+    events = _read_sse_events(r)
+    frames_events = [e for e in events if e.get("type") == "frames"]
+    assert len(frames_events) == 1
+    assert frames_events[0]["items"] == [frame_item]
+
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assistant = msgs["items"][-1]
+    assert assistant["role"] == "assistant"
+    assert assistant["frame_refs"] == [frame_item]
+    # The user turn (and any job with no LOOK step at all) has no frame_refs.
+    assert msgs["items"][0]["frame_refs"] == []
+
+
+def test_ai_qa_no_frame_refs_when_no_frames_event(client: TestClient) -> None:
+    """The common case — no LOOK step ran (page/PDF job, or nothing deemed
+    worth a look) — leaves frame_refs empty, not merely absent."""
+    create = client.post(
+        "/jobs", json={"url": "https://no-frames", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    client.post("/ai/qa", json={"job_id": create["id"], "question": "q"})
+
+    msgs = client.get(f"/jobs/{create['id']}/messages").json()
+    assistant = msgs["items"][-1]
+    assert assistant["frame_refs"] == []
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/frames/{rel_path} — serves a LOOK-step JPEG, hard path checks
+# ---------------------------------------------------------------------------
+
+
+def test_get_frame_happy_path(client: TestClient) -> None:
+    from src.config import get_config
+
+    create = client.post(
+        "/jobs", json={"url": "https://frame-file", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    frame_dir = Path(get_config().storage.data_dir) / "frames" / create["id"] / "t12"
+    frame_dir.mkdir(parents=True)
+    jpeg_bytes = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+    (frame_dir / "frame_02.jpg").write_bytes(jpeg_bytes)
+
+    r = client.get(f"/jobs/{create['id']}/frames/t12/frame_02.jpg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content == jpeg_bytes
+
+
+def test_get_frame_404_for_unknown_job(client: TestClient) -> None:
+    r = client.get("/jobs/no-such-job/frames/t12/frame_02.jpg")
+    assert r.status_code == 404
+
+
+def test_get_frame_404_for_missing_file(client: TestClient) -> None:
+    create = client.post(
+        "/jobs", json={"url": "https://frame-missing", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.get(f"/jobs/{create['id']}/frames/t12/frame_99.jpg")
+    assert r.status_code == 404
+
+
+def test_get_frame_404_for_traversal_attempt(client: TestClient) -> None:
+    """A crafted rel_path trying to escape the job's own frame directory
+    must 404, not leak an arbitrary file off disk."""
+    from src.config import get_config
+
+    create = client.post(
+        "/jobs", json={"url": "https://frame-traversal", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    # A file that exists on disk but OUTSIDE this job's own frame directory —
+    # must never be reachable via a `..`-crafted rel_path.
+    secret_dir = Path(get_config().storage.data_dir) / "frames" / "some-other-job" / "t1"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    (secret_dir / "frame_00.jpg").write_bytes(b"secret")
+
+    r = client.get(f"/jobs/{create['id']}/frames/../some-other-job/t1/frame_00.jpg")
+    assert r.status_code == 404
+
+
 def test_ai_qa_409_when_job_not_done(client: TestClient) -> None:
     """Q&A on a job that hasn't finished summarizing returns 409."""
     # YouTube without transcript stays in queued state with the no-op worker.
@@ -728,5 +849,251 @@ def test_retry_endpoint_409_when_not_failed(client: TestClient) -> None:
     r = client.post(f"/jobs/{create['id']}/retry")
     assert r.status_code == 409
     assert "failed" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/moments, POST /jobs/{id}/frames — on-demand "look"
+# affordance (see workers/deixis.py, workers/frames.py). Deliberately
+# hermetic like the rest of this file: `workers.frames.fetch_frames` is
+# monkeypatched, never yt-dlp/ffmpeg.
+# ---------------------------------------------------------------------------
+
+# Real deixis phrases (matched against src/workers/deixis.py's English
+# marker table, verified directly against find_deixis_candidates before
+# being written here) spaced well beyond COLLAPSE_WINDOW_SECONDS apart so
+# each stays its own candidate.
+_ACTION_SECONDS = 10.0
+_OBJECT_SECONDS = 50.0
+_EXTERNAL_SECONDS = 90.0
+_DEIXIS_SEGMENTS = [
+    {"start": _ACTION_SECONDS, "text": "Now watch this, follow along."},
+    {"start": _OBJECT_SECONDS, "text": "You want to apply this cream twice a day."},
+    {"start": _EXTERNAL_SECONDS, "text": "The link is in the description below."},
+]
+
+
+def _make_audio_job(
+    client: TestClient,
+    *,
+    segments: list[dict[str, Any]] | None = None,
+    transcript_source: str = "whisper",
+    language: str = "en",
+    url: str = "https://example.com/video",
+) -> str:
+    """Create a job the normal (hermetic) way, then promote it via
+    ``repo.mark_done`` into a "done" job carrying a real audio
+    ``transcript_source`` + ``raw_segments_json`` — this test module's
+    pipeline mocks never produce a genuine audio transcript (YouTube always
+    defers to the whisper queue, which is a no-op here), so this is the
+    direct route to a job GET /moments / POST /frames can actually see
+    candidates for. ``workers.deixis.candidates_for_job`` only looks at
+    ``transcript_source`` / ``raw_segments_json`` / ``transcript_language``
+    — the job's ``kind`` is irrelevant to it.
+    """
+    from src.storage import repo
+
+    create = client.post(
+        "/jobs", json={"url": url, "kind": "page", "page_text": "placeholder"}
+    ).json()
+    job_id = create["id"]
+    _wait_until_done(client, job_id)
+    repo.mark_done(
+        job_id,
+        raw_text="placeholder raw text",
+        summary_md="placeholder summary",
+        transcript_source=transcript_source,
+        transcript_language=language,
+        raw_segments_json=json.dumps(segments if segments is not None else _DEIXIS_SEGMENTS),
+    )
+    return job_id
+
+
+def test_list_moments_excludes_external_and_shapes_response(client: TestClient) -> None:
+    job_id = _make_audio_job(client)
+
+    r = client.get(f"/jobs/{job_id}/moments")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+
+    # EXTERNAL is dropped; only ACTION + OBJECT survive.
+    assert len(items) == 2
+    categories = {item["category"] for item in items}
+    assert categories == {"action", "object"}
+    assert all(item["seconds"] != _EXTERNAL_SECONDS for item in items)
+
+    action = next(i for i in items if i["category"] == "action")
+    assert action["seconds"] == _ACTION_SECONDS
+    assert action["timecode"] == "00:10"
+    assert action["phrase"] == "watch this"
+
+
+def test_list_moments_page_job_returns_empty(client: TestClient) -> None:
+    """A job whose transcript_source isn't an audio source (page/PDF) must
+    return an empty list, never an error — same rule the QA LOOK step
+    enforces (AUDIO_TRANSCRIPT_SOURCES)."""
+    create = client.post(
+        "/jobs", json={"url": "https://a-page.example", "kind": "page", "page_text": "hello"}
+    ).json()
+    _wait_until_done(client, create["id"])
+
+    r = client.get(f"/jobs/{create['id']}/moments")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_list_moments_audio_job_with_empty_segments_list_returns_empty(
+    client: TestClient,
+) -> None:
+    """transcript_source qualifies, but raw_segments_json parses to an
+    empty list — still an empty result, never an error."""
+    job_id = _make_audio_job(client, segments=[])
+    r = client.get(f"/jobs/{job_id}/moments")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_list_moments_audio_job_with_no_segments_column_returns_empty(
+    client: TestClient,
+) -> None:
+    """transcript_source qualifies, but raw_segments_json was never set at
+    all (None) — still an empty result, never an error."""
+    from src.storage import repo
+
+    create = client.post(
+        "/jobs", json={"url": "https://example.com/video", "kind": "page",
+                       "page_text": "placeholder"},
+    ).json()
+    job_id = create["id"]
+    _wait_until_done(client, job_id)
+    repo.mark_done(
+        job_id,
+        raw_text="placeholder",
+        summary_md="placeholder",
+        transcript_source="whisper",
+        transcript_language="en",
+        # raw_segments_json intentionally omitted — stays None.
+    )
+
+    r = client.get(f"/jobs/{job_id}/moments")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_list_moments_unknown_job_404(client: TestClient) -> None:
+    r = client.get("/jobs/does-not-exist/moments")
+    assert r.status_code == 404
+
+
+def test_fetch_moment_frames_happy_path(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    job_id = _make_audio_job(client)
+
+    frame_paths = [tmp_path / "frame_01.jpg", tmp_path / "frame_02.jpg"]
+    for p in frame_paths:
+        p.write_bytes(b"jpeg")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.update(kwargs)
+        return frame_paths
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["items"]) == 2
+    for item, path in zip(body["items"], frame_paths, strict=True):
+        assert item["seconds"] == _ACTION_SECONDS
+        assert item["timecode"] == "00:10"
+        assert item["phrase"] == "watch this"
+        assert item["frame_url"] == f"/jobs/{job_id}/frames/{path.parent.name}/{path.name}"
+
+    # ACTION -> SECTION_MAX_HEIGHT_PX (not the "readable" resolution).
+    assert captured["max_height_px"] == frames_mod.SECTION_MAX_HEIGHT_PX
+    assert captured["reuse_existing"] is True
+    assert captured["timestamp_seconds"] == _ACTION_SECONDS
+
+
+def test_fetch_moment_frames_uses_readable_height_for_object_category(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    job_id = _make_audio_job(client)
+    frame_path = tmp_path / "frame_01.jpg"
+    frame_path.write_bytes(b"jpeg")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.update(kwargs)
+        return [frame_path]
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _OBJECT_SECONDS})
+    assert r.status_code == 200, r.text
+    assert captured["max_height_px"] == frames_mod.SECTION_MAX_HEIGHT_READABLE_PX
+
+
+def test_fetch_moment_frames_rejects_external_moment(client: TestClient) -> None:
+    job_id = _make_audio_job(client)
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _EXTERNAL_SECONDS})
+    assert r.status_code == 400
+    assert "outside the video" in r.json()["detail"]
+
+
+def test_fetch_moment_frames_unknown_seconds_404(client: TestClient) -> None:
+    job_id = _make_audio_job(client)
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": 12345.0})
+    assert r.status_code == 404
+
+
+def test_fetch_moment_frames_unknown_job_404(client: TestClient) -> None:
+    r = client.post("/jobs/does-not-exist/frames", json={"seconds": 10.0})
+    assert r.status_code == 404
+
+
+def test_fetch_moment_frames_budget_exhausted_returns_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _make_audio_job(client)
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        return []  # workers.frames.fetch_frames's own "budget spent" signal
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
+    assert r.status_code == 409
+    assert "budget" in r.json()["detail"]
+
+
+def test_fetch_moment_frames_download_failure_returns_502(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _make_audio_job(client)
+
+    from src.workers import frames as frames_mod
+    from src.workers.errors import FrameExtractionError
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        raise FrameExtractionError(
+            f"section download failed for x after {frames_mod.SECTION_DOWNLOAD_MAX_ATTEMPTS} "
+            "attempts: ffmpeg exited with code 8"
+        )
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
+    assert r.status_code == 502
+    assert "ffmpeg exited with code 8" in r.json()["detail"]
 
 

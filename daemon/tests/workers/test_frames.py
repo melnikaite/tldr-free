@@ -293,6 +293,108 @@ def test_download_section_sync_propagates_on_ytdlp_failure(
 
 
 # ---------------------------------------------------------------------------
+# _download_video_section — retry-on-failure wrapper around
+# _download_section_sync (measured-transient "ffmpeg exited with code 8" —
+# see module docstring "Section download retries").
+# ---------------------------------------------------------------------------
+
+
+async def test_download_video_section_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(frames, "resolve_ffmpeg_dir", lambda: None)
+    monkeypatch.setattr(frames, "deno_runtime_opt", lambda: {})
+    out_file = tmp_path / "attempt2" / "vid.section.mp4"
+    calls = {"n": 0}
+
+    def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
+        ydl = _FakeYoutubeDL(opts)
+
+        def extract_info(url: str, download: bool = True) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise RuntimeError("ffmpeg exited with code 8")
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(b"fake video")
+            return {"requested_downloads": [{"filepath": str(out_file)}]}
+
+        ydl.extract_info = extract_info  # type: ignore[method-assign]
+        return ydl
+
+    monkeypatch.setattr(frames, "_new_ytdl", factory)
+
+    result = await frames._download_video_section(
+        url="https://example.com/video", start=0.0, end=5.0,
+        cookies=[], dir=tmp_path, max_height=480,
+    )
+    assert result == out_file
+    assert calls["n"] == 2
+
+
+async def test_download_video_section_raises_last_error_after_exhausting_attempts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(frames, "resolve_ffmpeg_dir", lambda: None)
+    monkeypatch.setattr(frames, "deno_runtime_opt", lambda: {})
+    calls = {"n": 0}
+
+    def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
+        ydl = _FakeYoutubeDL(opts)
+
+        def extract_info(url: str, download: bool = True) -> dict[str, Any]:
+            calls["n"] += 1
+            raise RuntimeError(f"ffmpeg exited with code 8 (attempt {calls['n']})")
+
+        ydl.extract_info = extract_info  # type: ignore[method-assign]
+        return ydl
+
+    monkeypatch.setattr(frames, "_new_ytdl", factory)
+
+    with pytest.raises(RuntimeError, match=r"attempt 3"):
+        await frames._download_video_section(
+            url="https://example.com/video", start=0.0, end=5.0,
+            cookies=[], dir=tmp_path, max_height=480,
+        )
+    assert calls["n"] == frames.SECTION_DOWNLOAD_MAX_ATTEMPTS
+
+
+async def test_download_video_section_uses_fresh_subdir_per_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A partial file left behind by a failed attempt (yt-dlp's ffmpeg
+    external downloader does not delete its temp output on a nonzero exit
+    — see the function's docstring) must never be visible to the next
+    attempt. Verified here at the ``_download_section_sync`` call boundary:
+    each attempt gets a distinct ``dir``."""
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
+    seen_dirs: list[Path] = []
+
+    def fake_sync(*, url: str, start: float, end: float, cookies: list[Any],
+                  dir: Path, max_height: int) -> Path:
+        seen_dirs.append(dir)
+        # Leave a partial file behind, exactly like a failed real attempt
+        # would (see docstring) — must not affect the next attempt.
+        dir.mkdir(parents=True, exist_ok=True)
+        (dir / "vid.section.mp4.part").write_bytes(b"partial")
+        raise RuntimeError("ffmpeg exited with code 8")
+
+    monkeypatch.setattr(frames, "_download_section_sync", fake_sync)
+
+    with pytest.raises(RuntimeError):
+        await frames._download_video_section(
+            url="https://example.com/video", start=0.0, end=5.0,
+            cookies=[], dir=tmp_path, max_height=480,
+        )
+
+    assert len(seen_dirs) == frames.SECTION_DOWNLOAD_MAX_ATTEMPTS
+    assert len(set(seen_dirs)) == frames.SECTION_DOWNLOAD_MAX_ATTEMPTS
+    for d in seen_dirs:
+        assert d.parent == tmp_path
+
+
+# ---------------------------------------------------------------------------
 # _download_full_sync — no download_ranges, max_filesize present
 # ---------------------------------------------------------------------------
 
@@ -563,13 +665,104 @@ async def test_fetch_frames_clamps_to_remaining_job_budget(
     assert len(result) == 2
 
 
-async def test_fetch_frames_raises_without_fallback_when_section_fails(
+async def test_fetch_frames_reuse_existing_returns_cached_frames_without_download(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """``reuse_existing=True`` for a moment that already has frames on disk
+    must return them as-is, touching neither yt-dlp nor ffmpeg."""
+    out_dir = tmp_path / "frames" / "jobcached" / "t31"
+    out_dir.mkdir(parents=True)
+    (out_dir / "frame_01.jpg").write_bytes(b"jpeg-1")
+    (out_dir / "frame_02.jpg").write_bytes(b"jpeg-2")
+
+    def boom(*a: object, **k: object) -> None:
+        pytest.fail("reuse_existing must not touch the network")
+
+    monkeypatch.setattr(frames, "_download_video_section", boom)
+    monkeypatch.setattr(frames, "_download_full_video", boom)
+
+    result = await frames.fetch_frames(
+        job_id="jobcached", url="https://example.com/video",
+        timestamp_seconds=31.0, reuse_existing=True,
+    )
+    assert result == [out_dir / "frame_01.jpg", out_dir / "frame_02.jpg"]
+
+
+async def test_fetch_frames_reuse_existing_downloads_when_nothing_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``reuse_existing=True`` for a moment with NOTHING on disk yet still
+    downloads/extracts normally — the flag only skips the network when
+    there's actually something to reuse."""
+    out_file = tmp_path / "vid.section.mp4"
+
     def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
         ydl = _FakeYoutubeDL(opts)
 
         def extract_info(url: str, download: bool = True) -> dict[str, Any]:
+            out_file.write_bytes(b"fake video")
+            return {"requested_downloads": [{"filepath": str(out_file)}]}
+
+        ydl.extract_info = extract_info  # type: ignore[method-assign]
+        return ydl
+
+    monkeypatch.setattr(frames, "_new_ytdl", factory)
+    monkeypatch.setattr(frames, "resolve_ffmpeg_dir", lambda: None)
+    monkeypatch.setattr(frames, "_ffmpeg_bin", lambda: str(tmp_path / "ffmpeg"))
+    monkeypatch.setattr(frames.subprocess, "run", _fake_ffmpeg_writes_frames(5))
+
+    result = await frames.fetch_frames(
+        job_id="jobfresh", url="https://example.com/video",
+        timestamp_seconds=31.0, reuse_existing=True,
+    )
+    assert len(result) == 5
+
+
+async def test_fetch_frames_without_reuse_flag_redownloads_even_if_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Default behaviour (``reuse_existing=False``) is unchanged by adding
+    the reuse path: a second call for the same moment still clears and
+    re-fetches rather than returning the stale files."""
+    out_dir = tmp_path / "frames" / "jobstale" / "t31"
+    out_dir.mkdir(parents=True)
+    (out_dir / "frame_01.jpg").write_bytes(b"stale")
+
+    out_file = tmp_path / "vid.section.mp4"
+
+    def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
+        ydl = _FakeYoutubeDL(opts)
+
+        def extract_info(url: str, download: bool = True) -> dict[str, Any]:
+            out_file.write_bytes(b"fake video")
+            return {"requested_downloads": [{"filepath": str(out_file)}]}
+
+        ydl.extract_info = extract_info  # type: ignore[method-assign]
+        return ydl
+
+    monkeypatch.setattr(frames, "_new_ytdl", factory)
+    monkeypatch.setattr(frames, "resolve_ffmpeg_dir", lambda: None)
+    monkeypatch.setattr(frames, "_ffmpeg_bin", lambda: str(tmp_path / "ffmpeg"))
+    monkeypatch.setattr(frames.subprocess, "run", _fake_ffmpeg_writes_frames(3))
+
+    result = await frames.fetch_frames(
+        job_id="jobstale", url="https://example.com/video", timestamp_seconds=31.0,
+    )
+    assert len(result) == 3
+    assert all(p.read_bytes() != b"stale" for p in result)
+
+
+async def test_fetch_frames_raises_without_fallback_when_section_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
+    calls = {"n": 0}
+
+    def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
+        ydl = _FakeYoutubeDL(opts)
+
+        def extract_info(url: str, download: bool = True) -> dict[str, Any]:
+            calls["n"] += 1
             raise RuntimeError("section download refused")
 
         ydl.extract_info = extract_info  # type: ignore[method-assign]
@@ -578,16 +771,22 @@ async def test_fetch_frames_raises_without_fallback_when_section_fails(
     monkeypatch.setattr(frames, "_new_ytdl", factory)
     monkeypatch.setattr(frames, "resolve_ffmpeg_dir", lambda: None)
 
-    with pytest.raises(FrameExtractionError, match="section download failed"):
+    with pytest.raises(
+        FrameExtractionError,
+        match=f"section download failed.*after {frames.SECTION_DOWNLOAD_MAX_ATTEMPTS} attempts",
+    ):
         await frames.fetch_frames(
             job_id="jobX", url="https://example.com/video",
             timestamp_seconds=10.0, allow_full_download=False,
         )
+    # Every attempt was actually tried, not just the first.
+    assert calls["n"] == frames.SECTION_DOWNLOAD_MAX_ATTEMPTS
 
 
 async def test_fetch_frames_falls_back_to_full_download_when_opted_in(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
     full_file = tmp_path / "full.mp4"
     calls = {"section": 0, "full": 0}
 
@@ -615,13 +814,16 @@ async def test_fetch_frames_falls_back_to_full_download_when_opted_in(
         timestamp_seconds=10.0, num_frames=2, allow_full_download=True,
     )
 
-    assert calls == {"section": 1, "full": 1}
+    # The section attempt retries SECTION_DOWNLOAD_MAX_ATTEMPTS times before
+    # the caller falls back to the full download.
+    assert calls == {"section": frames.SECTION_DOWNLOAD_MAX_ATTEMPTS, "full": 1}
     assert len(result) == 2
 
 
 async def test_fetch_frames_full_download_over_size_guard_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(frames, "SECTION_DOWNLOAD_RETRY_DELAY_SECONDS", 0.0)
     full_file = tmp_path / "full.mp4"
 
     def factory(opts: dict[str, Any]) -> _FakeYoutubeDL:
@@ -663,3 +865,49 @@ def test_delete_job_frames_removes_directory(tmp_path: Path) -> None:
 
 def test_delete_job_frames_returns_false_when_nothing_to_delete(tmp_path: Path) -> None:
     assert frames.delete_job_frames("no-such-job") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_frame_path — path validation for GET /jobs/{id}/frames/{rel_path}
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_frame_path_happy_path(tmp_path: Path) -> None:
+    job_dir = tmp_path / "frames" / "jobA" / "t12"
+    job_dir.mkdir(parents=True)
+    frame = job_dir / "frame_02.jpg"
+    frame.write_bytes(b"jpeg")
+
+    resolved = frames.resolve_frame_path("jobA", "t12/frame_02.jpg")
+    assert resolved == frame.resolve()
+
+
+def test_resolve_frame_path_missing_file_returns_none(tmp_path: Path) -> None:
+    (tmp_path / "frames" / "jobA" / "t12").mkdir(parents=True)
+    assert frames.resolve_frame_path("jobA", "t12/frame_99.jpg") is None
+
+
+def test_resolve_frame_path_missing_job_returns_none(tmp_path: Path) -> None:
+    assert frames.resolve_frame_path("no-such-job", "t12/frame_00.jpg") is None
+
+
+def test_resolve_frame_path_rejects_traversal_outside_job_dir(tmp_path: Path) -> None:
+    # A secret file that lives OUTSIDE jobA's own frame directory (a
+    # sibling job's frame, in this case) must never be reachable via a
+    # crafted rel_path from jobA.
+    other_job_dir = tmp_path / "frames" / "jobB" / "t1"
+    other_job_dir.mkdir(parents=True)
+    secret = other_job_dir / "frame_00.jpg"
+    secret.write_bytes(b"someone else's frame")
+
+    (tmp_path / "frames" / "jobA").mkdir(parents=True)
+
+    assert frames.resolve_frame_path("jobA", "../jobB/t1/frame_00.jpg") is None
+
+
+def test_resolve_frame_path_rejects_absolute_path_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"not a frame")
+    # An absolute rel_path would otherwise let Path(a) / Path(b) discard `a`
+    # entirely (Python's pathlib semantics) and resolve straight to `b`.
+    assert frames.resolve_frame_path("jobA", str(outside)) is None

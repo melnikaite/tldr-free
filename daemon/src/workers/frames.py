@@ -3,21 +3,36 @@ multimodal LLM to look at, without ever downloading the whole video.
 
 Public surface:
     fetch_frames(*, job_id, url, timestamp_seconds, num_frames=..., cookies=None,
-                  allow_full_download=False, full_download_max_bytes=...)
+                  allow_full_download=False, full_download_max_bytes=...,
+                  reuse_existing=False)
         -> list[Path]
         Downloads a short section of ``url`` around ``timestamp_seconds``
         (yt-dlp ``--download-sections``, never the full video — see below),
         then extracts a handful of JPEG frames from it with ffmpeg. Returns
         the frame paths in chronological order.
 
-    delete_job_frames(job_id) -> bool
-        RETENTION HOOK. See its docstring — something outside this module
-        must call it; it is not wired up on its own.
+        ``reuse_existing=True`` makes a second call for the SAME
+        ``(job_id, timestamp_seconds)`` return whatever is already on disk
+        for that moment WITHOUT touching the network at all — for a caller
+        that only wants "the frames for this moment, fetching once is
+        enough" (e.g. a user re-opening the same "look" affordance).
+        Default ``False`` keeps every other caller's existing behaviour: a
+        second call always clears and re-downloads/re-extracts (see the
+        stale-leftover comment inside the function for why that's still
+        the right default when a caller might ask for a different
+        ``num_frames`` between calls).
 
-Not wired into the pipeline or the QA flow. This module only produces JPEG
-files on disk and hands back their paths; a future QA-time vision step is
-responsible for reading them and feeding them to the multimodal LLM as
-``image_url`` content.
+    delete_job_frames(job_id) -> bool
+        RETENTION HOOK. See its docstring — wired in from both
+        ``storage/repo.py`` delete paths (explicit delete + retention sweep).
+
+Not wired into the pipeline itself — only the QA LOOK step
+(``llm/qa.py``'s ``_inspect_moment``) and the on-demand "look" affordance
+(``api/jobs.py``'s ``POST /jobs/{id}/frames``) call ``fetch_frames``. This
+module only produces JPEG files on disk and hands back their paths; those
+callers are responsible for what happens to them next (feeding them to the
+multimodal LLM as ``image_url`` content, or serving them straight to the
+user via ``GET /jobs/{id}/frames/{rel_path}``).
 
 Why sections, not the whole file
 ---------------------------------
@@ -85,11 +100,10 @@ alongside how ``workers/youtube.download_audio`` places a job's audio under
 tracks it for cleanup. Frames have no DB column — like ``media_url`` for
 MEDIA jobs (see ``.claude/workers.md``, "Media and PDF jobs are ephemeral on
 restart"), there is nothing here that's safe or worth persisting across a
-restart, so this module doesn't try. That means the existing
-``retention.py`` sweep (keyed off ``Job.created_at`` / row deletion in the
-DB) has no way to find these directories on its own — see
-``delete_job_frames`` below for the concrete hook that must be wired in to
-close that gap.
+restart, so this module doesn't try. That means the ``retention.py`` sweep
+(keyed off ``Job.created_at`` / row deletion in the DB) has no way to find
+these directories on its own — see ``delete_job_frames`` below for the
+hook ``storage/repo.py`` calls to close that gap.
 
 The section/full clip downloaded on the way to the frames is never
 persisted — it lives in a ``tempfile.TemporaryDirectory`` under
@@ -97,6 +111,23 @@ persisted — it lives in a ``tempfile.TemporaryDirectory`` under
 and is removed (directory and all) before the call returns, success or
 failure. Only ``frames/`` (the extracted JPEGs) needs the retention hook;
 ``frames_scratch/`` self-cleans every call.
+
+Section download retries
+--------------------------
+A section download can fail with a plain transient error — measured
+directly rather than assumed: a live ``ffmpeg exited with code 8`` on one
+moment of a YouTube video turned out to be flaky, not sticky. A follow-up
+probe called ``_download_section_sync`` directly against the SAME video,
+three attempts each on the range that had just failed live and a range
+that had just succeeded live, and saw the failure MOVE between ranges
+(roughly one failure in six attempts) rather than stay with one — a
+CDN-side hiccup mid-download, not a property of any particular section.
+``_download_video_section`` therefore retries the section download up to
+``SECTION_DOWNLOAD_MAX_ATTEMPTS`` times (constant's docstring has the
+reasoning for the count/delay) before giving up — recovering most of
+these for free, well before the caller has to pay for a full-video
+download. Only the section path retries; the opt-in full-download
+fallback below does not (see its own note).
 
 Fallback for sites that refuse ranged/section downloads
 ---------------------------------------------------------
@@ -180,6 +211,20 @@ FULL_DOWNLOAD_MAX_HEIGHT_PX = 480
 # Size guard for the opt-in full-download fallback. Well under the 71 MB
 # measured full-720p example; see module docstring.
 FULL_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
+
+# Bounded retry for the SECTION download only (never the full-download
+# fallback — that path is a big, rare, deliberately-opt-in escape hatch;
+# retrying it automatically would multiply an already-expensive cost).
+# 3 total attempts (2 retries) — see module docstring "Section download
+# retries" for the measurement behind this: a transient CDN-side failure
+# was observed at roughly 1-in-6 attempts, moving between ranges, so two
+# retries clears the vast majority of these without piling on unbounded
+# wall-clock time for a truly broken URL.
+SECTION_DOWNLOAD_MAX_ATTEMPTS = 3
+# Short pause between attempts — long enough to let a transient hiccup
+# clear, short enough that the worst case (all attempts fail) doesn't make
+# the user wait much longer than a couple of extra download attempts.
+SECTION_DOWNLOAD_RETRY_DELAY_SECONDS = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +480,49 @@ def _download_full_sync(
 async def _download_video_section(
     *, url: str, start: float, end: float, cookies: list[Cookie], dir: Path, max_height: int,
 ) -> Path:
-    return await asyncio.to_thread(
-        _download_section_sync,
-        url=url, start=start, end=end, cookies=cookies, dir=dir, max_height=max_height,
-    )
+    """Download the ``[start, end]`` section, retrying up to
+    ``SECTION_DOWNLOAD_MAX_ATTEMPTS`` times on failure — see module
+    docstring "Section download retries" for the measurement behind why
+    this is worth doing at all.
+
+    Each attempt gets its OWN fresh subdirectory under ``dir`` rather than
+    reusing one across attempts. Checked what a failed attempt leaves
+    behind first: yt-dlp's ffmpeg-backed external downloader
+    (``yt_dlp.downloader.external.ExternalFD.real_download``) downloads to
+    a temp-named file and only renames it to the final filename on a ZERO
+    ffmpeg exit code — on failure it reports the error and returns without
+    renaming OR deleting, so the temp file can survive under the original
+    name. yt-dlp re-invokes ffmpeg with ``-y`` on a retry, so in practice a
+    same-directory retry would just overwrite that leftover — but a fresh
+    subdirectory per attempt removes the question entirely instead of
+    depending on that overwrite behaviour (which isn't necessarily true for
+    every extractor/downloader combination), and guarantees
+    ``_locate_downloaded_file`` can never resolve a stale partial file from
+    an earlier failed attempt as if it were this attempt's result.
+
+    Raises the LAST attempt's exception once every attempt is exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, SECTION_DOWNLOAD_MAX_ATTEMPTS + 1):
+        attempt_dir = dir / f"attempt{attempt}"
+        try:
+            return await asyncio.to_thread(
+                _download_section_sync,
+                url=url, start=start, end=end, cookies=cookies,
+                dir=attempt_dir, max_height=max_height,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt < SECTION_DOWNLOAD_MAX_ATTEMPTS:
+                log.warning(
+                    "frames: section download attempt %d/%d failed for %s %s: "
+                    "%s — retrying",
+                    attempt, SECTION_DOWNLOAD_MAX_ATTEMPTS, url,
+                    _format_section_arg(start, end), exc,
+                )
+                await asyncio.sleep(SECTION_DOWNLOAD_RETRY_DELAY_SECONDS)
+    assert last_exc is not None  # loop always sets it before exhausting attempts
+    raise last_exc
 
 
 async def _download_full_video(
@@ -563,11 +647,13 @@ async def fetch_frames(
     max_height_px: int = SECTION_MAX_HEIGHT_PX,
     allow_full_download: bool = False,
     full_download_max_bytes: int = FULL_DOWNLOAD_MAX_BYTES,
+    reuse_existing: bool = False,
 ) -> list[Path]:
     """Fetch a handful of JPEG frames from around ``timestamp_seconds`` in
-    ``url``, for a multimodal LLM to inspect. Never downloads the whole video
-    unless ``allow_full_download=True`` is passed AND the section download
-    fails — see the module docstring for the full reasoning.
+    ``url``, for a multimodal LLM (or the user, directly) to inspect. Never
+    downloads the whole video unless ``allow_full_download=True`` is passed
+    AND the section download fails — see the module docstring for the full
+    reasoning.
 
     Returns frame paths in chronological order, or ``[]`` if the job's
     per-job frame budget (``MAX_FRAMES_PER_JOB``) is already spent — that is
@@ -581,21 +667,40 @@ async def fetch_frames(
     ``FULL_DOWNLOAD_MAX_HEIGHT_PX`` regardless: there the whole file is
     fetched, so the size guard matters more than legibility.
 
+    ``reuse_existing=True`` short-circuits the whole download/extract path
+    when this exact ``(job_id, timestamp_seconds)`` already has frames on
+    disk from an earlier call — returns them as-is, no network, no budget
+    check (they were already paid for). Default ``False`` preserves every
+    existing caller's behaviour (always clear + re-fetch fresh).
+
     Raises ``FrameExtractionError`` (``code="network_error"`` — see that
-    class's docstring for why) if the download and/or ffmpeg step fails.
+    class's docstring for why) if the download and/or ffmpeg step fails
+    after every retry the section download gets (see module docstring
+    "Section download retries").
     """
     cookies = cookies or []
     timestamp_seconds = max(0.0, float(timestamp_seconds))
     requested = _effective_num_frames(num_frames)
 
     out_dir = _job_frames_dir(job_id) / f"t{int(timestamp_seconds)}"
-    # A second call for the same (job_id, timestamp) reuses this directory.
-    # ffmpeg's -y only overwrites same-NAMED files, so if this call requests
-    # fewer frames than a previous one did, stale higher-indexed leftovers
-    # would otherwise survive and get returned alongside the fresh ones.
-    # Clear it up front — before the budget check below — so (a) every
-    # call's result reflects only itself, and (b) this timestamp's old
-    # frames don't count against its own replacement's budget.
+
+    if reuse_existing:
+        cached = sorted(out_dir.glob("frame_*.jpg"))
+        if cached:
+            log.info(
+                "frames: reusing %d cached frame(s) for job %s at %ds (no download)",
+                len(cached), job_id, int(timestamp_seconds),
+            )
+            return cached
+
+    # A second call for the same (job_id, timestamp) that does NOT ask to
+    # reuse blows away any stale directory instead. ffmpeg's -y only
+    # overwrites same-NAMED files, so if this call requests fewer frames
+    # than a previous one did, stale higher-indexed leftovers would
+    # otherwise survive and get returned alongside the fresh ones. Clear it
+    # up front — before the budget check below — so (a) every call's result
+    # reflects only itself, and (b) this timestamp's old frames don't count
+    # against its own replacement's budget.
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -628,7 +733,8 @@ async def fetch_frames(
             if not allow_full_download:
                 raise FrameExtractionError(
                     f"section download failed for {url} "
-                    f"{_format_section_arg(start, end)}: {exc}"
+                    f"{_format_section_arg(start, end)} after "
+                    f"{SECTION_DOWNLOAD_MAX_ATTEMPTS} attempts: {exc}"
                 ) from exc
             log.warning(
                 "frames: section download failed for %s (%s); "
@@ -665,19 +771,45 @@ async def fetch_frames(
     return frames
 
 
+def resolve_frame_path(job_id: str, rel_path: str) -> Path | None:
+    """Resolve a frame JPEG's on-disk path for ``GET /jobs/{id}/frames/...``,
+    or ``None`` if it doesn't exist or ``rel_path`` tries to escape the
+    job's own frame directory.
+
+    Pure path validation — no fetching, no network, no mutation (beyond the
+    harmless ``mkdir`` inside ``_frames_root_dir``/``_job_frames_dir``, the
+    same idempotent side effect every other reader/writer in this module
+    already has). The caller (``api/jobs.py``) is responsible for the 404
+    HTTP response; this just decides yes/no.
+
+    Hardening: resolves both the job's frame root and the candidate path
+    with symlinks/``..`` collapsed, then requires the candidate to still be
+    *inside* the root (``Path.relative_to`` raises otherwise) — a
+    ``rel_path`` like ``"../../etc/passwd"`` or an absolute path can't
+    escape the job's own directory no matter how it's spelled.
+    """
+    job_root = _job_frames_dir(job_id).resolve()
+    candidate = (job_root / rel_path).resolve()
+    try:
+        candidate.relative_to(job_root)
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
 def delete_job_frames(job_id: str) -> bool:
     """Remove every frame JPEG (and the per-job directory) for ``job_id``.
 
-    RETENTION HOOK — nothing calls this yet; wire it in at both existing
-    audio-cleanup call sites in ``storage/repo.py`` so frame directories
-    share the audio file's lifecycle exactly:
+    RETENTION HOOK — wired in at both audio-cleanup call sites in
+    ``storage/repo.py`` (via the local ``_delete_job_frames`` wrapper there)
+    so frame directories share the audio file's lifecycle exactly:
 
-      1. ``repo.delete_job(job_id)`` — call ``frames.delete_job_frames(job_id)``
-         right alongside the existing ``_safe_unlink(Path(cached_audio))``
-         call for ``job.audio_path``.
-      2. ``repo.delete_jobs_older_than(cutoff)`` — call
-         ``frames.delete_job_frames(job_id)`` for each id in the ``ids``
-         loop. This is what makes the periodic
+      1. ``repo.delete_job(job_id)`` — called right alongside the existing
+         ``_safe_unlink(Path(cached_audio))`` call for ``job.audio_path``.
+      2. ``repo.delete_jobs_older_than(cutoff)`` — called for each id in the
+         ``ids`` loop. This is what makes the periodic
          ``workers.retention.retention_worker`` sweep actually clean up
          frame directories instead of leaking them for
          ``storage.retention_days`` (default 365).
@@ -702,4 +834,5 @@ __all__ = [
     "MAX_FRAMES_PER_JOB",
     "delete_job_frames",
     "fetch_frames",
+    "resolve_frame_path",
 ]

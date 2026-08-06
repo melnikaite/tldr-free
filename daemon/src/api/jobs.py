@@ -21,9 +21,13 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.schemas import (
+    DeixisMoment,
+    FrameFetchRequest,
+    FrameFetchResponse,
+    FrameRef,
     JobCreateRequest,
     JobCreateResponse,
     JobDetails,
@@ -32,14 +36,17 @@ from src.api.schemas import (
     JobStatus,
     JobSummary,
     MessagesListResponse,
+    MomentsListResponse,
     TranscriptSource,
 )
 from src.api.schemas import (
     Message as MessageModel,
 )
 from src.storage import repo
-from src.workers import pipeline, timecodes, youtube
+from src.workers import deixis, frames, pipeline, timecodes, youtube
 from src.workers.broker import get_stream_buffer
+from src.workers.deixis import DeixisCategory
+from src.workers.errors import FrameExtractionError
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +187,27 @@ def _to_details(job: Any) -> JobDetails:
     )
 
 
+def _parse_frame_refs(raw: str | None, *, message_id: Any) -> list[Any]:
+    """Parse ``Message.frame_refs_json`` back into a list of dicts.
+
+    Malformed payloads (should never happen — we wrote it ourselves in
+    ``repo.add_message``) are logged and dropped rather than failing the
+    whole message list, same defensive style as
+    ``_to_details``'s ``alt_media_candidates_json`` parsing above.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        log.warning("api: malformed frame_refs_json for message %s", message_id)
+        return []
+    if not isinstance(parsed, list):
+        log.warning("api: frame_refs_json for message %s is not a list", message_id)
+        return []
+    return parsed
+
+
 def _to_message(row: Any) -> MessageModel:
     return MessageModel(
         id=row.id,
@@ -187,6 +215,9 @@ def _to_message(row: Any) -> MessageModel:
         role=row.role,
         content=row.content,
         created_at=row.created_at,
+        frame_refs=_parse_frame_refs(
+            getattr(row, "frame_refs_json", None), message_id=row.id
+        ),
     )
 
 
@@ -479,6 +510,189 @@ def get_transcript(job_id: str, lang: str | None = None) -> dict[str, Any]:
         "is_original": False,
         "is_pending": False,
     }
+
+
+@router.get("/{job_id}/frames/{rel_path:path}")
+def get_frame(job_id: str, rel_path: str) -> FileResponse:
+    """Serve one JPEG frame fetched via ``workers/frames.py`` — either by
+    the QA LOOK step (``llm/qa.py``, backs the thumbnail under an answer
+    that looked at the video) or by ``POST /jobs/{id}/frames`` (the
+    on-demand "look" affordance next to a summary line). Both write into
+    the same ``<data_dir>/frames/<job_id>/`` layout, so one route serves
+    either (see ``FrameRef``).
+
+    ``rel_path`` is the ``t<second>/frame_NN.jpg`` shape ``fetch_frames``
+    writes — validated hard by ``frames.resolve_frame_path`` (job must
+    exist here first; the resolved path must land inside that job's OWN
+    frame directory, no traversal). Single-user localhost daemon, so no
+    auth beyond that path check.
+
+    404 for an unknown job OR a missing/escaping file — deliberately the
+    same status for both so this endpoint doesn't leak which job ids exist
+    independently of whether they have frames.
+    """
+    if repo.get_job(job_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
+    path = frames.resolve_frame_path(job_id, rel_path)
+    if path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "frame not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# On-demand "look" affordance — GET the job's deixis moments, POST to fetch
+# (or reuse) that moment's frames. Distinct from the QA LOOK step: no vision
+# call here, the user looks themselves. See FrameRef / DeixisMoment.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{job_id}/moments", response_model=MomentsListResponse)
+def list_moments(job_id: str) -> MomentsListResponse:
+    """The deixis moments for a job — feeds the sidepanel's on-demand
+    "look" affordance next to a summary line's ``[MM:SS]`` marker.
+
+    Reuses ``workers.deixis.candidates_for_job`` — the EXACT same
+    job-qualification + candidate-finding logic the QA LOOK step uses — so
+    this list is byte-for-byte the set of moments QA could ever look at for
+    this job. EXTERNAL candidates are dropped: they point outside the video
+    (a link, an article number in the description) and must never be
+    offered for a frame fetch, same rule the QA path enforces daemon-side.
+
+    Empty list (never an error) for: jobs that don't qualify at all (page/
+    PDF, or any transcript_source not in AUDIO_TRANSCRIPT_SOURCES), jobs
+    with no raw_segments_json, or a transcript with no deixis moments.
+    """
+    job = repo.get_job(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
+    candidates = deixis.candidates_for_job(job)
+    items = [
+        DeixisMoment(
+            seconds=c.timestamp,
+            timecode=timecodes.format_timecode(c.timestamp),
+            phrase=c.phrase,
+            category=c.category.value,  # type: ignore[arg-type]
+        )
+        for c in candidates
+        if c.category != DeixisCategory.EXTERNAL
+    ]
+    return MomentsListResponse(items=items)
+
+
+# Category -> section download resolution for the on-demand frame fetch.
+# Small enough (2 entries) that it isn't worth sharing across modules — see
+# workers/frames.py's own module docstring: mapping a deixis category to a
+# resolution is deliberately the CALLER's job, not that module's. Mirrors
+# llm/qa.py's `_HEIGHT_BY_CATEGORY` (OBJECT is worth reading a label off;
+# ACTION only needs to be seen; EXTERNAL is absent on purpose — it can never
+# reach here, see the guard in `fetch_moment_frames` below).
+_MOMENT_HEIGHT_BY_CATEGORY: dict[DeixisCategory, int] = {
+    DeixisCategory.OBJECT: frames.SECTION_MAX_HEIGHT_READABLE_PX,
+    DeixisCategory.ACTION: frames.SECTION_MAX_HEIGHT_PX,
+}
+
+# Tolerance for matching the request's `seconds` back to one of this job's
+# own DeixisMoment entries. The client echoes back the exact
+# `DeixisMoment.seconds` value GET /moments handed it, unmodified — this
+# only needs to absorb float round-tripping through JSON, NOT reconcile a
+# rendered [MM:SS] marker against a moment (that fuzzier matching is the
+# extension's own job — see sidepanel/app.js's own, much wider, tolerance
+# constant). A tight window here is a deliberate defence: it means a
+# request can't "aim" at a nearby moment it wasn't actually shown.
+_MOMENT_MATCH_TOLERANCE_SECONDS = 1.0
+
+
+@router.post("/{job_id}/frames", response_model=FrameFetchResponse)
+async def fetch_moment_frames(job_id: str, req: FrameFetchRequest) -> FrameFetchResponse:
+    """Fetch (or reuse already-downloaded) frames for one of this job's own
+    deixis moments, for the user to look at directly. NO vision/LLM call
+    here — the user clicked because they want to see the picture
+    themselves; involving a model would only add latency and a chance to
+    invent something.
+
+    Validates ``seconds`` against this job's own moments (the same source
+    ``GET /moments`` uses) before ever touching the network: a value that
+    doesn't correspond to a real moment 404s, and a match that turns out to
+    be EXTERNAL is rejected the same way the QA LOOK step's daemon-side
+    guard rejects an EXTERNAL pick regardless of what a caller sends.
+
+    On success, frames already on disk for this exact moment are returned
+    without re-downloading (``fetch_frames(reuse_existing=True)``).
+    Failure is always a clear HTTP error, never a silently-empty body:
+    - 409 if this job's per-job frame budget is already spent.
+    - 502 if the section download failed (after its own internal retries
+      — see ``workers.frames``'s "Section download retries").
+    """
+    job = repo.get_job(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
+
+    candidates = deixis.candidates_for_job(job)
+    match = min(
+        (
+            c for c in candidates
+            if abs(c.timestamp - req.seconds) <= _MOMENT_MATCH_TOLERANCE_SECONDS
+        ),
+        key=lambda c: abs(c.timestamp - req.seconds),
+        default=None,
+    )
+    if match is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no deixis moment near {req.seconds}s for job {job_id}",
+        )
+    if match.category == DeixisCategory.EXTERNAL:
+        # Defence in depth: GET /moments never offers an EXTERNAL entry in
+        # the first place, but this guard is what actually GUARANTEES one
+        # never reaches fetch_frames, not the client's compliance.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "this moment points outside the video (a link or description "
+            "reference) — there is no frame to fetch for it",
+        )
+
+    url = getattr(job, "url", None)
+    if not url:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"job {job_id} has no source url")
+
+    max_height = _MOMENT_HEIGHT_BY_CATEGORY.get(match.category, frames.SECTION_MAX_HEIGHT_PX)
+    try:
+        frame_paths = await frames.fetch_frames(
+            job_id=job_id,
+            url=url,
+            timestamp_seconds=match.timestamp,
+            max_height_px=max_height,
+            # No cookies: cookies only ever arrive on the original
+            # job-creation request and are never persisted on Job (see
+            # llm/qa.py's `_inspect_moment` — same story here, long after
+            # ingestion there is nothing stored to forward).
+            cookies=None,
+            reuse_existing=True,
+        )
+    except FrameExtractionError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"could not fetch the video frame: {exc}",
+        ) from exc
+
+    if not frame_paths:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this job's frame budget ({frames.MAX_FRAMES_PER_JOB} frames) is "
+            "already spent; no new frames can be fetched",
+        )
+
+    timecode = timecodes.format_timecode(match.timestamp)
+    items = [
+        FrameRef(
+            seconds=match.timestamp,
+            timecode=timecode,
+            phrase=match.phrase,
+            frame_url=f"/jobs/{job_id}/frames/{p.parent.name}/{p.name}",
+        )
+        for p in frame_paths
+    ]
+    return FrameFetchResponse(items=items)
 
 
 @router.delete("/{job_id}", status_code=204)

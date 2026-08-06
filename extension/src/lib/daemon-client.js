@@ -5,13 +5,15 @@
  *   AIStreamEvent,
  *   AIStreamRequest,
  *   ChatMessage,
+ *   FrameFetchResponse,
  *   HealthResponse,
  *   JobCreateRequest,
  *   JobCreateResponse,
  *   JobDetails,
  *   JobListResponse,
  *   JobStatus,
- *   MessagesListResponse
+ *   MessagesListResponse,
+ *   MomentsListResponse
  * } from "./api-types.js" */
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
@@ -114,6 +116,17 @@ async function* sseStream(path, body, opts = {}) {
 }
 
 export const daemon = {
+  /**
+   * Resolve the currently configured daemon base URL. Exposed directly
+   * (not just through `request()`) so callers building a raw resource URL
+   * — e.g. an `<img src>` for a QA frame thumbnail, see
+   * `FrameRef.frame_url` — can prefix a server-relative path without
+   * duplicating the `chrome.storage.local` read.
+   *
+   * @returns {Promise<string>}
+   */
+  baseUrl: () => getBaseUrl(),
+
   /** @returns {Promise<HealthResponse>} */
   health: () => request("/health"),
 
@@ -227,6 +240,34 @@ export const daemon = {
    * @returns {Promise<MessagesListResponse>}
    */
   listMessages: (id) => request(`/jobs/${id}/messages`),
+
+  /**
+   * The deixis moments for a job — feeds the summary's on-demand "look"
+   * affordance (see sidepanel/app.js). Empty `items` (never an error) for
+   * a job with no timestamped transcript or no deixis moments at all.
+   *
+   * @param {string} id
+   * @returns {Promise<MomentsListResponse>}
+   */
+  getMoments: (id) => request(`/jobs/${id}/moments`),
+
+  /**
+   * Fetch (or reuse already-downloaded) frames for one of a job's own
+   * deixis moments — `seconds` must be a value `getMoments()` actually
+   * returned for this job, or the daemon 404s. No vision/LLM call: this
+   * returns pictures, not descriptions. Throws (via `request()`) on any
+   * non-2xx response — 404 (unknown job/moment), 400 (EXTERNAL moment),
+   * 409 (per-job frame budget spent), 502 (download failed after retries).
+   *
+   * @param {string} id
+   * @param {number} seconds
+   * @returns {Promise<FrameFetchResponse>}
+   */
+  fetchMomentFrames: (id, seconds) =>
+    request(`/jobs/${id}/frames`, {
+      method: "POST",
+      body: JSON.stringify({ seconds }),
+    }),
 
   /**
    * Fetch the daemon's current configuration: LLM backend, Whisper

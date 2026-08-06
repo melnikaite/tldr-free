@@ -69,9 +69,11 @@ reload icon in `chrome://extensions`. Full matrix in
    mirror in `extension/src/lib/api-types.js` (same commit). Route in
    `daemon/src/api/<file>.py`. Prefer extending `/ai/stream` body for new AI
    modes over a new endpoint.
-2. **New SQLite column** → edit the v1 migration in
-   `daemon/src/storage/migrations.py` (we wipe DB during dev — `task reset`)
-   + field on the SQLModel in `daemon/src/storage/db.py` + helper in `repo.py`.
+2. **New SQLite column** → v1 is frozen (a DB that already ran it never
+   runs it again); add a new version in `daemon/src/storage/migrations.py`
+   (`ALTER TABLE ... ADD COLUMN`, registered in `MIGRATIONS`, following the
+   existing v3-v6 pattern) + field on the SQLModel in `daemon/src/storage/db.py`
+   + helper in `repo.py`.
 3. **New worker / external integration** → file under `daemon/src/workers/`.
    Errors typed under `workers/errors.py` with a `code` matching `DeferredReason`.
    Publish progress to `workers.broker.get_broker()` keyed by `job_id` so

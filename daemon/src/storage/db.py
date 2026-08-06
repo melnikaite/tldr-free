@@ -101,6 +101,13 @@ class Message(SQLModel, table=True):
     role: str                                       # "user" | "assistant"
     content: str
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    # JSON-encoded list of FrameRef dicts (api.schemas.FrameRef) — the video
+    # frame(s) that actually backed a visual claim in this message, one per
+    # relevant LOOK-step moment (see llm/qa.py). Null for user messages and
+    # for assistant messages that never looked at a frame, or looked but
+    # found nothing relevant. Round-trip storage only; the daemon never
+    # reads this back into anything other than the API response.
+    frame_refs_json: str | None = None
 
 
 class TranscriptTranslation(SQLModel, table=True):

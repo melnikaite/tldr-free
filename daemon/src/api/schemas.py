@@ -226,12 +226,101 @@ class JobListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class FrameRef(BaseModel):
+    """One video frame worth showing the user a thumbnail for.
+
+    Two producers share this exact shape, so the client needs only ONE
+    thumbnail renderer:
+
+    - The QA LOOK step (``llm/qa.py``) — at most one ``FrameRef`` per
+      inspected deixis moment, and ONLY when the vision model reported the
+      frames as genuinely relevant to the question (see
+      ``llm.qa.VisionResult`` / ``qa_frames.txt``). A moment that was
+      looked at but found irrelevant contributes its finding text to the
+      synthesis prompt same as before, but never produces a ``FrameRef`` —
+      no thumbnail for "we checked and there was nothing to see".
+    - ``POST /jobs/{id}/frames`` (see ``FrameFetchResponse``) — one
+      ``FrameRef`` per extracted frame for the moment the user clicked a
+      "look" affordance on, all sharing that moment's seconds/timecode/
+      phrase. No vision call involved; the user looks themselves.
+
+    ``frame_url`` is a path rooted at the daemon (``GET
+    /jobs/{job_id}/frames/{rel_path}``), not an absolute URL — the client
+    prefixes it with whatever base URL it's using to reach this daemon,
+    the same way every other daemon-served resource works.
+
+    QA-produced refs are persisted verbatim (as a JSON list) on the
+    assistant ``Message`` row (``Message.frame_refs_json``) so reopening a
+    job's chat history renders the identical thumbnail without redoing any
+    of the LOOK step's work. ``POST /jobs/{id}/frames`` refs are not
+    persisted anywhere — the client re-fetches (cheaply, see
+    ``workers.frames.fetch_frames``'s ``reuse_existing``) if it wants them
+    again after a reload.
+    """
+    seconds: float
+    timecode: str
+    phrase: str
+    frame_url: str
+
+
+class DeixisMoment(BaseModel):
+    """One moment where this job's transcript speech points at the video's
+    picture (see ``workers.deixis.DeixisCandidate``) — offered to the
+    client so a summary line's ``[MM:SS]`` marker landing near one can show
+    a "look" affordance (see ``GET /jobs/{id}/moments``).
+
+    EXTERNAL candidates are never included here: they point OUTSIDE the
+    video (a link, an article number in the description) and fetching a
+    frame for one would show nothing relevant to what was said — same rule
+    the QA LOOK step enforces daemon-side, independent of any client.
+    """
+    seconds: float
+    timecode: str
+    phrase: str
+    category: Literal["action", "object"]
+
+
+class MomentsListResponse(BaseModel):
+    """``GET /jobs/{id}/moments`` — empty ``items`` (never an error) for a
+    job that doesn't qualify for deixis candidates at all (page/PDF, no
+    transcript, or a transcript with no candidates) — see
+    ``workers.deixis.candidates_for_job``."""
+    items: list[DeixisMoment]
+
+
+class FrameFetchRequest(BaseModel):
+    """Body for ``POST /jobs/{id}/frames`` — the moment (in seconds) the
+    user clicked the "look" affordance for. Must match one of this job's
+    own ``DeixisMoment`` entries (see ``GET /jobs/{id}/moments``); the
+    route 404s otherwise, and rejects an EXTERNAL-category match the same
+    way the QA LOOK step's daemon-side guard does (defence in depth — an
+    EXTERNAL moment is never offered by ``GET /moments`` in the first
+    place, but the route re-checks rather than trusting the caller sent
+    back exactly what it was given).
+    """
+    seconds: float
+
+
+class FrameFetchResponse(BaseModel):
+    """Returned by ``POST /jobs/{id}/frames`` on success. ``items`` uses
+    the SAME ``FrameRef`` shape the QA LOOK step returns (see ``FrameRef``)
+    — one thumbnail-row renderer for both. Always non-empty here; the
+    failure cases (unknown moment, EXTERNAL moment, per-job frame budget
+    already spent, section-download failure after retries) are raised as
+    HTTP errors instead of an empty/partial body — see the route.
+    """
+    items: list[FrameRef]
+
+
 class Message(BaseModel):
     id: int
     job_id: str
     role: Literal["user", "assistant"]
     content: str
     created_at: datetime
+    # Empty for user messages and for assistant messages that never looked
+    # at a frame, or looked but found nothing relevant. See `FrameRef`.
+    frame_refs: list[FrameRef] = []
 
 
 class MessagesListResponse(BaseModel):
@@ -293,6 +382,21 @@ class AIErrorEvent(BaseModel):
     """Terminal failure event."""
     type: Literal["error"] = "error"
     error: str
+
+
+class AIFramesEvent(BaseModel):
+    """Emitted once, after the LOOK step finishes, ONLY when at least one
+    inspected moment turned out relevant (see `FrameRef`). Never emitted
+    for a QA turn that ran no LOOK step, or where every inspected moment
+    was irrelevant — a frame must have actually contributed to the answer
+    to be worth showing the user a thumbnail for.
+
+    Client renders `items` as a small thumbnail row under the finished
+    answer bubble; the same list is persisted on the assistant `Message`
+    row (`Message.frame_refs`) so history reload renders identically.
+    """
+    type: Literal["frames"] = "frames"
+    items: list[FrameRef]
 
 
 # ---------------------------------------------------------------------------

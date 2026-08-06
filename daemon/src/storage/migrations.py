@@ -256,6 +256,30 @@ def _migration_v5(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v6 — Message.frame_refs_json
+# ---------------------------------------------------------------------------
+# The video frame(s) that actually backed a visual claim in a QA answer (see
+# api.schemas.FrameRef / llm/qa.py's LOOK step), JSON-encoded, one entry per
+# relevant moment. Null for user messages and for assistant messages whose
+# LOOK step never ran or found nothing relevant. Read by the sidepanel so
+# reopening a job's chat renders the same thumbnail without redoing the
+# LOOK step.
+
+_V6_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE message ADD COLUMN frame_refs_json TEXT",
+)
+
+
+def _migration_v6(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V6_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -266,6 +290,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (3, _migration_v3),
     (4, _migration_v4),
     (5, _migration_v5),
+    (6, _migration_v6),
 ]
 
 

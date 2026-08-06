@@ -37,9 +37,10 @@
 //     user reads from the top, not the bottom of a long response.
 
 import { daemon } from "../lib/daemon-client.js";
+import { buildFrameRow } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
 
-/** @import { ChatMessage, JobDetails } from "../lib/api-types.js" */
+/** @import { ChatMessage, FrameRef, JobDetails } from "../lib/api-types.js" */
 
 /** @type {JobDetails | null} */
 let activeJob = null;
@@ -199,12 +200,18 @@ async function _runQaTurn(jobId, question) {
   // Reset module-level streaming state.
   _liveTextNode = null;
   _liveAcc = "";
+  // Collected from a "frames" event, if the LOOK step found any moment
+  // actually relevant to the question (see api-types.js AIFramesEvent).
+  /** @type {FrameRef[]} */
+  let frameRefs = [];
 
   try {
     for await (const ev of daemon.aiQa({ job_id: jobId, question })) {
       if (ev.type === "stage") {
         // Stage events (e.g. "thinking") arrive before first delta — the
         // pulsing dot already covers the "in progress" signal; no extra UI needed.
+      } else if (ev.type === "frames") {
+        frameRefs = ev.items || [];
       } else if (ev.type === "delta") {
         if (_liveTextNode === null) {
           // First token — replace spinner with streaming text.
@@ -223,6 +230,9 @@ async function _runQaTurn(jobId, question) {
         // markers only appear when the answer came from the material, so any
         // marker the LLM emits is a real jump target (not a web_search hallucination).
         assistantBubble.innerHTML = renderMarkdown(final, activeJob);
+        if (frameRefs.length) {
+          await _appendFrameRow(assistantWrap, frameRefs);
+        }
         _setQaActive(false);
         // Scroll to the START of the assistant bubble so the user reads from
         // the top, not the bottom of a potentially long answer. Only scroll
@@ -257,12 +267,20 @@ async function _runQaTurn(jobId, question) {
  * Built into a DocumentFragment so we hit the DOM once — long histories
  * (dozens of bubbles) would otherwise thrash layout per-append.
  *
+ * Renders frame thumbnails (via `_appendFrameRow`) for any assistant
+ * message that has `frame_refs` — the exact same helper the live-stream
+ * path (`_runQaTurn`) uses, so a reloaded turn looks identical to when it
+ * first streamed in.
+ *
  * @param {ChatMessage[]} items
+ * @returns {Promise<void>}
  */
-export function renderHistory(items) {
+export async function renderHistory(items) {
   if (!messages) return;
   messages.innerHTML = "";
   const frag = document.createDocumentFragment();
+  /** @type {Promise<void>[]} */
+  const framePromises = [];
   for (const m of items) {
     const bubble = appendBubble(m.role, "", frag);
     if (m.role === "assistant") {
@@ -270,11 +288,16 @@ export function renderHistory(items) {
       // timestamps from web_search, so any [MM:SS] in stored answers is a
       // genuine material reference worth making clickable.
       bubble.innerHTML = renderMarkdown(m.content, activeJob);
+      if (m.frame_refs && m.frame_refs.length) {
+        const wrap = /** @type {HTMLElement | null} */ (bubble.closest(".chat-bubble"));
+        framePromises.push(_appendFrameRow(wrap, m.frame_refs));
+      }
     } else {
       bubble.textContent = m.content;
     }
   }
   messages.appendChild(frag);
+  await Promise.all(framePromises);
   scrollMessagesToEnd();
 }
 
@@ -311,6 +334,43 @@ function appendBubble(who, text, container) {
   wrap.appendChild(inner);
   target.appendChild(wrap);
   return inner;
+}
+
+// ---------------------------------------------------------------------------
+// Frame thumbnails (LOOK-step visual findings — see api-types.js FrameRef)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a small thumbnail row right after `bubbleEl` (a `.chat-bubble`
+ * wrapper) — one entry per `FrameRef`: image + `[MM:SS]` caption + phrase,
+ * all on one quiet row. Row-building itself lives in
+ * `lib/frame-thumbnails.js` (shared with the summary "look" affordance in
+ * app.js) — this wrapper only owns bubble placement + fail-soft error
+ * handling.
+ *
+ * Shared by both the live-stream path (`_runQaTurn`, on the "frames" SSE
+ * event) and the history-reload path (`renderHistory`) so a reloaded turn
+ * renders identically to when it first streamed in.
+ *
+ * @param {HTMLElement | null} bubbleEl
+ * @param {FrameRef[] | null | undefined} frameRefs
+ * @returns {Promise<void>}
+ */
+async function _appendFrameRow(bubbleEl, frameRefs) {
+  if (!bubbleEl || !frameRefs || frameRefs.length === 0) return;
+  // Fails soft, deliberately: this renders on top of an already-finished
+  // answer bubble (live path) or an already-built history list (renderHistory,
+  // whose callers never await it — see app.js's loadHistory). A thumbnail is
+  // a nice-to-have; a rejected chrome.storage.local read (daemon.baseUrl())
+  // or any other hiccup here must never surface as an unhandled promise
+  // rejection, and must never take the rendered text down with it.
+  try {
+    const base = await daemon.baseUrl();
+    const row = buildFrameRow(activeJob, frameRefs, base);
+    bubbleEl.insertAdjacentElement("afterend", row);
+  } catch (err) {
+    console.warn("[TLDR] failed to render frame thumbnails", err);
+  }
 }
 
 /**

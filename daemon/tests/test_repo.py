@@ -7,6 +7,7 @@ through the ``isolated_db`` fixture.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -382,3 +383,53 @@ def test_frame_cleanup_failure_does_not_block_row_deletion(
     j = repo.create_job(url="https://x", kind="youtube")
     assert repo.delete_job(j.id) is True
     assert repo.get_job(j.id) is None
+
+
+# ---------------------------------------------------------------------------
+# add_message / list_messages — chat history, incl. frame_refs round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_add_message_round_trip_without_frame_refs(isolated_db) -> None:
+    j = repo.create_job(url="https://x", kind="page")
+    msg = repo.add_message(j.id, role="user", content="hello?")
+    assert msg.role == "user"
+    assert msg.content == "hello?"
+    assert msg.frame_refs_json is None
+
+    [stored] = repo.list_messages(j.id)
+    assert stored.id == msg.id
+    assert stored.frame_refs_json is None
+
+
+def test_add_message_persists_frame_refs_json(isolated_db) -> None:
+    j = repo.create_job(url="https://x", kind="youtube")
+    frame_refs = [
+        {
+            "seconds": 12.0,
+            "timecode": "00:12",
+            "phrase": "this cream",
+            "frame_url": f"/jobs/{j.id}/frames/t12/frame_02.jpg",
+        }
+    ]
+    msg = repo.add_message(
+        j.id, role="assistant", content="It's ACME cream.", frame_refs=frame_refs
+    )
+    assert msg.frame_refs_json is not None
+
+    [stored] = repo.list_messages(j.id)
+    assert json.loads(stored.frame_refs_json) == frame_refs
+
+
+def test_add_message_empty_frame_refs_list_stores_null(isolated_db) -> None:
+    """An empty list is treated the same as None — NULL on the row, not an
+    empty-JSON-array string — matching how alt_media_candidates_json is
+    handled on Job."""
+    j = repo.create_job(url="https://x", kind="page")
+    msg = repo.add_message(j.id, role="assistant", content="answer", frame_refs=[])
+    assert msg.frame_refs_json is None
+
+
+def test_add_message_unknown_job_raises(isolated_db) -> None:
+    with pytest.raises(KeyError):
+        repo.add_message("no-such-job", role="user", content="hi")

@@ -30,6 +30,7 @@
 
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
+import { buildFrameRow } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
@@ -723,6 +724,12 @@ function renderState(state) {
       summaryEl.innerHTML = `${titleHtml}<div class="markdown-body">${html}</div>`;
       setStage(null);
       syncChatEnabled(true);
+      // Fire-and-forget: attaches a "look" affordance next to any [MM:SS]
+      // marker that lands near one of this job's own deixis moments.
+      // Never fetches a frame itself — only on click (see the function).
+      _attachMomentAffordances(state.job).catch((err) =>
+        console.warn("[TLDR] moment affordance setup failed:", err),
+      );
       return;
     }
 
@@ -749,6 +756,246 @@ function _stateKey(state) {
     case "done":       return `done:${state.job.id}:${state.content?.length ?? 0}`;
     case "streaming":  return `streaming:${state.job.id}`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// "Look" affordance — on-demand video frames for a summary line whose
+// [MM:SS] marker sits on a moment the speaker pointed at the video's
+// picture (see daemon GET/POST /jobs/{id}/moments|frames,
+// daemon/src/workers/deixis.py). Nothing is fetched until the user clicks.
+//
+// Only FEW summary lines should ever earn this — see
+// MOMENT_MATCH_TOLERANCE_SECONDS below for why 10s, with the measured
+// counts that justify it.
+// ---------------------------------------------------------------------------
+
+// A rendered [MM:SS] marker and the deixis moment it was drawn from rarely
+// land on the exact same second (the summary LLM cites the transcript
+// marker of whichever sentence/line it drew the fact from, which can start
+// a few seconds before or after the exact phrase workers/deixis.py
+// detected). This constant is how far apart the two are allowed to be and
+// still count as "the same moment" for showing the affordance.
+//
+// MEASURED against 8 real video jobs in the owner's SQLite DB (real
+// summary_md + real raw_segments_json), counting how many [MM:SS]-marked
+// summary lines would get the affordance at each candidate window,
+// out of every marked line that had ANY deixis moment on the job at all:
+//
+//   window(s):    3     5     8    10    15    20    30
+//   hits/92:      2     3     4     5     7    11    14
+//   percentage: 2.2%  3.3%  4.3%  5.4%  7.6% 12.0% 15.2%
+//
+// 10s keeps the overall rate low (5.4% — genuinely "few lines", matching
+// the owner's "не пихать лишь бы пихать" rule) while still catching real
+// matches in most measured jobs. 15s already pushes the worst single job
+// to 3 of its 8 marked lines (38%) — i.e. "most" of that job's lines,
+// which is exactly the noise threshold the rule rejects; 10s tops out at
+// 2 of 8 (25%) for that same job. Segments in this DB run 1-5s apart and
+// workers/deixis.py's own COLLAPSE_WINDOW_SECONDS (3s) already merges a
+// gesture spanning consecutive segments into one moment, so 10s comfortably
+// covers "summary cited the sentence's start, not the exact phrase" slack
+// without reaching into unrelated nearby timestamps.
+const MOMENT_MATCH_TOLERANCE_SECONDS = 10;
+
+/**
+ * Attach a "look" button next to every `[MM:SS]` timecode link in the
+ * rendered summary that lands within `MOMENT_MATCH_TOLERANCE_SECONDS` of
+ * one of this job's own deixis moments. Cheap no-op for jobs that can
+ * never have moments (page/PDF) — skips the network call entirely.
+ *
+ * @param {import("../lib/api-types.js").JobDetails} job
+ */
+async function _attachMomentAffordances(job) {
+  if (job.kind !== "youtube" && job.kind !== "media") return;
+  const container = summaryEl.querySelector(".markdown-body");
+  if (!container) return;
+  const anchors = /** @type {HTMLAnchorElement[]} */ (
+    Array.from(container.querySelectorAll("a[data-tldr-seconds]"))
+  );
+  if (anchors.length === 0) return;
+
+  /** @type {import("../lib/api-types.js").DeixisMoment[]} */
+  let moments;
+  try {
+    moments = (await daemon.getMoments(job.id)).items;
+  } catch (err) {
+    console.warn("[TLDR] failed to load deixis moments:", err);
+    return;
+  }
+  if (!moments || moments.length === 0) return;
+
+  for (const a of anchors) {
+    const seconds = Number(a.dataset.tldrSeconds);
+    if (!Number.isFinite(seconds)) continue;
+    const match = _nearestMoment(moments, seconds);
+    if (match) _insertLookAffordance(a, job, match);
+  }
+}
+
+/**
+ * @param {import("../lib/api-types.js").DeixisMoment[]} moments
+ * @param {number} seconds
+ * @returns {import("../lib/api-types.js").DeixisMoment | null}
+ */
+function _nearestMoment(moments, seconds) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const m of moments) {
+    const dist = Math.abs(m.seconds - seconds);
+    if (dist <= MOMENT_MATCH_TOLERANCE_SECONDS && dist < bestDist) {
+      best = m;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+// Small camera-ish glyph (a well-worn open-source icon shape, redrawn here
+// as plain inline SVG — no icon library, no emoji) for the "look" button.
+const _LOOK_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+  'stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="3" y="3" width="18" height="18" rx="2"></rect>' +
+  '<circle cx="8.5" cy="8.5" r="1.5"></circle>' +
+  '<polyline points="21 15 16 10 5 21"></polyline>' +
+  "</svg>";
+
+// Swapped in on a successful fetch. A plain checkmark, not the camera —
+// the button STAYS next to the marker (see _handleLookClick) so its shape
+// changing is the signal that this one already produced the row below it,
+// distinct from every still-clickable camera icon elsewhere in the summary.
+const _LOOK_DONE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" ' +
+  'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" ' +
+  'stroke-linejoin="round" aria-hidden="true">' +
+  '<polyline points="20 6 9 17 4 12"></polyline>' +
+  "</svg>";
+
+// How many of the fetched frames to actually render inline, per moment
+// category — the full set workers/frames.py extracted (5 by default)
+// always stays on disk and reachable via GET /jobs/{id}/frames/... either
+// way; this only controls what gets shown in the summary.
+//
+// OBJECT candidates are, per workers/deixis.py's own category docs, "worth
+// ONE good frame" — a ~1fps sample of the same still shot read as one
+// picture printed several times over, which is exactly the noise the
+// owner's rule rejects (and wrapped a bullet list apart in practice). Show
+// exactly one — the QA LOOK step already does the same for this reason.
+//
+// ACTION candidates are documented as "worth several CONSECUTIVE frames" —
+// a demonstrated motion genuinely reads better as a short sequence than a
+// single freeze-frame. 3 is enough to show progression (start/mid/end of
+// the fetched batch, via _pickRepresentativeFrames) without reintroducing
+// the same wrap-the-layout-apart problem a full 5 caused.
+const FRAMES_SHOWN_BY_CATEGORY = { object: 1, action: 3 };
+
+/**
+ * Pick a representative subset of `items` to render, per
+ * FRAMES_SHOWN_BY_CATEGORY. For a single pick, takes the batch's middle
+ * frame — workers/frames.py's section window is asymmetric (WINDOW_BEFORE/
+ * AFTER) but centered close to the actual moment, so the middle of the
+ * fetched sample is the best single stand-in. For a small handful, spreads
+ * the picks evenly across the batch (first/mid/last-ish) to show
+ * progression rather than clustering at one end.
+ *
+ * @param {import("../lib/api-types.js").FrameRef[]} items
+ * @param {string} category
+ * @returns {import("../lib/api-types.js").FrameRef[]}
+ */
+function _pickRepresentativeFrames(items, category) {
+  const want = FRAMES_SHOWN_BY_CATEGORY[category] ?? 1;
+  if (items.length <= want) return items;
+  if (want <= 1) return [items[Math.floor((items.length - 1) / 2)]];
+  const picked = new Set();
+  for (let i = 0; i < want; i++) {
+    picked.add(Math.round((i * (items.length - 1)) / (want - 1)));
+  }
+  return [...picked].sort((a, b) => a - b).map((i) => items[i]);
+}
+
+/**
+ * @param {HTMLAnchorElement} anchor
+ * @param {import("../lib/api-types.js").JobDetails} job
+ * @param {import("../lib/api-types.js").DeixisMoment} moment
+ */
+function _insertLookAffordance(anchor, job, moment) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "look-affordance";
+  btn.title = "Show the video frame here";
+  btn.setAttribute("aria-label", "Show the video frame here");
+  btn.innerHTML = _LOOK_ICON_SVG;
+  btn.addEventListener("click", (ev) => {
+    // Not nested inside the timecode <a>, so this wouldn't reach the
+    // delegated seek handler anyway — stopPropagation is just cheap insurance.
+    ev.preventDefault();
+    ev.stopPropagation();
+    _handleLookClick(btn, anchor, job, moment).catch((err) =>
+      console.warn("[TLDR] look-affordance click failed:", err),
+    );
+  });
+  anchor.insertAdjacentElement("afterend", btn);
+}
+
+/**
+ * @param {HTMLButtonElement} btn
+ * @param {HTMLAnchorElement} anchor
+ * @param {import("../lib/api-types.js").JobDetails} job
+ * @param {import("../lib/api-types.js").DeixisMoment} moment
+ */
+async function _handleLookClick(btn, anchor, job, moment) {
+  if (btn.disabled) return;
+  _clearLookError(btn);
+  btn.disabled = true;
+  btn.classList.add("look-affordance--pending");
+  try {
+    const { items } = await daemon.fetchMomentFrames(job.id, moment.seconds);
+    const base = await daemon.baseUrl();
+    const chosen = _pickRepresentativeFrames(items, moment.category);
+    const row = buildFrameRow(job, chosen, base);
+    row.classList.add("look-frame-row");
+    // Insert under the WHOLE bullet/paragraph, not mid-sentence right
+    // after the marker — the anchor can sit mid-sentence with more text
+    // (and its closing punctuation) still to come. Falls back to the
+    // anchor's parent for markup shapes without an enclosing li/p.
+    const block = anchor.closest("li, p") || anchor.parentElement || anchor;
+    block.insertAdjacentElement("afterend", row);
+
+    // Deliberate end state: the button STAYS right next to the marker
+    // (so the marker keeps visible context for what produced the row) but
+    // is permanently disabled — a second click must not silently
+    // re-fetch — and swaps to a checkmark so its own shape tells the user
+    // this exact marker is the one that produced the row below the bullet.
+    btn.classList.remove("look-affordance--pending");
+    btn.classList.add("look-affordance--done");
+    btn.innerHTML = _LOOK_DONE_ICON_SVG;
+    btn.title = "Frame shown below";
+    btn.setAttribute("aria-label", "Frame shown below");
+    // No re-enable — see above.
+  } catch (err) {
+    btn.disabled = false;
+    btn.classList.remove("look-affordance--pending");
+    _showLookError(btn, stringifyError(err));
+  }
+}
+
+/** @param {HTMLButtonElement} btn */
+function _clearLookError(btn) {
+  const next = btn.nextElementSibling;
+  if (next?.classList.contains("look-affordance-error")) next.remove();
+}
+
+/**
+ * @param {HTMLButtonElement} btn
+ * @param {string} message
+ */
+function _showLookError(btn, message) {
+  _clearLookError(btn);
+  const span = document.createElement("span");
+  span.className = "look-affordance-error";
+  span.textContent = message;
+  btn.insertAdjacentElement("afterend", span);
 }
 
 /**

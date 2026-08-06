@@ -22,6 +22,7 @@ pattern in ``db.py``.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from collections.abc import Iterable
 from datetime import datetime
@@ -527,15 +528,33 @@ def _safe_unlink(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def add_message(job_id: str, *, role: str, content: str) -> Message:
-    """Insert a chat message for ``job_id`` and return it (detached)."""
+def add_message(
+    job_id: str,
+    *,
+    role: str,
+    content: str,
+    frame_refs: list[dict[str, Any]] | None = None,
+) -> Message:
+    """Insert a chat message for ``job_id`` and return it (detached).
+
+    ``frame_refs`` is the LOOK step's list of ``FrameRef``-shaped dicts
+    (``api.schemas.FrameRef.model_dump()``-compatible) — pre-serialised
+    here to JSON on ``Message.frame_refs_json`` so the storage layer stays
+    Pydantic-free, matching how ``alt_media_candidates_json`` is handled on
+    ``Job``. ``None`` or empty is stored as NULL; the API layer treats a
+    missing/malformed value as "no frames" (see ``api/jobs.py._to_message``).
+    """
     if role not in ("user", "assistant"):
         raise ValueError(f"invalid role: {role!r}")
+    frame_refs_json: str | None = None
+    if frame_refs:
+        frame_refs_json = json.dumps(frame_refs, ensure_ascii=False, separators=(",", ":"))
     msg = Message(
         job_id=job_id,
         role=role,
         content=content,
         created_at=datetime.utcnow(),
+        frame_refs_json=frame_refs_json,
     )
     with session_scope() as session:
         if session.get(Job, job_id) is None:

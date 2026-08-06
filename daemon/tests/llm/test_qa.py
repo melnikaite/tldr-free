@@ -448,11 +448,37 @@ def _plan_completion_with_indices(
     return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
 
+def _is_plan_call(kwargs: dict[str, Any]) -> bool:
+    """Both the PLAN call and the LOOK step's vision call now pass `tools=`
+    (forced tool-calling), so `kwargs.get("tools")` alone no longer tells
+    them apart — check the forced tool's name instead."""
+    tools = kwargs.get("tools") or []
+    return bool(tools) and tools[0]["function"]["name"] == "plan"
+
+
 def _vision_completion(text: str) -> Any:
-    """ChatCompletion mock for the qa_frames.txt vision call (no tool call,
-    just message content) — mirrors what workers/pdf.py's _ocr_one_page
-    consumes from the same primitive."""
+    """ChatCompletion mock with no tool call (malformed vision response) —
+    exercises `_parse_vision_result`'s degrade-to-irrelevant path."""
     msg = types.SimpleNamespace(content=text, tool_calls=None)
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+
+def _vision_tool_completion(
+    finding: str, relevant: Any, best_frame_index: Any
+) -> Any:
+    """ChatCompletion mock carrying a `report_frame_findings` tool call —
+    the shape the LOOK step's vision call returns once frames were sent
+    (see `qa_mod._VISION_TOOL` / `qa_mod._parse_vision_result`)."""
+    args = json.dumps(
+        {
+            "finding": finding,
+            "relevant": relevant,
+            "best_frame_index": best_frame_index,
+        }
+    )
+    func = types.SimpleNamespace(name="report_frame_findings", arguments=args)
+    tc = types.SimpleNamespace(id="call_vision", type="function", function=func)
+    msg = types.SimpleNamespace(content=None, tool_calls=[tc])
     return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
 
@@ -510,13 +536,15 @@ async def test_candidates_offered_to_plan_and_only_chosen_fetched(
     plan_prompts_seen: list[str] = []
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
-        if kwargs.get("tools"):
+        if _is_plan_call(kwargs):
             plan_tools_seen.append(kwargs["tools"])
             plan_prompts_seen.append(messages[0]["content"])
             # Model only picks index 1 (the OBJECT candidate) though two
             # were offered — index 2 (ACTION) must NOT be fetched.
             return _plan_completion_with_indices(False, "q", [1])
-        return _vision_completion("A red tub labeled 'ACME Cream 200ml'.")
+        return _vision_tool_completion(
+            "A red tub labeled 'ACME Cream 200ml'.", True, 1
+        )
 
     streamed: list[list[dict]] = []
 
@@ -587,9 +615,9 @@ async def test_action_category_uses_lower_resolution(
     monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
-        if kwargs.get("tools"):
+        if _is_plan_call(kwargs):
             return _plan_completion_with_indices(True, "q", [1])
-        return _vision_completion("A hand folds the fabric in half.")
+        return _vision_tool_completion("A hand folds the fabric in half.", True, 1)
 
     async def fake_stream(messages: list[dict], **kwargs: Any) -> AsyncIterator[str]:
         yield "ok"
@@ -736,7 +764,7 @@ async def test_vision_call_error_degrades_gracefully(
     monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
-        if kwargs.get("tools"):
+        if _is_plan_call(kwargs):
             return _plan_completion_with_indices(True, "q", [1])
         raise RuntimeError("vision backend errored")
 
@@ -843,3 +871,166 @@ async def test_audio_job_without_segments_also_takes_unchanged_path(
         job=job, question="q", output_language="English", from_audio=True
     ):
         pass
+
+
+# ---------------------------------------------------------------------------
+# _parse_vision_result — the LOOK step's structured vision output (see
+# VisionResult / _VISION_TOOL). Same defensive shape as _parse_plan:
+# anything malformed degrades to relevant=False/no frame rather than raising.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_vision_result_valid_relevant() -> None:
+    resp = _vision_tool_completion("A red tub on the desk.", True, 2)
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result == qa_mod.VisionResult("A red tub on the desk.", True, 2)
+
+
+def test_parse_vision_result_relevant_false_keeps_finding() -> None:
+    """relevant=false still carries the finding text (it goes into VISUAL
+    FINDINGS either way) but the frame index doesn't matter downstream —
+    stream_answer only reads best_frame_index when relevant is true."""
+    resp = _vision_tool_completion(
+        "The frames show no information relevant to the question.", False, 1
+    )
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result.relevant is False
+    assert result.finding == "The frames show no information relevant to the question."
+
+
+def test_parse_vision_result_malformed_tool_call_degrades() -> None:
+    """No tool call at all (backend ignored tool_choice, or errored) ->
+    degrade to relevant=False, no frame, empty finding — never raise."""
+    resp = _vision_completion("some free-text the model wrote instead")
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result == qa_mod.VisionResult("", False, None)
+
+
+def test_parse_vision_result_bad_json_degrades() -> None:
+    func = types.SimpleNamespace(name="report_frame_findings", arguments="{not json")
+    tc = types.SimpleNamespace(id="call_vision", type="function", function=func)
+    msg = types.SimpleNamespace(content=None, tool_calls=[tc])
+    resp = types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result == qa_mod.VisionResult("", False, None)
+
+
+def test_parse_vision_result_out_of_range_frame_index_drops_index_only() -> None:
+    """A frame index outside [1, num_frames] is dropped (best_frame_index=None)
+    but the rest of the parse (finding, relevant) is still honoured —
+    mirrors _parse_look_at_indices's "drop rather than fail everything"."""
+    resp = _vision_tool_completion("A demonstrated action.", True, 99)
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result.best_frame_index is None
+    assert result.relevant is True
+    assert result.finding == "A demonstrated action."
+
+
+def test_parse_vision_result_non_numeric_frame_index_drops_index_only() -> None:
+    resp = _vision_tool_completion("Something visible.", True, "two")
+    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    assert result.best_frame_index is None
+
+
+def test_parse_vision_result_truthy_non_bool_relevant_is_not_relevant() -> None:
+    """Same strict-boolean bar _parse_plan holds material_sufficient to."""
+    resp = _vision_tool_completion("Something visible.", 1, 1)
+    result = qa_mod._parse_vision_result(resp, num_frames=1)
+    assert result.relevant is False
+
+
+# ---------------------------------------------------------------------------
+# stream_answer LOOK loop — "frames" event only for relevant moments
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_relevant_moment_emits_frames_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT]
+    )
+    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        return [Path("/tmp/t12/frame_01.jpg"), Path("/tmp/t12/frame_02.jpg")]
+
+    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+
+    async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
+        if _is_plan_call(kwargs):
+            return _plan_completion_with_indices(True, "q", [1])
+        # Model picks frame 2 as the most informative.
+        return _vision_tool_completion("A red tub labeled 'ACME Cream'.", True, 2)
+
+    async def fake_stream(messages: list[dict], **kwargs: Any) -> AsyncIterator[str]:
+        yield "answer"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _audio_job()
+    items = [
+        item
+        async for item in qa_mod.stream_answer(
+            job=job, question="what cream is that", output_language="English", from_audio=True
+        )
+    ]
+
+    frames_events = [i for i in items if isinstance(i, dict) and i.get("type") == "frames"]
+    assert len(frames_events) == 1
+    refs = frames_events[0]["items"]
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["seconds"] == _CAND_OBJECT.timestamp
+    assert ref["timecode"] == "00:12"
+    assert ref["phrase"] == _CAND_OBJECT.phrase
+    # Points at frame index 2 (frame_02.jpg), the one the model picked, under
+    # the job's own frame directory, in the t<second>/frame_NN.jpg shape
+    # frames.resolve_frame_path expects.
+    assert ref["frame_url"] == f"/jobs/{job.id}/frames/t12/frame_02.jpg"
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_moment_skips_frames_event_but_keeps_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vision model looked and found nothing relevant: the finding text
+    still reaches VISUAL FINDINGS (useful context: "we checked"), but no
+    'frames' event is emitted — no thumbnail for nothing shown."""
+    monkeypatch.setattr(
+        qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT]
+    )
+    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        return [Path("/tmp/t12/frame_01.jpg")]
+
+    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+
+    async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
+        if _is_plan_call(kwargs):
+            return _plan_completion_with_indices(True, "q", [1])
+        return _vision_tool_completion(
+            "The frames show no information relevant to the question.", False, 1
+        )
+
+    streamed: list[list[dict]] = []
+
+    async def fake_stream(messages: list[dict], **kwargs: Any) -> AsyncIterator[str]:
+        streamed.append(messages)
+        yield "answer"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _audio_job()
+    items = [
+        item
+        async for item in qa_mod.stream_answer(
+            job=job, question="what cream is that", output_language="English", from_audio=True
+        )
+    ]
+
+    assert not [i for i in items if isinstance(i, dict) and i.get("type") == "frames"]
+    synthesis_prompt = streamed[0][0]["content"]
+    assert "no information relevant to the question" in synthesis_prompt

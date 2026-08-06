@@ -96,13 +96,18 @@ feature.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from src.api.schemas import AUDIO_TRANSCRIPT_SOURCES
 from src.workers.timecodes import _segment_start, _segment_text
+
+log = logging.getLogger(__name__)
 
 
 class DeixisCategory(StrEnum):
@@ -367,10 +372,58 @@ def find_deixis_candidates(
     return candidates
 
 
+def candidates_for_job(job: Any) -> list[DeixisCandidate]:
+    """Deixis candidates for a Job, or ``[]`` when this job doesn't qualify.
+
+    Shared by every daemon-side consumer of deixis candidates — the QA LOOK
+    step (``llm/qa.py``) and the on-demand "look" affordance's ``GET
+    /jobs/{id}/moments`` (``api/jobs.py``) both call this so a job's set of
+    candidates is byte-for-byte identical between the two, and a job that
+    doesn't qualify (page/PDF, no transcript) behaves identically in both:
+    an empty list, never an error.
+
+    Only jobs with a genuinely timestamped, speech-derived transcript
+    qualify: ``Job.transcript_source`` must be one of
+    ``api.schemas.AUDIO_TRANSCRIPT_SOURCES`` (excludes PAGE_EXTRACT /
+    TRAFILATURA / PDF_TEXT / PDF_VISION — web pages and PDFs must take a
+    completely unchanged path) AND ``Job.raw_segments_json`` must actually
+    be present and parse to a non-empty list. ``getattr`` throughout
+    because callers (including tests) may hand in a minimal job stand-in
+    that doesn't define these fields at all.
+    """
+    transcript_source = getattr(job, "transcript_source", None)
+    if transcript_source not in AUDIO_TRANSCRIPT_SOURCES:
+        return []
+    raw_segments_json = getattr(job, "raw_segments_json", None)
+    if not raw_segments_json:
+        return []
+    try:
+        segments = json.loads(raw_segments_json)
+    except (TypeError, ValueError):
+        log.warning(
+            "job %s: raw_segments_json failed to parse; skipping deixis candidates",
+            getattr(job, "id", "?"),
+        )
+        return []
+    if not isinstance(segments, list) or not segments:
+        return []
+    language = getattr(job, "transcript_language", None)
+    try:
+        return find_deixis_candidates(segments, language)
+    except Exception:
+        log.warning(
+            "job %s: deixis candidate search failed",
+            getattr(job, "id", "?"),
+            exc_info=True,
+        )
+        return []
+
+
 __all__ = [
     "COLLAPSE_WINDOW_SECONDS",
     "DEFAULT_MAX_CANDIDATES",
     "DeixisCandidate",
     "DeixisCategory",
+    "candidates_for_job",
     "find_deixis_candidates",
 ]

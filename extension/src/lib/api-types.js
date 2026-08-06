@@ -130,12 +130,73 @@
 // ---------------------------------------------------------------------------
 
 /**
+ * One video frame worth showing the user a thumbnail for. TWO producers
+ * share this exact shape (one renderer, see lib/frame-thumbnails.js):
+ *   - the QA LOOK step (daemon/src/llm/qa.py) — ONLY when the vision model
+ *     reported the frames as genuinely relevant to the question. A moment
+ *     that was looked at but found irrelevant still contributes its
+ *     finding text to the answer, but never produces a FrameRef.
+ *   - `POST /jobs/{id}/frames` (see FrameFetchResponse) — the on-demand
+ *     "look" affordance next to a summary line; no vision call involved.
+ *
+ * `frame_url` is a path rooted at the daemon (`GET /jobs/{id}/frames/...`),
+ * not an absolute URL — prefix it with `daemon.baseUrl()` before use, same
+ * as every other daemon-served resource.
+ *
+ * @typedef {object} FrameRef
+ * @property {number} seconds
+ * @property {string} timecode      - "[MM:SS]"-style label, pre-formatted, no brackets
+ * @property {string} phrase        - the deixis phrase that triggered this moment
+ * @property {string} frame_url
+ */
+
+/**
+ * One moment where a job's transcript speech points at the video's
+ * picture — offered by `GET /jobs/{id}/moments` so the sidepanel can show
+ * a "look" affordance next to a summary line's `[MM:SS]` marker that lands
+ * near one. EXTERNAL candidates are never included (they point outside the
+ * video — a link, an article number — so there's nothing to fetch).
+ *
+ * @typedef {object} DeixisMoment
+ * @property {number} seconds
+ * @property {string} timecode          - "[MM:SS]"-style label, no brackets
+ * @property {string} phrase
+ * @property {"action" | "object"} category
+ */
+
+/**
+ * @typedef {object} MomentsListResponse
+ * @property {DeixisMoment[]} items    - empty (never an error) for a job with no deixis moments
+ */
+
+/**
+ * Body for `POST /jobs/{id}/frames` — echo back the exact `seconds` value
+ * from a `DeixisMoment` (see MomentsListResponse). A value that doesn't
+ * match one of the job's own moments 404s.
+ *
+ * @typedef {object} FrameFetchRequest
+ * @property {number} seconds
+ */
+
+/**
+ * Response for `POST /jobs/{id}/frames`. Same FrameRef shape the QA LOOK
+ * step returns — one thumbnail-row renderer for both (see
+ * lib/frame-thumbnails.js). A non-2xx response means the fetch failed;
+ * the thrown Error's message (via daemon-client.js's `request()`) carries
+ * the daemon's `detail` string.
+ *
+ * @typedef {object} FrameFetchResponse
+ * @property {FrameRef[]} items
+ */
+
+/**
  * @typedef {object} ChatMessage
  * @property {number} id
  * @property {string} job_id
  * @property {"user" | "assistant"} role
  * @property {string} content
  * @property {string} created_at  ISO datetime string
+ * @property {FrameRef[]} frame_refs  - empty unless a LOOK-step frame actually backed this answer
  */
 
 /**
@@ -191,7 +252,17 @@
  * @property {string} error
  */
 
-/** @typedef {AIStageEvent | AIDeltaEvent | AIDoneEvent | AIErrorEvent} AIStreamEvent */
+/**
+ * Emitted once, after the LOOK step finishes, ONLY when at least one
+ * inspected video moment turned out relevant (see FrameRef). Never emitted
+ * when the LOOK step didn't run, or ran but found nothing relevant to show.
+ *
+ * @typedef {object} AIFramesEvent
+ * @property {"frames"} type
+ * @property {FrameRef[]} items
+ */
+
+/** @typedef {AIStageEvent | AIDeltaEvent | AIDoneEvent | AIErrorEvent | AIFramesEvent} AIStreamEvent */
 
 // ---------------------------------------------------------------------------
 // GET /health
