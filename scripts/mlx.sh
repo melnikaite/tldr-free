@@ -22,8 +22,12 @@
 #
 # Subcommands:
 #   install               Install mlx-openai-server in ~/.venvs/mlx-server +
-#                         seed ~/.mlx-server/config.yaml + download Gemma 4 E4B + Whisper
-#                         weights (~6 GB) + apply TLDR patches
+#                         seed ~/.mlx-server/config.yaml + download the LLM
+#                         (Qwen3-VL 8B by default, ~7-8 GB with Whisper;
+#                         MLX_LLM_MODEL/MLX_LLM_SERVED_NAME/
+#                         MLX_LLM_CONTEXT_LENGTH env vars override this —
+#                         see scripts/smart-install.sh) + Whisper weights +
+#                         apply TLDR patches
 #   patch                 (Re-)apply TLDR's patches to the installed
 #                         mlx-openai-server. Run after every
 #                         `pip install --upgrade mlx-openai-server`. See
@@ -149,6 +153,18 @@ cmd_install() {
   # required for fine-grained timecodes in the transcript-tab UI. Idempotent.
   cmd_patch
 
+  # LLM model selection. MLX_LLM_MODEL / MLX_LLM_SERVED_NAME /
+  # MLX_LLM_CONTEXT_LENGTH (all optional, all default to the shipped Qwen3-VL
+  # 8B config) let a caller — scripts/smart-install.sh, on smaller-memory
+  # tiers — swap in a different model. All three move together: this is what
+  # both downloads the right weights AND seeds ~/.mlx-server/config.yaml so
+  # the server actually serves what config/tldr.yaml is about to ask for.
+  # Leaving them unset (a plain `mlx.sh install`) reproduces today's
+  # shipped defaults unchanged.
+  local llm_model="${MLX_LLM_MODEL:-mlx-community/Qwen3-VL-8B-Instruct-4bit}"
+  local llm_served_name="${MLX_LLM_SERVED_NAME:-qwen3-vl}"
+  local llm_ctx="${MLX_LLM_CONTEXT_LENGTH:-65536}"
+
   hdr "Set up $MLX_HOME (config + logs)"
   [ -f "$CONFIG_EXAMPLE" ] || err "$CONFIG_EXAMPLE not found"
   mkdir -p "$LOG_DIR"
@@ -156,13 +172,25 @@ cmd_install() {
     skip "$CONFIG already exists (your edits preserved)"
   else
     cp "$CONFIG_EXAMPLE" "$CONFIG"
+    # Template the LLM entry to match llm_model/llm_served_name/llm_ctx.
+    # Anchor-string substitution against the example's known shipped
+    # defaults (same approach as scripts/mlx-patches/apply.py) — a no-op,
+    # not a silent failure, if those defaults ever drift out from under
+    # this. model_type is NOT parameterised: every model this project
+    # swaps in here (Qwen3-VL, Gemma 4 E4B) is vision-capable, so it must
+    # stay "multimodal" — see the comment in $CONFIG_EXAMPLE for why.
+    sed -i '' \
+      -e "s|^  - model_path: mlx-community/Qwen3-VL-8B-Instruct-4bit|  - model_path: ${llm_model}|" \
+      -e "s|^    served_model_name: qwen3-vl|    served_model_name: ${llm_served_name}|" \
+      -e "s|^    context_length: 65536|    context_length: ${llm_ctx}|" \
+      "$CONFIG"
     ok "$CONFIG copied from $CONFIG_EXAMPLE"
   fi
 
   if [ "$download_models" = 1 ]; then
-    hdr "Download Gemma 4 E4B + Whisper weights (~6 GB, may take 5–20 min)"
+    hdr "Download the configured LLM ($llm_model) + Whisper weights (may take 5–20 min)"
     "$VENV/bin/pip" install --quiet huggingface-hub
-    for repo in mlx-community/gemma-4-e4b-it-4bit mlx-community/whisper-large-v3-turbo; do
+    for repo in "$llm_model" mlx-community/whisper-large-v3-turbo; do
       local cache_dir="$HOME/.cache/huggingface/hub/models--${repo//\//--}"
       if [ -d "$cache_dir/blobs" ] && [ "$(du -sm "$cache_dir/blobs" 2>/dev/null | awk '{print $1}')" -gt 1 ]; then
         skip "$repo already cached"

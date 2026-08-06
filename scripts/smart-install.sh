@@ -3,9 +3,9 @@
 # TLDR — smart installer.
 #
 # Uses llmfit to detect your hardware and already-running backends, then
-# picks the best LLM backend + model (preferring Gemma 4) and Whisper backend
-# automatically. Writes config/tldr.yaml with the right endpoints, model names,
-# and context_length=131072.
+# picks the best LLM backend + model (preferring Qwen3-VL 8B, falling back to
+# Gemma 4 on smaller machines) and Whisper backend automatically. Writes
+# config/tldr.yaml with the right endpoints, model names, and context_length.
 #
 # Replaces the manual "which backend do I use?" step — you no longer need to
 # choose between task install and task install:mlx.
@@ -25,9 +25,16 @@
 #      loaded → use it, skip new installs for that slot.
 #   2. Run `llmfit --json system` for hardware (backend, VRAM/RAM, CPU).
 #   3. Pick LLM backend + model from hardware:
-#        Metal  + ≥16 GB → mlx-server + gemma-4-e4b-it-4bit   (131 072 ctx)
-#        Metal  + 8–15 GB → mlx-server + gemma-4-e2b-it-4bit  (131 072 ctx)
-#        CUDA   + ≥12 GB  → Ollama + gemma4:e4b + Modelfile   (131 072 ctx)
+#        Metal  + ≥16 GB  → mlx-server + Qwen3-VL-8B-Instruct-4bit (65 536 ctx,
+#                            no reasoning_effort — not a thinking model)
+#        Metal  + 8–15 GB → mlx-server + gemma-4-e2b-it-4bit  (131 072 ctx,
+#                            reasoning_effort low). Unchanged from Gemma:
+#                            the frame-understanding step (video-picture QA)
+#                            was only measured on Qwen3-VL 8B, so smaller
+#                            machines keep Gemma and get weaker
+#                            video-picture answers.
+#        CUDA   + ≥12 GB  → Ollama + qwen3-vl:8b + Modelfile   (65 536 ctx,
+#                            no reasoning_effort)
 #        CUDA   + 6–11 GB → Ollama + gemma4:e2b + Modelfile   (131 072 ctx)
 #        ROCm/Vulkan       → Ollama + gemma4:e2b (best effort, ROCm support varies)
 #        CPU only          → Ollama + gemma4:e2b (warn: slow)
@@ -212,7 +219,10 @@ import json,sys
 try:
     d=json.load(sys.stdin)
     models=d.get('models',[])
-    # Prefer gemma4 variants, fall back to first model
+    # Prefer qwen3-vl variants (the new default), then gemma4, then first model
+    for m in models:
+        name=m.get('name','')
+        if 'qwen3-vl' in name or 'qwen3vl' in name: print(name); exit()
     for m in models:
         name=m.get('name','')
         if 'gemma4' in name or 'gemma-4' in name: print(name); exit()
@@ -271,8 +281,10 @@ LLM_BACKEND=""    # "mlx" | "ollama" | "lmstudio" | "llamacpp"
 LLM_BASE_URL=""
 LLM_MODEL=""
 LLM_CTX=131072
+LLM_SINGLE_PASS_LIMIT=80000   # ~60% of LLM_CTX; overridden alongside LLM_CTX below
 LLM_CONCURRENT=1
 LLM_REASONING_EFFORT=""
+LLM_OLLAMA_CTX_SUFFIX="-128k"  # tag suffix Ollama Modelfile creation strips/adds; matches LLM_CTX
 LLM_NEW_INSTALL=0  # 1 if we need to install something new
 
 # Helper: compare floats (returns 0 if $1 >= $2)
@@ -283,30 +295,204 @@ if [ "$LMSTUDIO_RUNNING" = 1 ] && [ -n "$LMSTUDIO_MODEL" ]; then
   LLM_BACKEND="lmstudio"
   LLM_BASE_URL="http://host.docker.internal:1234/v1"
   LLM_MODEL="$LMSTUDIO_MODEL"
-  LLM_REASONING_EFFORT="low"  # safe for Gemma 4; harmless for others
-  warn "Using LM Studio model '$LMSTUDIO_MODEL'. Make sure context is set to 131072 in the model settings."
-  warn "Check: lms ps  (CONTEXT column should show 131072)"
+
+  # Query LM Studio's own REST API (distinct from the OpenAI-compat
+  # /v1/models used above just to get a model id) for the model's ACTUAL
+  # loaded context length and whether it exposes a reasoning/thinking
+  # capability at all — real, per-model signals instead of assuming
+  # "131072 + reasoning_effort low" for whatever happens to be loaded.
+  # Per lmstudio.ai/docs/developer/rest, GET /api/v1/models returns
+  # loaded_instances[].config.context_length and capabilities.reasoning.
+  # Best-effort: older LM Studio versions may not have this endpoint, in
+  # which case we fall back below instead of asserting a number/flag we
+  # have no way to verify.
+  _LMS_INFO="$(curl -sf --max-time 3 "http://127.0.0.1:1234/api/v1/models" 2>/dev/null \
+    | LMS_TARGET="$LMSTUDIO_MODEL" python3 -c "
+import json, os, sys
+target = os.environ.get('LMS_TARGET', '')
+try:
+    d = json.load(sys.stdin)
+    for m in d.get('models', []):
+        if m.get('key') == target or m.get('id') == target:
+            ctx = None
+            insts = m.get('loaded_instances') or []
+            if insts:
+                ctx = (insts[0].get('config') or {}).get('context_length')
+            if ctx is None:
+                ctx = m.get('max_context_length')
+            reasoning = 'reasoning' in (m.get('capabilities') or {})
+            if ctx is not None:
+                print(f'{int(ctx)}|{1 if reasoning else 0}')
+            break
+except Exception:
+    pass
+" 2>/dev/null)"
+
+  if [ -n "$_LMS_INFO" ]; then
+    LLM_CTX="${_LMS_INFO%%|*}"
+    _LMS_REASONING="${_LMS_INFO##*|}"
+    case "$LLM_CTX" in
+      65536) LLM_SINGLE_PASS_LIMIT=40000 ;;
+      131072) LLM_SINGLE_PASS_LIMIT=80000 ;;
+      *) LLM_SINGLE_PASS_LIMIT=$(( LLM_CTX * 3 / 5 )) ;;
+    esac
+    if [ "$_LMS_REASONING" = "1" ]; then
+      LLM_REASONING_EFFORT="low"
+      info "'$LMSTUDIO_MODEL' exposes a reasoning capability; setting reasoning_effort: low."
+    fi
+    ok "Read context_length=$LLM_CTX for '$LMSTUDIO_MODEL' from LM Studio's REST API."
+  else
+    # Couldn't confirm from LM Studio (older version without
+    # /api/v1/models, or no matching entry) — default to this project's own
+    # shipped Qwen3-VL numbers rather than assert the old Gemma-era
+    # "131072 + reasoning_effort low" for a model we haven't identified.
+    # reasoning_effort is left UNSET here, not "low": whether an
+    # unsupported field is harmless on LM Studio's OpenAI-compat layer is
+    # unverified. The daemon's own call_with_dialect_adaptation
+    # (daemon/src/llm/client.py) auto-retries without reasoning_effort on
+    # an HTTP 400 that blames the field BY NAME — but if LM Studio ever
+    # 400s without naming it, that retry can't fire and every call breaks
+    # instead of just costing one wasted round-trip. Not worth risking on
+    # an unidentified model.
+    LLM_CTX=65536
+    LLM_SINGLE_PASS_LIMIT=40000
+    warn "Could not read '$LMSTUDIO_MODEL''s context/reasoning capability from LM Studio's REST API (older LM Studio version, or no match)."
+    warn "Verify its actual context in LM Studio (Settings -> Context Length, or 'lms ps') and correct config/tldr.yaml's context_length/single_pass_token_limit if it isn't 65536. If it's a thinking model, add reasoning_effort yourself (\"low\" for most; check its docs)."
+  fi
 # Priority 2: Ollama already running
 elif [ "$OLLAMA_RUNNING" = 1 ] && [ -n "$OLLAMA_MODEL" ]; then
   LLM_BACKEND="ollama"
   LLM_BASE_URL="http://host.docker.internal:11434/v1"
-  LLM_MODEL="${OLLAMA_MODEL%-128k}-128k"  # normalise to 128k variant name
-  info "Will create/update Ollama Modelfile for 131072 context."
+
+  # Ollama's /api/show echoes back any num_ctx already baked into this exact
+  # tag via a prior Modelfile (its "parameters" field is a text blob like
+  # "num_ctx 65536\ntemperature 0.7"). Check that BEFORE assuming this tag
+  # needs a fresh context-expanded Modelfile — this is the real, queryable
+  # truth for a tag that already exists, not a guess.
+  _OLLAMA_NUM_CTX="$(curl -sf --max-time 3 -X POST http://localhost:11434/api/show \
+      -d "{\"model\":\"$OLLAMA_MODEL\"}" 2>/dev/null \
+    | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for line in (d.get('parameters') or '').splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == 'num_ctx':
+            print(parts[1])
+            break
+except Exception:
+    pass
+" 2>/dev/null)"
+
+  if [ -n "$_OLLAMA_NUM_CTX" ]; then
+    # This tag already has num_ctx configured (e.g. a previous smart-install
+    # run's Modelfile tag) — reuse as-is, no new Modelfile needed.
+    LLM_MODEL="$OLLAMA_MODEL"
+    LLM_CTX="$_OLLAMA_NUM_CTX"
+    case "$LLM_CTX" in
+      65536) LLM_SINGLE_PASS_LIMIT=40000 ;;
+      131072) LLM_SINGLE_PASS_LIMIT=80000 ;;
+      *) LLM_SINGLE_PASS_LIMIT=$(( LLM_CTX * 3 / 5 )) ;;
+    esac
+    ok "Ollama model '$OLLAMA_MODEL' already has num_ctx=$LLM_CTX configured; reusing as-is."
+  else
+    # No num_ctx on this tag — it needs a context-expanded Modelfile tag.
+    # Pick the target context by model family, matching the sniffer's own
+    # qwen3-vl-first / gemma4-second preference above; default to this
+    # project's own Qwen3-VL numbers (not the old Gemma ones) for anything
+    # unrecognised, since guessing Gemma's 131072 for an unknown model would
+    # be an equally baseless assumption in the other direction.
+    case "$OLLAMA_MODEL" in
+      *qwen3-vl*|*qwen3vl*)
+        LLM_CTX=65536; LLM_SINGLE_PASS_LIMIT=40000; LLM_OLLAMA_CTX_SUFFIX="-64k" ;;
+      *gemma4*|*gemma-4*)
+        LLM_CTX=131072; LLM_SINGLE_PASS_LIMIT=80000; LLM_OLLAMA_CTX_SUFFIX="-128k" ;;
+      *)
+        LLM_CTX=65536; LLM_SINGLE_PASS_LIMIT=40000; LLM_OLLAMA_CTX_SUFFIX="-64k"
+        warn "Ollama model '$OLLAMA_MODEL' doesn't match a known qwen3-vl/gemma4 naming convention; assuming this project's 65536 default context. Check with: ollama show $OLLAMA_MODEL"
+        ;;
+    esac
+    LLM_MODEL="${OLLAMA_MODEL%$LLM_OLLAMA_CTX_SUFFIX}${LLM_OLLAMA_CTX_SUFFIX}"
+    # Ollama itself is already running, but this tag still needs the
+    # Modelfile step below to actually exist at the expanded context —
+    # both `ollama pull` and `ollama create -f` are idempotent, so running
+    # them even though Ollama is "already running" is safe.
+    LLM_NEW_INSTALL=1
+    info "Will create/update Ollama Modelfile '$LLM_MODEL' for $LLM_CTX context."
+  fi
 # Priority 3: mlx-server already running
 elif [ "$MLX_RUNNING" = 1 ] && [ -n "$MLX_MODEL" ]; then
   LLM_BACKEND="mlx"
   LLM_BASE_URL="http://host.docker.internal:18000/v1"
   LLM_MODEL="$MLX_MODEL"
+
+  # mlx-openai-server's /v1/models does NOT expose context_length (confirmed
+  # from its v1.8.1 source: app/core/model_registry.py::list_models() only
+  # returns id/object/created/owned_by), so we can't query the running
+  # server for it over HTTP. Read the local seed file this project itself
+  # writes instead (~/.mlx-server/config.yaml, via scripts/mlx.sh) and look
+  # up the entry whose served_model_name matches what's actually running —
+  # the real config the server was launched with, not a guess.
+  _MLX_CFG_CTX=""
+  if [ -f "$HOME/.mlx-server/config.yaml" ]; then
+    _MLX_CFG_CTX="$(awk -v target="$MLX_MODEL" '
+      function check() { if (name == target && ctx != "" && !printed) { print ctx; printed = 1 } }
+      /^  - model_path:/ { check(); name = ""; ctx = "" }
+      /served_model_name:/ {
+        line = $0; sub(/^[^:]*:[ \t]*/, "", line); sub(/[ \t]*#.*/, "", line)
+        gsub(/^[ \t]+|[ \t]+$/, "", line); name = line
+      }
+      /context_length:/ {
+        line = $0; sub(/^[^:]*:[ \t]*/, "", line); sub(/[ \t]*#.*/, "", line)
+        gsub(/^[ \t]+|[ \t]+$/, "", line); ctx = line
+      }
+      END { check() }
+    ' "$HOME/.mlx-server/config.yaml" 2>/dev/null)"
+  fi
+
+  if [ -n "$_MLX_CFG_CTX" ]; then
+    LLM_CTX="$_MLX_CFG_CTX"
+    case "$LLM_CTX" in
+      65536) LLM_SINGLE_PASS_LIMIT=40000 ;;
+      131072) LLM_SINGLE_PASS_LIMIT=80000 ;;
+      *) LLM_SINGLE_PASS_LIMIT=$(( LLM_CTX * 3 / 5 )) ;;
+    esac
+    ok "Read context_length=$LLM_CTX for '$MLX_MODEL' from ~/.mlx-server/config.yaml"
+  else
+    # No local config match (server started some other way, or file missing)
+    # — fall back to a name-based guess, and failing that, default to this
+    # project's own shipped Qwen3-VL numbers rather than the old Gemma ones.
+    case "$MLX_MODEL" in
+      *qwen3-vl*|*qwen3vl*|*Qwen3-VL*)
+        LLM_CTX=65536; LLM_SINGLE_PASS_LIMIT=40000
+        warn "Could not read context_length from ~/.mlx-server/config.yaml; inferred 65536 from model name '$MLX_MODEL'. Verify against ~/.mlx-server/config.yaml."
+        ;;
+      *gemma*|*Gemma*)
+        LLM_CTX=131072; LLM_SINGLE_PASS_LIMIT=80000
+        warn "Could not read context_length from ~/.mlx-server/config.yaml; inferred 131072 from model name '$MLX_MODEL'. Verify against ~/.mlx-server/config.yaml."
+        ;;
+      *)
+        LLM_CTX=65536; LLM_SINGLE_PASS_LIMIT=40000
+        warn "Could not determine context_length for mlx model '$MLX_MODEL' (no ~/.mlx-server/config.yaml match, name doesn't match a known convention). Defaulting to this project's shipped 65536 — check ~/.mlx-server/config.yaml and correct config/tldr.yaml's context_length/single_pass_token_limit by hand if that's wrong for your model."
+        ;;
+    esac
+  fi
 # Priority 4: Install based on hardware
 elif [ "$BACKEND" = "Metal" ]; then
   LLM_BACKEND="mlx"
   LLM_BASE_URL="http://host.docker.internal:18000/v1"
   LLM_NEW_INSTALL=1
   if _gte "${EFFECTIVE_GPU_MEM:-0}" "16"; then
-    LLM_MODEL="gemma4"  # served_model_name in mlx-server config
-    info "Apple Silicon ≥16 GB → mlx-server + gemma-4-e4b-it-4bit"
+    LLM_MODEL="qwen3-vl"  # served_model_name in mlx-server config
+    LLM_CTX=65536
+    LLM_SINGLE_PASS_LIMIT=40000
+    info "Apple Silicon ≥16 GB → mlx-server + Qwen3-VL-8B-Instruct-4bit"
   else
     LLM_MODEL="gemma4"
+    LLM_REASONING_EFFORT="low"
+    # The video-frame-understanding QA step was only measured on Qwen3-VL
+    # 8B (needs ≥16 GB), so this tier keeps Gemma 4 and gets weaker
+    # video-picture answers.
     info "Apple Silicon 8–15 GB → mlx-server + gemma-4-e2b-it-4bit"
   fi
 elif [ "$BACKEND" = "Cuda" ]; then
@@ -314,22 +500,28 @@ elif [ "$BACKEND" = "Cuda" ]; then
   LLM_BASE_URL="http://host.docker.internal:11434/v1"
   LLM_NEW_INSTALL=1
   if _gte "${EFFECTIVE_GPU_MEM:-0}" "12"; then
-    LLM_MODEL="gemma4:e4b-128k"
-    info "NVIDIA ≥12 GB → Ollama + gemma4:e4b + 131072 context Modelfile"
+    LLM_CTX=65536
+    LLM_SINGLE_PASS_LIMIT=40000
+    LLM_OLLAMA_CTX_SUFFIX="-64k"
+    LLM_MODEL="qwen3-vl:8b${LLM_OLLAMA_CTX_SUFFIX}"
+    info "NVIDIA ≥12 GB → Ollama + qwen3-vl:8b + 65536 context Modelfile"
   else
     LLM_MODEL="gemma4:e2b-128k"
+    LLM_REASONING_EFFORT="low"
     info "NVIDIA 6–11 GB → Ollama + gemma4:e2b + 131072 context Modelfile"
   fi
 elif [ "$BACKEND" = "ROCm" ] || [ "$BACKEND" = "Vulkan" ]; then
   LLM_BACKEND="ollama"
   LLM_BASE_URL="http://host.docker.internal:11434/v1"
   LLM_MODEL="gemma4:e2b-128k"
+  LLM_REASONING_EFFORT="low"
   LLM_NEW_INSTALL=1
   warn "AMD GPU detected — Ollama ROCm support varies by card. Falling back to gemma4:e2b."
 else
   LLM_BACKEND="ollama"
   LLM_BASE_URL="http://host.docker.internal:11434/v1"
   LLM_MODEL="gemma4:e2b-128k"
+  LLM_REASONING_EFFORT="low"
   LLM_NEW_INSTALL=1
   warn "CPU-only mode — inference will be slow. gemma4:e2b (~4 GB RAM)."
 fi
@@ -425,14 +617,19 @@ bash "$REPO_ROOT/scripts/install.sh" $CORE_FLAGS
 if [ "$LLM_BACKEND" = "mlx" ] && [ "$LLM_NEW_INSTALL" = 1 ]; then
   hdr "Installing mlx-openai-server"
   _MLX_FLAGS="--yes"
-  # Pass model preference — mlx.sh reads MLX_LLM_MODEL env
-  MLX_LLM_MODEL_PREF=""
+  # mlx.sh honours these three env vars to pick which model it downloads AND
+  # seeds into ~/.mlx-server/config.yaml. All three MUST move together —
+  # LLM_MODEL/LLM_CTX are exactly what we're about to write into
+  # config/tldr.yaml below, so the seeded server config and the daemon
+  # config end up describing the same model at the same context length
+  # instead of silently drifting apart.
   if _gte "${EFFECTIVE_GPU_MEM:-0}" "16"; then
-    MLX_LLM_MODEL_PREF="mlx-community/gemma-4-e4b-it-4bit"
+    export MLX_LLM_MODEL="mlx-community/Qwen3-VL-8B-Instruct-4bit"
   else
-    MLX_LLM_MODEL_PREF="mlx-community/gemma-4-e2b-it-4bit"
+    export MLX_LLM_MODEL="mlx-community/gemma-4-e2b-it-4bit"
   fi
-  export MLX_LLM_MODEL="$MLX_LLM_MODEL_PREF"
+  export MLX_LLM_SERVED_NAME="$LLM_MODEL"
+  export MLX_LLM_CONTEXT_LENGTH="$LLM_CTX"
   bash "$REPO_ROOT/scripts/mlx.sh" install $_MLX_FLAGS
   ok "mlx-openai-server installed"
 fi
@@ -454,16 +651,18 @@ if [ "$LLM_BACKEND" = "ollama" ] && [ "$LLM_NEW_INSTALL" = 1 ]; then
     ollama serve &>/dev/null &
     sleep 3
   fi
-  # Pull the base model (without -128k suffix)
-  _BASE_MODEL="${LLM_MODEL%-128k}"
+  # Pull the base model (without the context-tag suffix, e.g. -128k / -64k).
+  # Ollama's own default context window (often 2048-4096) is far below what
+  # either Gemma 4 (131072) or Qwen3-VL (65536) supports, so we always
+  # create a context-expanded local tag via Modelfile.
+  _BASE_MODEL="${LLM_MODEL%$LLM_OLLAMA_CTX_SUFFIX}"
   info "Pulling $_BASE_MODEL …"
   ollama pull "$_BASE_MODEL"
-  # Create Modelfile for 131072 context
   _MODELFILE_TAG="$LLM_MODEL"
-  info "Creating context-expanded model '$_MODELFILE_TAG' (context_length=131072)…"
-  printf 'FROM %s\nPARAMETER num_ctx 131072\n' "$_BASE_MODEL" | \
+  info "Creating context-expanded model '$_MODELFILE_TAG' (context_length=$LLM_CTX)…"
+  printf 'FROM %s\nPARAMETER num_ctx %s\n' "$_BASE_MODEL" "$LLM_CTX" | \
     ollama create "$_MODELFILE_TAG" -f -
-  ok "Ollama model '$_MODELFILE_TAG' ready with 131072 context"
+  ok "Ollama model '$_MODELFILE_TAG' ready with $LLM_CTX context"
 fi
 
 # --- faster-whisper (Docker) ---
@@ -522,7 +721,7 @@ llm:
   api_key: $_LLM_API_KEY
   model: $LLM_MODEL
   context_length: $LLM_CTX
-  single_pass_token_limit: 80000
+  single_pass_token_limit: $LLM_SINGLE_PASS_LIMIT
   max_concurrent_calls: $LLM_CONCURRENT
 $([ -n "$_REASONING" ] && printf '%s\n' "$_REASONING")
 $_WHISPER_BLOCK

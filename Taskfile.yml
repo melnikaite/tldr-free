@@ -24,7 +24,7 @@ tasks:
       - bash scripts/install.sh
 
   install:mlx:
-    desc: "Apple Silicon only: install mlx-openai-server + Gemma 4 E4B + Whisper weights (~6 GB)"
+    desc: "Apple Silicon only: install mlx-openai-server + Qwen3-VL 8B + Whisper weights (~7-8 GB)"
     cmds:
       - bash scripts/install.sh
       - bash scripts/mlx.sh install

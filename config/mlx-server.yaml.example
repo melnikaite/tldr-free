@@ -16,17 +16,31 @@ server:
 # defence-in-depth so a hung backend stream eventually fails the job
 # instead of locking the queue forever.
 models:
-  # LLM: Gemma 4 E4B (4-bit) — ~5 GB, fits in 8 GB unified memory.
-  # NOTE: mlx-openai-server support for Gemma 4 is pending a stable release;
-  # if it doesn't load, fall back to mlx-community/gemma-3-12b-it-4bit until fixed.
-  # For the larger MoE flagship, swap in:
-  #   mlx-community/gemma-4-26b-a4b-it-4bit
-  - model_path: mlx-community/gemma-4-e4b-it-4bit
-    model_type: lm
-    served_model_name: gemma4
-    context_length: 131072
+  # LLM: Qwen3-VL 8B Instruct (4-bit) — ~5.8 GB weights. context_length is
+  # capped at 65536 (not the model's full window) on purpose: a larger KV
+  # cache doesn't fit comfortably in unified memory alongside the weights.
+  # Not a thinking model — no reasoning_effort knob needed.
+  #
+  # model_type MUST be "multimodal", not "lm": mlx-openai-server dispatches
+  # "lm" to MLXLMHandler (mlx_lm, text-only) and only "multimodal" to
+  # MLXVLMHandler (mlx_vlm, which accepts image_url content) — confirmed by
+  # reading app/server.py::create_handler_from_config and
+  # app/config.py::VALID_MODEL_TYPES in the mlx-openai-server 1.8.1 source
+  # (github.com/cubist38/mlx-openai-server). "lm" would silently break PDF
+  # vision OCR and video-frame QA, the reason this project uses a VL model
+  # at all.
+  #
+  # Prefer Gemma 4 E4B instead? Swap in mlx-community/gemma-4-E4B-it-qat-4bit,
+  # served_model_name gemma4, context_length 131072 (model_type stays
+  # "multimodal" — Gemma 4 E4B is vision-capable too), and set
+  # config/tldr.yaml's llm.reasoning_effort to "low" (Gemma 4 is a thinking
+  # model).
+  - model_path: mlx-community/Qwen3-VL-8B-Instruct-4bit
+    model_type: multimodal
+    served_model_name: qwen3-vl
+    context_length: 65536
     on_demand: true
-    on_demand_idle_timeout: 1800   # 30 min — frees ~5 GB after a batch finishes
+    on_demand_idle_timeout: 1800   # 30 min — frees ~5.8 GB after a batch finishes
     kv_bits: 4
     kv_group_size: 64
 
