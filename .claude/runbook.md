@@ -27,10 +27,10 @@ daemon, and the Chrome extension loaded.
 
    | Backend | Platform | Notes |
    |---|---|---|
-   | Ollama | any | `ollama pull gemma4:e4b`, then a Modelfile to bump ctx to 131072 |
-   | LM Studio | macOS / Windows | GUI; enable local server on port 1234; set ctx 131072 in model settings |
-   | mlx-openai-server | macOS arm64 | Bundled — `task install:mlx` sets up `~/.mlx-server/config.yaml` and pulls Gemma 4 E4B + Whisper turbo (~6 GB) |
-   | llama-server | any | `brew install llama.cpp`, launch with `-c 131072` |
+   | Ollama | any | `ollama pull qwen3-vl:8b`, then a Modelfile to bump ctx to 65536 (Gemma 4 alternative: `gemma4:e4b` + Modelfile to 131072) |
+   | LM Studio | macOS / Windows | GUI; enable local server on port 1234; set ctx 65536 in model settings (131072 for Gemma 4) |
+   | mlx-openai-server | macOS arm64 | Bundled — `task install:mlx` sets up `~/.mlx-server/config.yaml` and pulls Qwen3-VL 8B + Whisper turbo (~7-8 GB) |
+   | llama-server | any | `brew install llama.cpp`, launch with `-c 65536` (or `-c 131072` for Gemma 4) |
 
    Whisper is only used as a last-resort fallback for YouTube videos with
    no captions — you can skip it; those specific videos will error.
@@ -113,12 +113,13 @@ your input exceeds `llm.context_length`. Symptoms: a 60-minute video gets
 summarised through minute 30; a long article ends mid-section.
 
 - **Ollama**: defaults to 2048(!). Make a custom Modelfile:
-  `printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile`
-  then `ollama create gemma4:e4b-128k -f Modelfile`. Update
-  `model: gemma4:e4b-128k` in `config/tldr.yaml`.
+  `printf 'FROM qwen3-vl:8b\nPARAMETER num_ctx 65536\n' > Modelfile`
+  then `ollama create qwen3-vl:8b-64k -f Modelfile`. Update
+  `model: qwen3-vl:8b-64k` in `config/tldr.yaml`. (Gemma 4: same recipe with
+  `gemma4:e4b`, `num_ctx 131072`, `gemma4:e4b-128k`.)
 - **LM Studio**: open the loaded model's settings, set Context Length to
-  131072. Verify with `lms ps` (CONTEXT column).
-- **llama-server**: launch with `-c 131072`.
+  65536 (131072 for Gemma 4). Verify with `lms ps` (CONTEXT column).
+- **llama-server**: launch with `-c 65536` (`-c 131072` for Gemma 4).
 
 `config.llm.context_length` MUST match what the backend actually loaded.
 A mismatch on the high side causes `n_keep >= n_ctx` errors; on the low
@@ -129,8 +130,8 @@ side, silent truncation. After fixing: `task down && task up`.
 mlx-server v1.8.1 known bug — the idle-unload timer can fire mid-stream
 during continuous batches. Defences already in place:
 
-- Long `on_demand_idle_timeout` in `~/.mlx-server/config.yaml` (gemma:
-  1800s, whisper: 3600s).
+- Long `on_demand_idle_timeout` in `~/.mlx-server/config.yaml` (llm model
+  (Qwen3-VL or Gemma 4): 1800s, whisper: 3600s).
 - Per-chunk timeout `llm.stream_chunk_timeout_seconds` (default 60s).
 
 If still flaky: raise the whisper `on_demand_idle_timeout` to 7200 in
@@ -193,8 +194,9 @@ Workarounds (pick one):
 
 The PDF triggered the vision OCR fallback (pypdf returned ~no text, so
 the daemon assumes it's scanned). Vision OCR sends each page to the
-multimodal LLM separately — 10-60 seconds per page on a local Apple
-Silicon Gemma 4 E4B. Up to 100 pages by default; longer PDFs error out.
+multimodal LLM separately — 10-60 seconds per page, measured on a local
+Apple Silicon Gemma 4 E4B (not re-measured against the current Qwen3-VL 8B
+default). Up to 100 pages by default; longer PDFs error out.
 
 Faster alternatives:
 - Pre-OCR with `ocrmypdf input.pdf output.pdf`, then summarise the

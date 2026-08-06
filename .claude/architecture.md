@@ -207,6 +207,24 @@ POST /ai/stream {job_id, question}:
 `GET /jobs/{id}/messages` returns the full chat history. The side panel
 loads it on every job switch so chats persist across tab changes.
 
+Inside `llm.qa.stream_answer` the streamed answer isn't one LLM call — it's
+plan → LOOK → search → synthesis (see llm.md). For a video job with a
+timestamped transcript, LOOK sits between plan and search:
+`workers.deixis.find_deixis_candidates` (pure text analysis) offers the
+plan tool a numbered list of moments where the speech points at the
+picture, and for each moment the model picks, `workers.frames.fetch_frames`
+downloads a short section around that timestamp and the multimodal LLM
+inspects the resulting JPEGs in one forced tool call. A moment the vision
+call rates relevant surfaces once, after the loop, as
+`{"type": "frames", "items": [FrameRef, ...]}` — forwarded over the same
+`/ai/stream` SSE connection as the token deltas, and persisted onto the
+assistant `Message` row (`Message.frame_refs_json`) alongside its text so
+reloading the chat renders the identical thumbnail without redoing the
+LOOK step. `GET /jobs/{id}/frames/{rel_path}` serves the JPEGs themselves;
+the side panel's chat renders them as a thumbnail row under the answer,
+seekable the same way a `[MM:SS]` timecode is. Page and PDF jobs never
+reach LOOK at all — no timestamped transcript, no deixis candidates.
+
 ## Storage
 
 Single SQLite database under the named docker volume `tldr-data`, mounted

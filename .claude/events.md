@@ -22,9 +22,19 @@ stall fetches once you open per-job SSEs in parallel.
 
 ## Event shapes (uniform regardless of mode)
 
-- AI streams — `AIStageEvent | AIDeltaEvent | AIDoneEvent | AIErrorEvent`
+- AI streams — `AIStageEvent | AIDeltaEvent | AIDoneEvent | AIErrorEvent | AIFramesEvent`
 - Job-list — `job_event(action, job)` where `action ∈ {created, updated, deleted}`
 - Workers state — `workers_event({paused, queue_size, running})`
+
+`AIFramesEvent` (`{"type": "frames", "items": [FrameRef, ...]}`) is QA-only
+and rides the same `/ai/stream` connection as the token deltas, not a
+separate stream. It's emitted at most once per QA turn — after the LOOK
+step (see llm.md) finishes inspecting whichever video moments the model
+chose — and only when at least one moment's frames were rated relevant;
+a turn with no video, no candidates, or nothing relevant never emits it.
+`api/ai.py` also collects the same items into `Message.frame_refs_json` on
+the assistant row it persists, so `GET /jobs/{id}/messages` replays the
+identical thumbnails on reload without re-running LOOK.
 
 ## When adding new capabilities
 

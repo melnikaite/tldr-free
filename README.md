@@ -40,6 +40,14 @@ API** — pick whatever runner you like.
 </table>
 
 <p align="center">
+  <img src="docs/screenshots/qa-video-frame.png" alt="Answer citing numbers that appear only on screen, with the frame it read them from" width="620" />
+  <br />
+  <em>Asked about something the speaker points at, TLDR fetches that moment's frames
+  and answers from the picture — the thumbnail is the frame it actually read.
+  Neither number appears anywhere in the transcript.</em>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/library.png" alt="Local library of processed pages, videos and podcasts" width="820" />
 </p>
 
@@ -87,10 +95,20 @@ of it, keep it, and keep it private."*
 - **Transcript tab with translation.** The full transcript lives next to the
   summary, translated on demand into any language, navigable by timecode.
 - **PDFs work too.** http(s) or local `file://` PDFs are parsed in the
-  side panel via pdf.js and summarised like any other page. (Image-only
-  scans need OCR first — not built in.)
+  side panel via pdf.js and summarised like any other page. Image-only
+  scans fall back to per-page vision OCR automatically — no separate OCR
+  step needed.
 - **Persistent chat per job.** Q&A history is stored in SQLite, survives tab
   switches and browser restarts.
+- **Q&A can look at the video, not just the transcript.** When a video's
+  transcript has the speaker actually pointing at something on screen
+  ("watch this", "вот так", "hier seht ihr") and your question is about
+  that moment, TLDR fetches a handful of frames from just that few-second
+  span — never the whole video — and asks the model what's really there
+  before answering. A frame that turned out relevant shows up as a
+  thumbnail under the answer, clickable like a `[MM:SS]` timecode. It's
+  honest about its limits: reading a label or judging a gesture depends on
+  how legible the moment is and which vision model you're running.
 - **Pause/resume all background ML** when you need the machine for foreground
   work. The in-flight step finishes; the next step parks at a checkpoint
   until you click Resume. Q&A stays responsive throughout.
@@ -113,23 +131,53 @@ cloud backends further down.
 
 | Backend | Platform | LLM | Whisper | Notes |
 |---|---|---|---|---|
-| [**Ollama**](https://ollama.com/) | Any OS, CPU / GPU | ✅ | ❌ | [Download](https://ollama.com/download), then `ollama pull gemma4:e4b` |
+| [**Ollama**](https://ollama.com/) | Any OS, CPU / GPU | ✅ | ❌ | [Download](https://ollama.com/download), then `ollama pull qwen3-vl:8b` |
 | [**LM Studio**](https://lmstudio.ai/) | macOS / Windows | ✅ | ❌ | GUI; enable local server on port 1234 |
 | [**mlx-openai-server**](https://pypi.org/project/mlx-openai-server/) | macOS Apple Silicon | ✅ | ✅ | Fastest local; `task install:mlx` |
 | [**llama-server**](https://github.com/ggml-org/llama.cpp) | Any OS | ✅ | ❌ | `brew install llama.cpp` |
 | vLLM, openai-edge, … | Any OS | ✅ | ❌ | Any OpenAI-compat endpoint |
 
+The bundled default is **Qwen3-VL 8B** (4-bit), running with a **65536**-token
+context window. That's not Qwen3-VL's real limit — it's a deliberate cap:
+on a Mac's unified memory, a KV cache sized for a much larger window doesn't
+fit comfortably next to the model weights, so 65536 is the window we ship.
+Qwen3-VL is also the model this project measured the video-picture QA step
+against (fetching a frame from a video and asking the LLM about it).
+
 > **Context window — expand it or long pages get silently truncated.**
-> Gemma 4 E4B supports 128K but both Ollama and LM Studio default to a much smaller window.
+> Ollama and LM Studio both default to a much smaller window than 65536.
 >
 > **Ollama** — create a custom variant with the full context:
 > ```bash
-> printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile
-> ollama create gemma4:e4b-128k -f Modelfile
+> printf 'FROM qwen3-vl:8b\nPARAMETER num_ctx 65536\n' > Modelfile
+> ollama create qwen3-vl:8b-64k -f Modelfile
 > ```
-> Then set `model: gemma4:e4b-128k` and `context_length: 131072` in `config/tldr.yaml`.
+> Then set `model: qwen3-vl:8b-64k` and `context_length: 65536` in `config/tldr.yaml`.
 >
-> **LM Studio** — after loading the model, open its settings and set **Context Length** to `131072`.
+> **LM Studio** — after loading the model, open its settings and set **Context Length** to `65536`.
+
+<details>
+<summary><strong>Prefer Gemma 4 E4B instead?</strong> (fully supported, 128K context)</summary>
+
+Gemma 4 E4B remains a supported alternative — swap it in if you want the
+larger 128K context window instead of the 65536 default, or if your machine
+doesn't have enough unified memory for Qwen3-VL 8B (see the Requirements
+section below). It's a thinking model, so also set `reasoning_effort` — see
+`config/tldr.yaml`'s commented-out Gemma 4 block for a copy-paste config.
+
+```bash
+ollama pull gemma4:e4b
+printf 'FROM gemma4:e4b\nPARAMETER num_ctx 131072\n' > Modelfile
+ollama create gemma4:e4b-128k -f Modelfile
+```
+
+Then set `model: gemma4:e4b-128k` and `context_length: 131072` in
+`config/tldr.yaml`, plus `reasoning_effort: "low"` (mlx/LM Studio) or
+`"none"` (llama.cpp/LocalAI) to keep its thinking hidden. Video-picture QA
+answers will be weaker with Gemma — it wasn't the model this feature was
+measured on.
+
+</details>
 
 ### Cloud backends (optional)
 
@@ -185,7 +233,7 @@ llm:
   base_url: https://api.openai.com/v1
   api_key_file: ~/.config/tldr/openai.key   # see "API key storage" below
   model: gpt-5                              # or gpt-5-mini, o4-mini, ...
-  context_length: 400000                    # check your model's window — not gemma's 128K
+  context_length: 400000                    # check your model's window — not the local default's 65536
   single_pass_token_limit: 240000           # ~60% of context_length
   max_concurrent_calls: 3                   # hosted backends tolerate more parallelism than a laptop GPU
 ```
@@ -224,9 +272,9 @@ llm:
 ```
 
 Whichever provider you pick, set `context_length` / `single_pass_token_limit`
-to *that model's* window, not the 128K figure the local Gemma blocks use —
-otherwise you're leaving most of a paid context window unused (or, the other
-way, tripping the backend's real limit).
+to *that model's* window, not the 65536 figure the local default block
+uses — otherwise you're leaving most of a paid context window unused (or,
+the other way, tripping the backend's real limit).
 
 Reasoning models (GPT-5/o-series, and "thinking" models generally) spend
 part of their output budget on hidden reasoning before the visible answer
@@ -315,6 +363,56 @@ for a local backend; going cloud is an explicit trade you're opting into.
 Cloud inference is billed by the provider per token, and cloud Whisper
 transcription (e.g. OpenAI's `whisper-1`) is billed per minute — both are
 the provider's cost, not TLDR's.
+
+**Pick a multimodal model that also does tool calling.** TLDR sends images
+to the LLM (vision OCR for scanned PDFs, video frames for Q&A) and forces a
+specific tool call in Q&A's planning step, so a text-only model can't run
+the whole pipeline. On OpenRouter, 182 of 340 models accepted image input
+when this was checked (2026-08-06) — but note that some vendors have none
+at all there, DeepSeek among them.
+
+The numbers below are for one hour of video: summarise it, translate the
+whole transcript into another language, and look at three moments of the
+picture. An hour of speech is roughly 13K tokens of transcript, and a frame
+at 768×432 costs about 440 image tokens. Transcription is billed separately
+(below) and is not in these figures. Every model listed was released in
+2026, takes image input, and does tool calling; prices are from
+OpenRouter's model list on 2026-08-06.
+
+| Model | One hour |
+|---|---|
+| `qwen/qwen3.7-flash` | $0.004 |
+| `google/gemma-4-26b-a4b-it` | $0.010 |
+| `xiaomi/mimo-v2.5` | $0.011 |
+| `openai/gpt-5.6-luna` | $0.017 |
+| `google/gemini-3.5-flash-lite` | $0.066 |
+| `x-ai/grok-4.5` | $0.205 |
+| `anthropic/claude-sonnet-5` | $0.294 |
+
+85 models on OpenRouter clear that bar, so this is a sample, not a
+shortlist. Two things to watch when you substitute your own: an older
+generation from the same vendor is often *cheaper* than its current one
+(Gemini 3.1 Flash-Lite runs the same hour for $0.042), so sort by date as
+well as price; and a headline price means nothing if the context window
+can't hold the job — an hour of transcript plus its translation needs well
+over 16K tokens, which rules out several of the cheapest models on offer.
+Sonnet 5 is priced here at its introductory rate; at list price the hour is
+$0.441.
+
+Transcription is separate and billed per minute of audio, not per token:
+about $0.04 an hour on Groq's `whisper-large-v3-turbo`, about $0.36 an hour
+on OpenAI's `whisper-1`. Both speak the same OpenAI-compatible
+`/audio/transcriptions` endpoint, so either drops straight into
+`whisper.base_url`.
+
+Two things that table is worth reading for. **Translating the transcript
+dominates** — it emits as many tokens as it reads, and output costs several
+times more than input everywhere, so on the pricier rows it is most of the
+bill; `llm` and the transcript translator can point at different models if
+you want to split that. And **looking at the video is the cheapest thing
+TLDR does** — those three moments are under a tenth of a cent on the cheap
+rows and about two and a half cents on the dearest one. Whatever a cloud
+backend costs you, it isn't the frames.
 
 </details>
 
@@ -462,9 +560,9 @@ same server or different ones:
 # Example: LM Studio for LLM, mlx-server for Whisper
 llm:
   base_url: http://host.docker.internal:1234/v1    # LM Studio
-  model: google/gemma-4-e4b                        # model ID shown by LM Studio
-  context_length: 131072                           # must match what the backend loaded
-  single_pass_token_limit: 80000                   # ~60% of context_length
+  model: qwen/qwen3-vl-8b                          # model ID shown by LM Studio
+  context_length: 65536                            # must match what the backend loaded
+  single_pass_token_limit: 40000                   # ~60% of context_length
   max_concurrent_calls: 1
 
 whisper:
@@ -525,7 +623,7 @@ mlx-openai-server (LLM+Whisper), LM Studio+mlx, Ollama, llama-server+whisper.cpp
 LLM-only (no Whisper), and the cloud providers from
 [Cloud backends](#cloud-backends-optional) above. For a cloud `llm.base_url`,
 set `context_length` / `single_pass_token_limit` to that model's context
-window, not the 128K figure the local Gemma examples use, and prefer
+window, not the 65536 figure the local default examples use, and prefer
 `api_key_file` (or the keychain fields) over inline `api_key` — see
 [API key storage](#api-key-storage).
 
@@ -613,7 +711,10 @@ topic-specific docs under [`.claude/`](.claude/) — see
 - **A backend**: see Quick start. Anything OpenAI-compatible works.
 - **Chrome 116+** (Manifest V3 side panel).
 - **Apple Silicon, optional**: only if you want the bundled mlx setup (`task install:mlx`).
-  ~6 GB disk for Gemma 4 E4B (4-bit) + Whisper large-v3 weights.
+  ~7-8 GB disk for Qwen3-VL 8B (4-bit) + Whisper large-v3 weights. On
+  machines with less unified memory, `scripts/smart-install.sh` installs
+  the smaller Gemma 4 E2B (4-bit) instead — see the LLM backend table
+  above.
 
 ## Roadmap
 

@@ -14,6 +14,12 @@ so old extensions detect the mismatch instead of mis-parsing payloads.
 the daemon. New endpoints go there with a JSDoc return-type annotation
 against the api-types alias.
 
+`FrameRef` (the QA video-frame thumbnail — seconds, timecode, phrase,
+frame_url) is one instance of this rule, not an exception to it:
+`schemas.py`'s `FrameRef`/`AIFramesEvent` and `api-types.js`'s matching
+JSDoc typedefs are kept in step the same manual way as everything else
+mirrored here.
+
 ## URL normalization
 
 The extension normalizes every URL through `lib/url.js#normalizeUrl` before

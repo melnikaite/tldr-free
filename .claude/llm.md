@@ -22,7 +22,8 @@ single-user laptop from thrashing the GPU when multiple jobs land at once.
 
 Multimodal calls (image_url content) use the same primitives:
 `workers/pdf.py` builds a messages list with text + image_url parts and
-calls `complete_with_messages` — no special LLM API path.
+calls `complete_with_messages` — no special LLM API path. `llm/qa.py`'s
+LOOK step (below) is the other multimodal caller.
 
 The lock is **pause-aware**: acquire waits for both the semaphore AND
 the global pause flag, and re-checks pause AFTER acquire so a flip that
@@ -38,6 +39,83 @@ This is defence-in-depth against a known mlx-server v1.8.1 on-demand quirk
 do NOT patch upstream; mitigation is long idle_timeouts in
 `~/.mlx-server/config.yaml` (seeded from `config/mlx-server.yaml.example`)
 plus this per-chunk timeout for outliers.
+
+## The LOOK step: forced tool calls for video-picture Q&A
+
+For a job with a timestamped transcript, `llm/qa.py`'s plan → search →
+synthesis Q&A flow gains an extra step between plan and search: LOOK,
+which lets the model actually see a moment of the video instead of only
+reading what was said. `workers/deixis.py` (pure text analysis, no
+LLM/network) finds moments where the speech points at the picture ("watch
+this", "вот так", "hier seht ihr") and classifies each `ACTION` / `OBJECT`
+/ `EXTERNAL`. When candidates exist, the PLAN tool call gains an extra
+`look_at_indices` field and the model names at most `_MAX_LOOK_AT_MOMENTS`
+(2) worth fetching a frame for — with no candidates the PLAN tool/prompt
+stay byte-identical to before this feature existed, so a page/PDF job (or
+a video whose transcript has no deixis moments) takes exactly the old
+path.
+
+For each chosen moment, `workers/frames.fetch_frames` downloads a short
+section around that timestamp (see workers.md) and every resulting JPEG
+goes to the multimodal LLM in ONE call, not one call per frame: all the
+frames are a ~1fps sample of the SAME few seconds, so cross-frame
+reasoning ("the hand moves from A to B across these frames") only works
+if the model sees them together — deliberately unlike `workers/pdf.py`'s
+one-image-per-call OCR, where each page is an independent document. The
+call is a FORCED `report_frame_findings` tool call (same technique as the
+PLAN tool) returning a structured `VisionResult(finding, relevant,
+best_frame_index)`, never free prose, so `stream_answer` decides whether a
+frame actually contributed without any regex/keyword guessing over the
+answer text. A `relevant=True` result with a valid `best_frame_index` is
+what produces a `FrameRef` (a thumbnail the side panel renders under the
+answer); `finding` text goes into the synthesis prompt's VISUAL FINDINGS
+block either way — "we checked and there was nothing to see" is still
+useful context. EXTERNAL candidates (a defer-to-elsewhere reference: "the
+link in the description") are never fetched — the plan prompt tells the
+model not to pick one, but the real guarantee is `stream_answer`'s LOOK
+loop skipping an EXTERNAL index outright, independent of the model's
+compliance.
+
+Two prompts, two distinct anti-fabrication defenses:
+
+- `qa_frames.txt` (the vision call) forbids treating the QUESTION as
+  evidence about the picture — the question only says where to look, and
+  the model must name a thing only as specifically as the picture
+  supports.
+- `qa.txt` (synthesis) forbids describing footage nobody looked at — the
+  material is a transcript of SOUND, and VISUAL FINDINGS is the only
+  evidence about what was shown; if it's empty or silent on the moment
+  asked about, the model must say the picture wasn't examined rather than
+  reconstruct a plausible scene.
+
+### Measured: leading questions make the vision model fabricate
+
+A leading question makes the vision model invent an answer that fits the
+question's premise instead of the picture. Asking "what is he doing with
+the BRUSH on the SCREEN" about frames of a girl drawing with a marker
+produced a confident "tablet with a stylus, stylus tip in contact with the
+tablet" — the same frames with a neutral question were described
+accurately. That's why `qa_frames.txt` treats the question as a hint about
+where to look, never as evidence, and why it tells the model to name
+things only as specifically as the picture itself supports.
+
+Structuring the call as a forced tool call made this WORSE before an
+explicit guard was added to both the prompt and the tool-schema field
+description: with the JSON tool-call format and no guard, a question
+presupposing a laptop produced "На столе лежит черный ноутбук" ("there's a
+black laptop on the table") where none existed — the model was more
+willing to accept the question's premise inside structured tool-call
+output than it was inside free prose. The guard now lives in both places:
+`qa_frames.txt` itself and the `finding` field's description in
+`_VISION_TOOL` (`llm/qa.py`).
+
+Vision quality is model-dependent, and the prompt is honest about the
+limit rather than pretending otherwise: at the readable resolution (OBJECT
+moments), the vision model transcribed an on-screen overlay exactly
+("EVERYDAY 14 / NORMAL 10"); at the lower resolution (ACTION moments) it
+often could only say the action wasn't determinable from blurry frames.
+Measured on `qwen3-vl-8b-instruct` — gemma is weaker at this (see the
+README's Quick start section).
 
 ## Timecodes are formatted in ONE place
 
