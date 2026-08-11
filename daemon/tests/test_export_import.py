@@ -605,3 +605,96 @@ def test_import_rejects_job_with_missing_kind(client: TestClient) -> None:
     assert body["imported"] == []
     assert len(body["failed"]) == 1
     assert body["failed"][0]["url"] == "https://missing-kind.example"
+
+
+# ---------------------------------------------------------------------------
+# 7. A translation's "status" is a whitelist, not trusted verbatim
+# ---------------------------------------------------------------------------
+
+
+def test_import_normalizes_bogus_translation_status_to_done(client: TestClient) -> None:
+    """``TranscriptTranslationSummary.status`` is a pydantic ``Literal`` and
+    ``GET /jobs/{id}`` declares ``response_model=JobDetails`` — an
+    out-of-set value stored in the DB makes that endpoint 500 for this job
+    PERMANENTLY, with no way to fix it from the UI. A bundle is untrusted
+    input (same class of concern as the zip-slip guards above), so a
+    translation entry claiming an unrecognised status (or a LIVE one like
+    "running", which ``re_enqueue_running_on_startup`` would pick up and
+    start re-translating on the next daemon restart) must be normalised to
+    "done" on import, never written verbatim."""
+    job_payload = {
+        "url": "https://bogus-translation-status.example",
+        "title": "Bogus translation status job",
+        "kind": "page",
+        "raw_text": "hello world",
+        "summary_md": "**hi**",
+        "translations": [
+            {
+                "language_code": "ru",
+                "text": "привет мир",
+                "status": "bogus-status-not-in-the-literal",
+                "error": "some attacker-controlled string",
+            },
+        ],
+    }
+    bundle_zip = _build_zip(
+        {
+            "manifest.json": _manifest_bytes(["x"]),
+            "jobs/x/job.json": json.dumps(job_payload).encode("utf-8"),
+        }
+    )
+
+    r = client.post("/jobs/import", content=bundle_zip)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["failed"] == []
+    assert len(body["imported"]) == 1
+    new_id = body["imported"][0]["job_id"]
+
+    # The endpoint that would 500 forever on an un-whitelisted status must
+    # serve this job fine.
+    detail_resp = client.get(f"/jobs/{new_id}")
+    assert detail_resp.status_code == 200
+    translations = detail_resp.json()["transcript_translations"]
+    assert len(translations) == 1
+    assert translations[0]["language_code"] == "ru"
+    assert translations[0]["status"] == "done"
+    # error is dropped along with the bogus status — "error" only ever
+    # legitimately accompanies "partial".
+    assert translations[0]["error"] is None
+
+    transcript = client.get(f"/jobs/{new_id}/transcript?lang=ru")
+    assert transcript.status_code == 200
+    assert transcript.json()["text"] == "привет мир"
+
+
+def test_import_normalizes_live_translation_status_to_done(client: TestClient) -> None:
+    """A translation claiming "running" (a live, in-progress status) must
+    not be imported verbatim — ``re_enqueue_running_on_startup`` would
+    otherwise pick up the imported row on the next daemon restart and
+    start re-translating a job that has no worker for it."""
+    job_payload = {
+        "url": "https://live-translation-status.example",
+        "title": "Live translation status job",
+        "kind": "page",
+        "raw_text": "hello world",
+        "summary_md": "**hi**",
+        "translations": [
+            {"language_code": "de", "text": "hallo welt", "status": "running"},
+        ],
+    }
+    bundle_zip = _build_zip(
+        {
+            "manifest.json": _manifest_bytes(["x"]),
+            "jobs/x/job.json": json.dumps(job_payload).encode("utf-8"),
+        }
+    )
+
+    r = client.post("/jobs/import", content=bundle_zip)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["failed"] == []
+    new_id = body["imported"][0]["job_id"]
+
+    translations = client.get(f"/jobs/{new_id}").json()["transcript_translations"]
+    assert translations[0]["status"] == "done"

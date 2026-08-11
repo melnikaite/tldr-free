@@ -197,6 +197,8 @@ def _write_job_entry(zf: zipfile.ZipFile, job: Job) -> None:
             {
                 "language_code": t["language_code"],
                 "text": t["text"],
+                "status": t["status"],
+                "error": t["error"],
                 "created_at": t["created_at"].isoformat(),
                 "updated_at": t["updated_at"].isoformat(),
             }
@@ -582,6 +584,19 @@ def _build_messages(raw_messages: Any, new_job_id: str) -> list[dict[str, Any]]:
     return out
 
 
+# The only two statuses a stored TranscriptTranslation row may safely
+# carry text under (see db.py's docstring). This is a WHITELIST, not a
+# best-effort filter: ``TranscriptTranslationSummary.status`` is a
+# pydantic ``Literal``, and `GET /jobs/{id}` (``response_model=JobDetails``)
+# rejects an out-of-set value with a 500 — a hostile or corrupt bundle
+# writing an arbitrary string would 500 that endpoint for the imported
+# job PERMANENTLY, with no way to fix it from the UI. Same class of issue
+# as the zip member-name containment check in this module — untrusted
+# bundle content must never reach storage unvalidated (see
+# .claude/contract.md).
+_VALID_IMPORT_TRANSLATION_STATUSES = ("done", "partial")
+
+
 def _build_translations(raw_translations: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_translations, list):
         return []
@@ -593,10 +608,29 @@ def _build_translations(raw_translations: Any) -> list[dict[str, Any]]:
         text = t.get("text")
         if not isinstance(lang, str) or not lang or not isinstance(text, str):
             continue
+        # Anything other than "done"/"partial" — absent (bundles written
+        # before "partial" existed exported only "done" translations by
+        # construction), malformed, or a LIVE status like "queued"/
+        # "running" (which would make ``re_enqueue_running_on_startup``
+        # start re-translating an imported job on the next daemon
+        # restart) — silently becomes "done".
+        raw_status = t.get("status")
+        status = (
+            raw_status
+            if raw_status in _VALID_IMPORT_TRANSLATION_STATUSES
+            else "done"
+        )
+        raw_error = t.get("error")
+        # error only ever accompanies "partial" in a genuine row (see
+        # db.py) — drop it otherwise rather than trust a bundle to have
+        # kept the two in sync.
+        error = raw_error if status == "partial" and isinstance(raw_error, str) else None
         out.append(
             {
                 "language_code": lang,
                 "text": text,
+                "status": status,
+                "error": error,
                 "created_at": _parse_iso(t.get("created_at")),
                 "updated_at": _parse_iso(t.get("updated_at")),
             }

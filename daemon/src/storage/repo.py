@@ -148,9 +148,18 @@ def insert_imported_job(
     (ascending) ids in — this function inserts them in list order inside
     the same transaction as the Job row, so autoincrement ids come out
     monotonic. ``translations`` is a list of ``{"language_code", "text",
-    "created_at", "updated_at"}`` dicts, always inserted with
-    ``status="done"``/``progress_percent=100`` (only ``done`` translations
-    are ever exported — see ``list_done_translations``).
+    "status", "error", "created_at", "updated_at"}`` dicts (only ``done``
+    and ``partial`` translations are ever exported — see
+    ``list_done_translations``), always inserted with
+    ``progress_percent=100``. ``status`` is whitelisted to ``"done"``/
+    ``"partial"`` here too (defense-in-depth on top of
+    ``storage.bundle._build_translations``, which is the real boundary for
+    untrusted bundle content) — anything else defaults to ``"done"`` and
+    drops ``error`` with it, since an out-of-set value would make
+    ``GET /jobs/{id}`` 500 forever for this job (it's a pydantic
+    ``Literal``), and a live status like ``"running"`` would make
+    ``re_enqueue_running_on_startup`` start re-translating an imported job
+    that has no worker for it.
 
     All-or-nothing: if anything inside the transaction raises, the Job and
     every Message/TranscriptTranslation for it roll back together — no
@@ -200,12 +209,25 @@ def insert_imported_job(
                 )
             )
         for t in translations:
+            # Whitelist, not a default-if-missing: a stored row's status
+            # must be one pydantic's ``TranscriptTranslationSummary``
+            # Literal actually accepts, or `GET /jobs/{id}` 500s for this
+            # job permanently (see ``storage.bundle._build_translations``,
+            # which already normalises this for the real import path —
+            # this is defense-in-depth for any other caller of this
+            # function). Older bundles (pre-``partial`` status) never
+            # wrote a "status" field at all — everything they exported
+            # WAS ``done`` by construction, so that's the safe default too.
+            status = t.get("status")
+            if status not in ("done", "partial"):
+                status = "done"
             session.add(
                 TranscriptTranslation(
                     job_id=job.id,
                     language_code=t["language_code"],
-                    status="done",
+                    status=status,
                     text=t.get("text"),
+                    error=t.get("error") if status == "partial" else None,
                     progress_percent=100,
                     created_at=t.get("created_at") or now,
                     updated_at=t.get("updated_at") or now,
@@ -490,15 +512,20 @@ def get_translation(job_id: str, language_code: str) -> dict[str, Any] | None:
 
 
 def list_done_translations(job_id: str) -> list[dict[str, Any]]:
-    """Return this job's cached translations that are actually ``done`` —
-    together with the full ``text`` and both timestamps.
+    """Return this job's cached translations that carry real text — i.e.
+    ``done`` OR ``partial`` — together with the full ``text`` and both
+    timestamps.
 
     Used only by ``storage.bundle`` when packing an export bundle: the
     sidepanel-facing ``list_translations``/``get_translation`` above
     intentionally omit ``text`` (list) or timestamps (both) because
     nothing in the live UI needs them; the export format needs both, and
     only ever wants translations that carry actual text (queued/running/
-    failed rows have none worth exporting).
+    failed rows have none worth exporting). A ``partial`` translation has
+    text too — some lines are just left in the source language — so it's
+    exported the same as a fully ``done`` one; the receiving machine gets
+    the ``status``/``error`` fields via ``_build_translations`` and can
+    still see it was incomplete.
     """
     from src.storage.db import TranscriptTranslation
 
@@ -506,13 +533,15 @@ def list_done_translations(job_id: str) -> list[dict[str, Any]]:
         rows = session.exec(
             select(TranscriptTranslation).where(
                 TranscriptTranslation.job_id == job_id,
-                TranscriptTranslation.status == "done",
+                TranscriptTranslation.status.in_(("done", "partial")),  # type: ignore[attr-defined]
             )
         ).all()
         return [
             {
                 "language_code": r.language_code,
                 "text": r.text,
+                "status": r.status,
+                "error": r.error,
                 "created_at": r.created_at,
                 "updated_at": r.updated_at,
             }
