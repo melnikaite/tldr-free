@@ -614,6 +614,7 @@ body {
 }
 .lang-chip--running { opacity: 0.7; }
 .lang-chip--failed { border-color: #c33; color: #c33; }
+.lang-chip--partial { border-color: #c90; color: #c90; }
 .lang-chip .spinner-dot {
   width: 0.6rem;
   height: 0.6rem;

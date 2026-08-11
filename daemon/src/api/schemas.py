@@ -189,7 +189,7 @@ class TranscriptTranslationSummary(BaseModel):
     status) — full text comes through ``GET /jobs/{id}/transcript?lang=``.
     """
     language_code: str
-    status: Literal["queued", "running", "done", "failed"]
+    status: Literal["queued", "running", "done", "partial", "failed"]
     progress_percent: int = 0
     error: str | None = None
 

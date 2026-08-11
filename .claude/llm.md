@@ -302,29 +302,90 @@ characterisation of any model in general.
 
 ## Transcript translation
 
-`workers/translator.py` translates `Job.raw_text` into a target language,
-caching the result in `transcript_translation` (PK `job_id+language_code`).
-Triggered by `POST /jobs/{id}/transcript/translate {lang}`; dedup is at
-the row level — a second POST for an in-flight `(job_id, lang)` returns
-the existing status without spawning a duplicate worker.
+`workers/translator.py` translates a job's transcript into a target
+language, caching the result in `transcript_translation` (PK
+`job_id+language_code`). Triggered by
+`POST /jobs/{id}/transcript/translate {lang}`; dedup is at the row level —
+a second POST for an in-flight `(job_id, lang)` returns the existing
+status without spawning a duplicate worker.
 
-Three invariants:
+**Never trust the model's line alignment — verify it deterministically
+and repair by narrowing the window.** Losing input is structurally
+impossible; the worst case is a line left in the source language and an
+honest `partial` status, never a silently dropped chunk.
 
-1. **Chunked**: long transcripts go through `llm.chunking.split_for_summary`
-   so each LLM call fits the context. The translation prompt
-   (`prompts/transcript_translate.txt`) instructs Gemma to keep
-   `[MM:SS]` markers verbatim per line — without that the
-   transcript-tab's binary-search highlight breaks.
-2. **Pause-aware**: between chunks (`_checkpoint_pause_translation`) and
+1. **Line-aware packing, not `split_for_summary`.** The translation
+   prompt (`prompts/transcript_translate.txt`) is a strict one-input-line
+   → one-output-line contract with a `[MM:SS]` marker copied verbatim.
+   `llm.chunking.split_for_summary` cannot honor that: it splits on blank
+   lines first, and a marked transcript has none, so it degrades to
+   splitting the whole transcript by SENTENCE — tearing multi-sentence
+   lines in half and detaching the marker from the second half before the
+   model ever sees it. The translator instead uses
+   `llm.chunking.pack_lines`, which packs whole lines into token-budgeted
+   groups and never splits one.
+2. **Marker-based verification, not blind trust.** `_align_translation`
+   walks the output with a forward-only cursor, matching each input
+   line's marker to the first not-yet-consumed output line carrying the
+   same marker BY VALUE (`[1:02]` matches `[01:02]` — tolerates a model
+   that mangles the marker's formatting while copying it; the rebuilt
+   line always uses the INPUT's own marker text, never the model's copy).
+   Forward-only search makes duplicate markers align in encounter order,
+   and unmarked output lines that follow a match get absorbed into it
+   (recovers a line the model split in two). Any input marker not found
+   fails verification — as does a repetition-loop catch mirroring
+   `api.ai._DEGEN_TAIL_RE` (line-granular here since output is
+   line-shaped by contract): a run of more than `_MAX_REPEATED_LINES` (6)
+   identical output lines, EXCEPT the threshold floats up to match
+   whatever run-length the INPUT of that call already contains
+   (`_degenerate_run_threshold`) — a faithful translation of a
+   genuinely-repetitive source (measured live: 28 consecutive
+   `[05:28] Ja.` Whisper segments) is just as repetitive, and the
+   translator must not assume `timecodes.collapse_repeated_segments` has
+   already cleaned the input.
+3. **Bisection with a bounded budget, leaf fallback.** A group that fails
+   verification is split in half and each half retried independently, up
+   to `_MAX_BISECT_DEPTH` (8); a single line that still fails gets one
+   more retry before it's kept verbatim from the source. Depth has to be
+   deep enough to actually REACH single-line granularity on a real group
+   or that retry path is dead code: `pack_lines` produces much bigger
+   groups than the old sentence-shredding chunker did (measured live: a
+   656-line transcript packed into 4 groups of 145-177 lines, not 6
+   ragged ones), so a shallower cap bottoms out well above 1 line — depth
+   4 measured stopping at ~11 lines on a 170-line group, turning one bad
+   line into an 11-line fallback block. A per-job `_CallBudget`
+   (`max(_CALL_BUDGET_FLOOR, groups + 2 × (2×_MAX_BISECT_DEPTH + 1))`
+   calls — the derivation assumes two fully-isolated bad regions each
+   reaching max depth, plus one call per group) caps how far a
+   pathological model can make this fan out — budget or depth exhausted
+   falls the whole remaining (sub-)group back to source text. Raising
+   the depth constant means re-deriving the budget one, not just the
+   depth.
+4. **`max_tokens` is dynamic, not fixed.** Russian output measured ~1.5×
+   the source token count on the same transcript (11573 RU vs 7691 DE) —
+   a fixed 4000 was thin against a 2000-token chunk plus repair overhead.
+   `count_tokens(text) * 2.5`, floor 512 / ceiling 8000.
+5. **`status="partial"` is the honest outcome of imperfect repair.** If
+   any line fell back to source, the row is `partial` (not `done`), with
+   `text` fully populated and `error` a plain count
+   ("N of M lines could not be translated…"). The sidepanel treats
+   `partial` like `done` for selection/export — it has real text — but
+   flags it visually and offers it to "Retry all" alongside `failed`.
+6. **Markerless sources** (the `raw_text` fallback for PDF/HTML/legacy
+   jobs — no `[MM:SS]` to verify against): when fewer than 90% of a
+   group's lines carry a marker, `_align_translation` drops to an
+   emptiness/degeneration check only. Bisection and the `partial` outcome
+   still apply on top of that weaker check.
+7. **Pause-aware**: between groups (`_checkpoint_pause_translation`) and
    inside `stream_complete(respect_pause=True)`. Same pause flag as the
    summary path.
-3. **Restart-safe**: rows left in `running` at daemon startup get
+8. **Restart-safe**: rows left in `running` at daemon startup get
    re-enqueued by `re_enqueue_running_on_startup` (called from
-   `main.lifespan`). raw_text is in the DB and the language code is on
-   the row — nothing external is needed. Restart-continued translations
-   start from chunk 0 (no partial-chunk checkpointing); the user "loses"
-   any progress percent shown before the restart but the result is
-   correct.
+   `main.lifespan`) — the source text is in the DB and the language code
+   is on the row, nothing external is needed. Restart-continued
+   translations start from group 0 (no partial-group checkpointing); the
+   user "loses" any progress percent shown before the restart but the
+   result is correct.
 
 `en→en` (or whatever the source is) short-circuits — no LLM run, the
 endpoint returns `is_source=true` and the sidepanel switches to display

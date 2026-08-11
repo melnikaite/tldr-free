@@ -113,7 +113,7 @@ _eventStream.subscribe((event) => {
     // looking at, refetch + re-render the body. /events doesn't carry
     // the text payload itself — translation bodies can be megabytes,
     // we keep them out of the broadcast for sanity.
-    if (j.status === "done" && _currentLang === code) {
+    if ((j.status === "done" || j.status === "partial") && _currentLang === code) {
       _textCache.delete(`${_job.id}::${code}`);
       _pendingKeys.delete(`${_job.id}::${code}`);
       _showLanguage(code).catch(() => {});
@@ -471,7 +471,11 @@ function _renderChips() {
 
   const source = _job.transcript_language;
   const cached = (_job.transcript_translations || []).filter(
-    (t) => t.status === "done" || t.status === "running" || t.status === "failed",
+    (t) =>
+      t.status === "done" ||
+      t.status === "partial" ||
+      t.status === "running" ||
+      t.status === "failed",
   );
 
   // Source language chip (original; always present even when null — UI
@@ -521,8 +525,9 @@ function _renderChips() {
         input.value = "";
         // If the daemon told us this IS the source language, just switch
         // the view — no chip needs to appear (the source chip already
-        // exists).
-        if (result.is_source || result.status === "done") {
+        // exists). A dedup response of "partial" means a previous run
+        // already produced usable (if incomplete) text — same deal.
+        if (result.is_source || result.status === "done" || result.status === "partial") {
           _showLanguage(result.language_code).catch(() => {});
           return;
         }
@@ -563,14 +568,18 @@ function _renderChips() {
   });
   langBarEl.appendChild(input);
 
-  // Retry-all button (appears only when ≥1 chip is in ``failed`` state).
-  const hasFailed = cached.some((t) => t.status === "failed");
-  if (hasFailed) {
+  // Retry-all button (appears when ≥1 chip is ``failed`` OR ``partial`` —
+  // the daemon's retry-all endpoint re-queues both).
+  const hasRetryable = cached.some(
+    (t) => t.status === "failed" || t.status === "partial",
+  );
+  if (hasRetryable) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "lang-chip lang-chip--retry";
     btn.textContent = "Retry failed";
-    btn.title = "Re-queue every failed translation for this job.";
+    btn.title =
+      "Re-queue every failed or partially-translated language for this job.";
     btn.addEventListener("click", () => {
       btn.disabled = true;
       daemon.retryAllTranslations(_job.id)
@@ -595,7 +604,7 @@ function _renderChips() {
  * @param {{
  *   code: string | null,
  *   label: string,
- *   status: "queued"|"running"|"done"|"failed",
+ *   status: "queued"|"running"|"done"|"partial"|"failed",
  *   current: boolean,
  *   progress?: number,
  *   error?: string | null,
@@ -610,6 +619,9 @@ function _makeChip(opts) {
     btn.classList.add("lang-chip--running");
   }
   if (opts.status === "failed") btn.classList.add("lang-chip--failed");
+  // "partial" is selectable like "done" (it has real text) but flagged
+  // visually — some lines fell back to the source language.
+  if (opts.status === "partial") btn.classList.add("lang-chip--partial");
 
   if (opts.status === "running" && opts.progress != null) {
     btn.append(opts.label, ` ${opts.progress}%`);
@@ -619,14 +631,15 @@ function _makeChip(opts) {
   } else {
     btn.textContent = opts.label;
   }
-  if (opts.status === "failed" && opts.error) {
+  if ((opts.status === "failed" || opts.status === "partial") && opts.error) {
     btn.title = opts.error;
   }
 
   btn.addEventListener("click", () => {
-    // For "done" / null (source) chips: switch to that language.
-    // For in-flight or failed: no-op for now; Phase 3 wires retry.
-    if (opts.status !== "done") return;
+    // For "done" / "partial" / null (source) chips: switch to that
+    // language. For in-flight or failed: no-op for now; Phase 3 wires
+    // retry.
+    if (opts.status !== "done" && opts.status !== "partial") return;
     if ((_currentLang ?? null) === (opts.code ?? null)) {
       // Re-clicking current chip re-injects captions (idempotent, handy
       // if the user reloaded the source tab).

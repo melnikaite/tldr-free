@@ -5,6 +5,14 @@ Public surface:
         Splits primarily on blank lines (paragraphs), then on sentence boundaries
         for paragraphs that exceed target_tokens. Adds overlap by carrying the
         last `overlap_tokens` of each chunk into the next.
+    pack_lines(lines: list[str], *, target_tokens: int) -> list[list[str]]
+        Greedily packs whole LINES (never split) into groups under a token
+        budget. Used by ``workers/translator.py`` instead of
+        ``split_for_summary`` — a marked transcript has no blank lines to
+        split on, so the summary splitter degrades to sentence-splitting a
+        single giant "paragraph" and tears lines (and their leading
+        ``[MM:SS]`` marker) in half. ``pack_lines`` never does that: a line
+        is the atomic unit, full stop.
 
 Important: must NOT cut inside a [MM:SS] marker — keep markers attached to
 their following sentence so map-reduce summaries preserve them.
@@ -175,4 +183,39 @@ def split_for_summary(
     return chunks
 
 
-__all__ = ["split_for_summary"]
+def pack_lines(lines: list[str], *, target_tokens: int) -> list[list[str]]:
+    """Greedily pack whole ``lines`` into groups of at most ``target_tokens``.
+
+    Unlike ``split_for_summary`` (which splits prose on blank lines, then
+    sentences), this never looks inside a line — a line is the smallest
+    unit that can be moved, so a ``[MM:SS] ...`` marker can never end up
+    detached from its text. A single line that alone exceeds
+    ``target_tokens`` still becomes its own one-line group rather than
+    being split — the caller (the translator's LLM call) just sees a
+    slightly-over-budget prompt for that one line, which is far cheaper
+    than reconstructing a torn line downstream.
+
+    Empty input returns ``[]``. Blank lines are kept as lines (empty
+    strings) — they carry position in the caller's line-for-line contract,
+    not just words to pack.
+    """
+    if not lines:
+        return []
+
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for line in lines:
+        line_tokens = count_tokens(line)
+        if current and current_tokens + line_tokens > target_tokens:
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(line)
+        current_tokens += line_tokens
+    if current:
+        groups.append(current)
+    return groups
+
+
+__all__ = ["pack_lines", "split_for_summary"]

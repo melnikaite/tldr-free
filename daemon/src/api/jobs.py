@@ -533,8 +533,10 @@ async def translate_transcript(job_id: str, body: dict[str, Any]) -> dict[str, A
     Body: ``{"lang": "ru"}`` (ISO-639-1 code, ISO-639-2, or English name;
     see ``llm.languages.normalize_lang``). The call is **dedup**:
 
-    - Existing row in ``queued`` / ``running`` / ``done`` → no new task,
-      return the existing status.
+    - Existing row in ``queued`` / ``running`` / ``done`` / ``partial`` →
+      no new task, return the existing status. ``partial`` has real text
+      (some lines just fell back to the source language), so re-selecting
+      the language must not silently restart the work.
     - Existing row in ``failed`` → reset, re-spawn task.
     - No row → insert ``queued``, spawn task.
 
@@ -560,10 +562,12 @@ async def translate_transcript(job_id: str, body: dict[str, Any]) -> dict[str, A
 
 @router.post("/{job_id}/transcript/retry-all", status_code=202)
 async def retry_all_transcript_translations(job_id: str) -> dict[str, Any]:
-    """Re-enqueue every ``failed`` translation row for this job.
+    """Re-enqueue every ``failed`` OR ``partial`` translation row for this
+    job — a ``partial`` row has some lines left in the source language,
+    as much a retry candidate as a fully ``failed`` one.
 
     Returns ``{retried: [TranscriptTranslationSummary, ...]}``. Empty
-    list when nothing was failed (idempotent). MUST be async because
+    list when nothing was failed/partial (idempotent). MUST be async because
     spawning the translator workers calls ``asyncio.create_task`` under
     the hood — that requires a running event loop, which a sync FastAPI
     handler (run on a threadpool) doesn't have.
@@ -590,7 +594,9 @@ def get_transcript(job_id: str, lang: str | None = None) -> dict[str, Any]:
       shows a placeholder + refetches on the next ``job_event`` for this
       job. We do NOT 404 here because the Transcript tab opens as soon as
       the user clicks it, often before the daemon has finished extraction
-      on a freshly-submitted job.
+      on a freshly-submitted job. A ``status="partial"`` translation is
+      NOT pending — some lines fell back to the source language, but the
+      row has real text, so it's served like ``done``.
     - **No-such-translation** ``404`` — the caller asked for a language
       that has no row in ``transcript_translation`` at all. UI should
       POST to ``/translate`` to start one.
@@ -646,11 +652,14 @@ def get_transcript(job_id: str, lang: str | None = None) -> dict[str, Any]:
             status.HTTP_404_NOT_FOUND,
             f"no cached {requested!r} translation for job {job_id}",
         )
-    if translation.get("status") != "done":
+    if translation.get("status") not in ("done", "partial"):
         # Row exists, work in flight (queued / running / failed). Pending
         # sentinel so the UI shows a "translating…" placeholder for the
         # body. Chip status is the canonical source for UI; this response
-        # is just the body for the currently-selected language.
+        # is just the body for the currently-selected language. ``partial``
+        # is NOT pending — it has real (if incomplete) text, same as
+        # ``done``; the shortfall is communicated via the chip's error
+        # tooltip, not by withholding the body.
         return {
             "text": None,
             "language_code": requested,

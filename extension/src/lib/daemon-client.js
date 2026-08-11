@@ -284,8 +284,10 @@ export const daemon = {
     }),
 
   /**
-   * Re-enqueue every failed translation for this job. Idempotent (no-op
-   * when nothing is failed).
+   * Re-enqueue every failed OR partial translation for this job (a
+   * "partial" row has some lines that fell back to the source language —
+   * as much a retry candidate as a fully failed one). Idempotent (no-op
+   * when nothing is failed/partial).
    *
    * @param {string} id
    * @returns {Promise<{retried: import("./api-types.js").TranscriptTranslationSummary[]}>}

@@ -128,16 +128,27 @@ class TranscriptTranslation(SQLModel, table=True):
     to look up by ``(job_id, language_code)`` and CASCADE-delete with the
     parent Job.
 
-    Status flow: ``queued`` → ``running`` → ``done`` | ``failed``.
-    ``text`` is populated only on ``done``; ``error`` only on ``failed``.
-    ``progress_percent`` is updated mid-chunk so the UI shows movement
-    without partial text leaking out (we render a spinner + percent, not
-    the streaming tokens — per the agreed UX).
+    Status flow: ``queued`` → ``running`` → ``done`` | ``partial`` | ``failed``.
+    ``text`` is populated on ``done`` AND ``partial``; ``error`` on
+    ``partial`` AND ``failed``. ``progress_percent`` is updated mid-group
+    so the UI shows movement without partial text leaking out (we render
+    a spinner + percent, not the streaming tokens — per the agreed UX).
+
+    ``partial`` exists because the translator (``workers/translator.py``)
+    never trusts the model's line alignment — it verifies each group's
+    output against the source line-for-line and, when that keeps failing
+    even after bisecting the group down to single lines, gives up on just
+    those lines rather than the whole job. ``text`` is then the full
+    transcript with the untranslated lines left in the source language,
+    and ``error`` is a plain-English count of how many. The UI treats
+    ``partial`` like ``done`` for selection/export purposes (it has real
+    text) but flags it visually and offers it to "Retry all" alongside
+    ``failed``.
 
     Restart-safety: rows left in ``running`` at daemon startup are
-    re-enqueued by ``re_enqueue_pending`` because we have the source
-    ``Job.raw_text`` and the target language code — everything needed to
-    continue from scratch (we don't checkpoint partial output mid-chunk).
+    re-enqueued by ``re_enqueue_pending`` because we have the source text
+    and the target language code — everything needed to continue from
+    scratch (we don't checkpoint partial output mid-group).
     """
 
     __tablename__ = "transcript_translation"

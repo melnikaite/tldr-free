@@ -1,10 +1,10 @@
-"""Tests for llm.chunking.split_for_summary."""
+"""Tests for llm.chunking.split_for_summary and llm.chunking.pack_lines."""
 
 from __future__ import annotations
 
 import re
 
-from src.llm.chunking import split_for_summary
+from src.llm.chunking import pack_lines, split_for_summary
 from src.llm.tokens import count_tokens
 
 _TIMECODE_RE = re.compile(r"\[(\d{1,2}:)?\d{1,2}:\d{2}\]")
@@ -69,6 +69,55 @@ def test_chunks_have_overlap() -> None:
             raise AssertionError(
                 f"No overlap detected between chunk {i} and {i + 1}"
             )
+
+
+# ---------------------------------------------------------------------------
+# pack_lines
+# ---------------------------------------------------------------------------
+
+
+def test_pack_lines_empty_input() -> None:
+    assert pack_lines([], target_tokens=100) == []
+
+
+def test_pack_lines_never_splits_a_line() -> None:
+    lines = [f"[{i:02d}:00] line number {i} with some words in it" for i in range(50)]
+    groups = pack_lines(lines, target_tokens=50)
+    # Every original line appears verbatim in exactly one group, in order.
+    flat = [line for group in groups for line in group]
+    assert flat == lines
+
+
+def test_pack_lines_respects_budget() -> None:
+    lines = [f"[{i:02d}:00] " + ("word " * 20) for i in range(30)]
+    target = 100
+    groups = pack_lines(lines, target_tokens=target)
+    assert len(groups) > 1
+    for group in groups[:-1]:
+        # Each non-final group should be close to (not wildly under) budget —
+        # the greedy packer stops adding once the NEXT line would overflow,
+        # so a group is allowed to sit under budget by up to one line's
+        # worth of tokens, but never over by more than a fraction.
+        total = sum(count_tokens(line) for line in group)
+        assert total <= target * 1.5
+
+
+def test_pack_lines_oversized_single_line_gets_own_group() -> None:
+    huge_line = "word " * 5000  # far bigger than target_tokens
+    lines = ["[00:00] short", huge_line, "[00:02] short again"]
+    groups = pack_lines(lines, target_tokens=50)
+    assert huge_line in [line for group in groups for line in group]
+    # The huge line must be alone in its own group — never merged with
+    # neighbours, never split.
+    huge_group = next(g for g in groups if huge_line in g)
+    assert huge_group == [huge_line]
+
+
+def test_pack_lines_preserves_blank_lines() -> None:
+    lines = ["[00:00] a", "", "[00:01] b"]
+    groups = pack_lines(lines, target_tokens=1000)
+    flat = [line for group in groups for line in group]
+    assert flat == lines
 
 
 def test_timecode_markers_not_split() -> None:

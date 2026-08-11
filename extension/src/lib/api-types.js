@@ -90,7 +90,7 @@
 /**
  * @typedef {object} TranscriptTranslationSummary
  * @property {string} language_code
- * @property {"queued" | "running" | "done" | "failed"} status
+ * @property {"queued" | "running" | "done" | "partial" | "failed"} status
  * @property {number} progress_percent
  * @property {string | null} [error]
  */
