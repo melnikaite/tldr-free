@@ -300,6 +300,46 @@ build. A different backend or a cloud model may behave differently — treat
 the numbers above as evidence that model-level behaviour varies, not as a
 characterisation of any model in general.
 
+## No request may exceed the model's context — checked, not assumed
+
+`llm/summary.py` used to reason about size in two places and trust the
+answer in neither. Both cost a real job (a 4770-line YouTube transcript)
+its summary: one request of 72196 tokens went out against a 32768-token
+context, three retries, three identical failures.
+
+1. **`split_for_summary` now guarantees its budget.** It previously
+   *aimed* for `target_tokens` with no floor under the aim, and on a
+   marked transcript it returned the whole 65k-token input as ONE chunk.
+   Same root cause the translator hit (see below): `build_marked_text`
+   emits one line per sentence with `[MM:SS]` at the start and no blank
+   lines, so `_split_into_paragraphs` sees a single giant paragraph, and
+   `_SENTENCE_RE`'s lookahead — which excludes `[` precisely so a split
+   never orphans a marker — finds zero breakpoints because the character
+   after every `.` IS `[`. `_segments_for` now runs a final waterfall over
+   any still-oversized segment: by LINE via `pack_lines` (line-atomic, a
+   marker can't be torn off), then by WORD for a single line that alone
+   busts the budget. The only chunk that may still exceed `target_tokens`
+   is one unsplittable "word".
+2. **`stream_summarize` checks sizes instead of inferring them.** A lone
+   chunk is not proof it fits — single-pass is taken only when
+   `count_tokens(chunk) < threshold`. The map-phase chunk budget is
+   derived as `min(4000, single_pass_token_limit - 1)`, so an operator
+   configuring a threshold below the chunk target can't produce chunks
+   too big to send either.
+3. **The reduce phase has a budget too.** Correctly bounded chunks still
+   produce N partials whose concatenation is unbounded in N (17 on the
+   job above; longer videos, proportionally more). `_fold_partials`
+   measures the join and, if it doesn't fit, groups partials with
+   `pack_lines` and folds each group through an intermediate reduce
+   (reusing `prompts/summary_reduce.txt`), capped at 6 rounds.
+
+`config.llm.context_length` is a claim, not a measurement — the daemon
+believes it and builds prompts to fit. Declaring more than the backend
+actually serves doesn't create room, it just moves the failure into the
+backend. It also feeds `qa._select_context`, which uses
+`context_length - 4000` to decide whether to hand QA the full transcript
+instead of the summary.
+
 ## Transcript translation
 
 `workers/translator.py` translates a job's transcript into a target

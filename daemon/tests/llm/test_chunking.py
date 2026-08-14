@@ -153,6 +153,76 @@ def test_timecode_markers_not_split() -> None:
     assert original_markers  # sanity: regex actually fired
 
 
+def _make_marked_transcript(lines: int) -> str:
+    """Reproduce the real-world shape from ``workers/timecodes.build_marked_text``:
+    one line per sentence, a ``[MM:SS]`` marker at the very start of each line,
+    NO blank lines between them. This is the exact shape that made
+    ``split_for_summary`` return a single 65k-token chunk in production —
+    ``_split_into_paragraphs`` sees one giant paragraph (no blank lines), and
+    ``_SENTENCE_RE``'s lookahead never matches because the character right
+    after every ``. ``/``! ``/``? `` is always ``[`` (the next marker), not an
+    uppercase letter."""
+    out = []
+    for i in range(lines):
+        m, s = divmod(i * 5, 60)
+        out.append(f"[{m:02d}:{s:02d}] This is sentence number {i + 1} in a long transcript.")
+    return "\n".join(out)
+
+
+def test_marked_transcript_without_blank_lines_splits_into_multiple_chunks() -> None:
+    """Regression for the production incident: a marked transcript with no
+    blank lines must still be split into chunks that respect target_tokens —
+    NOT returned as a single oversized chunk."""
+    text = _make_marked_transcript(2000)
+    target = 4000
+    overlap = 200
+    assert count_tokens(text) > target * 5  # sanity: comfortably over budget
+
+    chunks = split_for_summary(text, target_tokens=target, overlap_tokens=overlap)
+
+    assert len(chunks) > 1, "marked transcript must be split into more than one chunk"
+    for ch in chunks:
+        # On this marked-transcript shape there are no unsplittable segments
+        # (every line packs cleanly), so the only headroom above `target` is
+        # the overlap prepended onto the next chunk — not the looser 1.5x
+        # allowance other tests give ordinary prose (which can contain a
+        # genuinely unsplittable sentence).
+        assert count_tokens(ch) <= target + overlap, (
+            f"chunk exceeds target_tokens+overlap budget ({count_tokens(ch)} > {target + overlap})"
+        )
+
+
+def test_marked_transcript_markers_not_torn_or_lost() -> None:
+    """Every [MM:SS] marker in the marked-transcript shape survives whole,
+    and none is dropped, across the waterfall split."""
+    text = _make_marked_transcript(2000)
+    target = 4000
+    chunks = split_for_summary(text, target_tokens=target, overlap_tokens=200)
+
+    for ch in chunks:
+        assert ch.count("[") == ch.count("]"), f"unbalanced bracket in chunk:\n{ch[:200]!r}"
+
+    original_markers = re.findall(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", text)
+    joined = "\n".join(chunks)
+    for m in set(original_markers):
+        assert m in joined, f"marker {m} lost during chunking"
+
+
+def test_single_giant_line_without_spaces_splits_without_looping() -> None:
+    """A single line with no spaces near it (one gigantic 'word') must still
+    terminate — split by word/space as a last resort, or yielded whole if
+    truly unsplittable, but never loop forever."""
+    huge_word = "x" * 50_000
+    text = f"[00:00] {huge_word}"
+    target = 500
+
+    chunks = split_for_summary(text, target_tokens=target, overlap_tokens=50)
+
+    assert chunks  # terminates and returns something
+    joined = "".join(chunks)
+    assert huge_word in joined
+
+
 def test_marker_kept_with_following_sentence() -> None:
     """A marker at the start of a sentence should never be orphaned across
     chunk boundaries (i.e. the chunk that closes does not end with `[12:34]`

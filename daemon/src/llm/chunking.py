@@ -4,18 +4,31 @@ Public surface:
     split_for_summary(text: str, *, target_tokens: int = 4000, overlap_tokens: int = 200) -> list[str]
         Splits primarily on blank lines (paragraphs), then on sentence boundaries
         for paragraphs that exceed target_tokens. Adds overlap by carrying the
-        last `overlap_tokens` of each chunk into the next.
+        last `overlap_tokens` of each chunk into the next. GUARANTEES no
+        returned chunk exceeds target_tokens (see the waterfall below) —
+        with one unavoidable exception: a single "word" (no whitespace
+        nearby) that alone exceeds target_tokens can't be split further and
+        is returned as its own oversized chunk.
     pack_lines(lines: list[str], *, target_tokens: int) -> list[list[str]]
         Greedily packs whole LINES (never split) into groups under a token
-        budget. Used by ``workers/translator.py`` instead of
-        ``split_for_summary`` — a marked transcript has no blank lines to
-        split on, so the summary splitter degrades to sentence-splitting a
-        single giant "paragraph" and tears lines (and their leading
-        ``[MM:SS]`` marker) in half. ``pack_lines`` never does that: a line
-        is the atomic unit, full stop.
+        budget. Used by ``workers/translator.py`` (a marked transcript has
+        no blank lines to split on, so line-atomic packing is the more
+        semantically appropriate tool there — it never touches sentence
+        boundaries, which matters for the translator's line-for-line output
+        contract) AND, since fixing a production incident described below,
+        reused inside ``split_for_summary`` itself as the second stage of
+        its own waterfall.
 
 Important: must NOT cut inside a [MM:SS] marker — keep markers attached to
 their following sentence so map-reduce summaries preserve them.
+
+A marked transcript (one line per sentence, ``[MM:SS]`` at the start of
+each line, no blank lines — see ``workers/timecodes.build_marked_text``)
+gives ``_split_into_paragraphs`` one giant "paragraph" and gives
+``_SENTENCE_RE`` no breakpoints (the char after every ``.``/``!``/``?`` is
+always ``[``, which its marker-safe lookahead excludes by design). Whatever
+segment is still oversized after that falls through a line→word waterfall
+in ``_segments_for`` instead of coming back whole.
 """
 
 from __future__ import annotations
@@ -52,26 +65,97 @@ def _split_into_sentences(paragraph: str) -> list[str]:
 
 
 def _segments_for(text: str, target_tokens: int) -> list[str]:
-    """Yield paragraph- or sentence-sized segments from `text`.
+    """Yield paragraph- or sentence-sized segments from `text`, each
+    guaranteed to be at most `target_tokens` (waterfall's last resort — a
+    single word with no nearby whitespace — aside).
 
     A paragraph is kept whole when it fits in target_tokens. Otherwise it is
-    broken into sentences. If a single sentence still exceeds target_tokens
-    (rare — extremely long unbroken text), it is yielded as-is — the chunk
-    packer will give it its own chunk.
+    broken into sentences. Whatever segment survives that (a paragraph with
+    no sentence breaks found, or an individual sentence) and is STILL over
+    target_tokens goes through one more waterfall stage: split by line, then
+    by word — see ``_split_oversized_segment`` and the module docstring for
+    the production incident this guards against (a marked transcript with no
+    blank lines and no sentence breaks the splitter could find).
     """
-    segments: list[str] = []
+    raw_segments: list[str] = []
     for paragraph in _split_into_paragraphs(text):
         if count_tokens(paragraph) <= target_tokens:
-            segments.append(paragraph)
+            raw_segments.append(paragraph)
             continue
         # Too big — split into sentences
         sentences = _split_into_sentences(paragraph)
         if len(sentences) <= 1:
-            # No sentence breaks found; yield the paragraph whole.
-            segments.append(paragraph)
+            # No sentence breaks found; yield the paragraph whole (waterfall
+            # below will split it further if it's still oversized).
+            raw_segments.append(paragraph)
         else:
-            segments.extend(sentences)
+            raw_segments.extend(sentences)
+
+    segments: list[str] = []
+    for seg in raw_segments:
+        if count_tokens(seg) <= target_tokens:
+            segments.append(seg)
+        else:
+            segments.extend(_split_oversized_segment(seg, target_tokens))
     return segments
+
+
+def _split_line_by_words(line: str, target_tokens: int) -> list[str]:
+    """Last resort: split ONE line that alone exceeds target_tokens by word.
+
+    A leading ``[MM:SS]``/``[HH:MM:SS]`` marker, if present, is consumed
+    whole up front and glued back onto the first word-group, so it can
+    never be torn. A single spaceless "word" still over budget becomes its
+    own piece rather than looping — mirrors ``pack_lines``'s oversized-
+    single-line contract.
+    """
+    marker_match = _TIMECODE_RE.match(line)
+    prefix = marker_match.group() if marker_match else ""
+    rest = line[marker_match.end() :].lstrip() if marker_match else line
+    words = rest.split()
+
+    if not words:
+        return [line] if line.strip() else []
+
+    pieces: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+    for word in words:
+        word_tokens = count_tokens(word)
+        if current and current_tokens + word_tokens > target_tokens:
+            pieces.append(" ".join(current))
+            current = []
+            current_tokens = 0
+        current.append(word)
+        current_tokens += word_tokens
+    if current:
+        pieces.append(" ".join(current))
+
+    if prefix and pieces:
+        pieces[0] = f"{prefix} {pieces[0]}"
+    return pieces
+
+
+def _split_oversized_segment(segment: str, target_tokens: int) -> list[str]:
+    """Waterfall stage 2/3 for a segment still over ``target_tokens`` after
+    paragraph/sentence splitting: split by LINE via ``pack_lines`` (line-
+    atomic, so a marker never gets torn off), then by WORD
+    (``_split_line_by_words``) for any resulting group that's still a
+    single oversized line — the common case here, since a marked transcript
+    has no internal newlines to split on at all.
+    """
+    lines = segment.split("\n")
+    if len(lines) == 1:
+        return _split_line_by_words(segment, target_tokens)
+
+    pieces: list[str] = []
+    for group in pack_lines(lines, target_tokens=target_tokens):
+        joined = "\n".join(group)
+        if len(group) == 1 and count_tokens(joined) > target_tokens:
+            pieces.extend(_split_line_by_words(joined, target_tokens))
+        else:
+            pieces.append(joined)
+    return pieces
 
 
 def _tail_for_overlap(text: str, overlap_tokens: int) -> str:
