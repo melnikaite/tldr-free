@@ -43,6 +43,9 @@ const llmMaxConcurrentInput = /** @type {HTMLInputElement} */ (
 const llmReasoningEffortInput = /** @type {HTMLInputElement} */ (
   document.getElementById("llm-reasoning-effort")
 );
+const llmModelListEl = /** @type {HTMLDataListElement} */ (
+  document.getElementById("llm-model-list")
+);
 const llmApiKeyInput = /** @type {HTMLInputElement} */ (document.getElementById("llm-api-key"));
 const llmApiKeySourceEl = /** @type {HTMLElement} */ (
   document.getElementById("llm-api-key-source")
@@ -455,6 +458,28 @@ async function loadDaemonUrl() {
 }
 
 /**
+ * Refresh the `<datalist>` backing the LLM model input from GET /health's
+ * `llm_backend_models` (itself fetched by the daemon from the configured
+ * backend's own /v1/models). Best-effort only: if the daemon is
+ * unreachable, too old to report it, or the backend didn't list any
+ * models, silently leave the datalist empty — the model field just
+ * behaves like a plain text input, no error shown.
+ */
+async function refreshLlmModelList() {
+  llmModelListEl.replaceChildren();
+  try {
+    const health = await daemon.health();
+    for (const model of health.llm_backend_models ?? []) {
+      const option = document.createElement("option");
+      option.value = model;
+      llmModelListEl.appendChild(option);
+    }
+  } catch {
+    // Daemon unreachable or /health failed — leave the datalist empty.
+  }
+}
+
+/**
  * Load GET /config and populate the settings form. On any failure — the
  * daemon is unreachable, or it's an older build without /config yet —
  * disable the whole settings fieldset and show an inline notice, without
@@ -593,6 +618,9 @@ saveSettingsBtn.addEventListener("click", async () => {
         result.whisper_api_key_verify_error,
       );
     }
+    // base_url/model may have changed to point at a different backend —
+    // refresh the model suggestions to match.
+    await refreshLlmModelList();
   } catch (err) {
     settingsStatusEl.textContent = `Save failed: ${formatRequestError(err)}`;
     settingsStatusEl.className = "err";
@@ -642,6 +670,7 @@ saveDaemonBtn.addEventListener("click", async () => {
   // The daemon URL changed — reload settings from the (possibly
   // different) daemon at the new address.
   await loadSettings();
+  await refreshLlmModelList();
 });
 
 (async function init() {
@@ -652,4 +681,5 @@ saveDaemonBtn.addEventListener("click", async () => {
     daemonStatusEl.className = "err";
   }
   await loadSettings();
+  await refreshLlmModelList();
 })();

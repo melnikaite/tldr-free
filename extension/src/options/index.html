@@ -86,7 +86,13 @@
         <input id="llm-base-url" type="url" placeholder="http://127.0.0.1:1240/v1" />
 
         <label for="llm-model">Model</label>
-        <input id="llm-model" type="text" placeholder="gemma-4-e4b-it-qat-q4_0" />
+        <!-- datalist only, never <select>: this stays free text. Cloud
+             endpoints can list hundreds of models, some backends don't
+             enumerate everything they can serve, and the user may want a
+             name that isn't in the list at all — the datalist is a hint,
+             not a constraint. -->
+        <input id="llm-model" type="text" placeholder="gemma-4-e4b-it-qat-q4_0" list="llm-model-list" />
+        <datalist id="llm-model-list"></datalist>
 
         <label for="llm-context-length">Context length (tokens)</label>
         <input id="llm-context-length" type="number" min="1" step="1" />
