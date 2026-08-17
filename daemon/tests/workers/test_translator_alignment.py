@@ -137,6 +137,266 @@ def test_align_markerless_source_rejects_empty_output() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Echo detection (group-level) — the model copied the input instead of
+# translating it. Measured live (job cWiAdufn-6j8, EN transcript -> RU):
+# qwen3-1.7b returned 139/139 lines byte-identical to the source and the
+# old structural-only check accepted it as "done". See _group_is_echo.
+# ---------------------------------------------------------------------------
+
+
+def test_align_full_group_echo_is_rejected() -> None:
+    """A group of N>1 lines that comes back byte-identical to the input
+    (marker-bearing case) is NOT accepted — it must go down the same path
+    as any other alignment failure (bisection / fallback), never straight
+    to "done"."""
+    input_lines = ["[00:00] hello", "[00:01] world", "[00:02] again"]
+    output_lines = list(input_lines)  # byte-identical echo
+    assert translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="ru",
+    ) is None
+
+
+def test_align_single_line_echo_is_accepted() -> None:
+    """Regression guard against an overly aggressive rule: once bisection
+    has narrowed a mismatch down to ONE line, that line matching the
+    source is normal (a number, a proper noun, "OK", "2024"), not evidence
+    of an echo — a group of size 1 must never be flagged."""
+    input_lines = ["[00:00] 2024"]
+    output_lines = ["[00:00] 2024"]
+    result = translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="ru",
+    )
+    assert result == output_lines
+
+
+def test_align_partial_echo_within_group_is_not_flagged() -> None:
+    """A group where SOME lines happen to match the source (numbers, a
+    proper noun) and others were genuinely translated is accepted whole —
+    the echo signature is the WHOLE group matching, never a subset."""
+    input_lines = ["[00:00] 2024", "[00:01] OK", "[00:02] hello world"]
+    output_lines = ["[00:00] 2024", "[00:01] OK", "[00:02] привет мир"]
+    result = translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="ru",
+    )
+    assert result == output_lines
+
+
+def test_align_full_echo_with_matching_source_and_target_lang_is_accepted() -> None:
+    """Behavior unchanged from before the echo check existed when the
+    target language equals the source language — a same-language
+    "translation" is SUPPOSED to come back identical (though in practice
+    ``enqueue_translation`` already short-circuits this case before any
+    LLM call is made; this test pins the defensive guard inside
+    ``_align_translation`` itself)."""
+    input_lines = ["[00:00] hello", "[00:01] world", "[00:02] again"]
+    output_lines = list(input_lines)
+    result = translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="en",
+    )
+    assert result == output_lines
+
+
+def test_align_markerless_full_group_echo_is_rejected() -> None:
+    """Markerless input (PDF/HTML raw_text) can still be an echo — the
+    group-level check applies on top of the emptiness/degeneration-only
+    check that markerless input degrades to. Predictable behavior: a
+    markerless group of N>1 lines coming back byte-identical is rejected
+    exactly like the marker-bearing case."""
+    input_lines = ["some paragraph text", "more prose, no markers here"]
+    output_lines = list(input_lines)
+    assert translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="ru",
+    ) is None
+
+
+def test_align_markerless_single_line_echo_is_accepted() -> None:
+    """Predictable behavior, other half: a markerless group of exactly one
+    line matching the source is accepted, same size-1 exemption as the
+    marker-bearing case."""
+    input_lines = ["Acme Corp"]
+    output_lines = ["Acme Corp"]
+    result = translator._align_translation(
+        input_lines, output_lines, source_lang="en", target_lang="ru",
+    )
+    assert result == output_lines
+
+
+def test_align_echo_check_does_not_guess_when_source_lang_unknown() -> None:
+    """When ``job.transcript_language`` was never detected (``None``), the
+    echo check must not guess via an alphabet heuristic — it runs the
+    check rather than assuming same-language. A full-group echo with
+    ``source_lang=None`` is still rejected."""
+    input_lines = ["[00:00] hello", "[00:01] world", "[00:02] again"]
+    output_lines = list(input_lines)
+    assert translator._align_translation(
+        input_lines, output_lines, source_lang=None, target_lang="ru",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_translate_group_full_echo_goes_to_fallback_not_silently_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through ``_translate_group``: a model that copies its
+    entire input back (measured live: qwen3-1.7b, 139/139 lines) must not
+    reach ``done`` — the echo check flags the group at every level it's
+    retried at, going down the ordinary bisection/fallback path exactly
+    like any other verification failure.
+
+    Note the interaction with the size-1 exemption (rule 2): if bisection
+    were allowed to run all the way down to single-line granularity, a
+    stub that echoes UNCONDITIONALLY at every call size would eventually
+    have every line accepted at the leaf (matching a lone line is not
+    itself evidence of an echo) — so this test caps ``_MAX_BISECT_DEPTH``
+    at 1 to pin the case that actually matters: an echo group that can't
+    be fully resolved down to exempted single lines within the
+    depth/budget it's given must come back as a real, counted fallback,
+    not silently accepted.
+    """
+    monkeypatch.setattr(translator, "_MAX_BISECT_DEPTH", 1)
+
+    async def echo_stream(
+        prompt: str, *, max_tokens: int, temperature: float, respect_pause: bool,
+    ) -> AsyncIterator[str]:
+        # Copies the input verbatim, like a model that ignored the
+        # translate instruction entirely.
+        yield prompt + "\n"
+
+    from src.llm import client as llm_client
+    monkeypatch.setattr(llm_client, "stream_complete", echo_stream)
+
+    lines = _lines(8)
+    budget = translator._CallBudget(50)
+    output, fallback_count = await translator._translate_group(
+        lines, _RU, _PROMPT, depth=0, budget=budget, source_lang="en",
+    )
+    # Every line is still present (never lost) but explicitly flagged as
+    # a fallback rather than accepted as "translated".
+    assert output == lines
+    assert fallback_count == len(lines)
+
+
+@pytest.mark.asyncio
+async def test_run_partial_error_counts_echoed_lines_honestly(
+    isolated_db, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``error`` message on a ``partial`` row must honestly count the
+    lines that fell back — including ones that fell back because they
+    were detected as an echo, not just structural mismatches. Same
+    shallow-depth setup as the ``_translate_group`` test above, for the
+    same reason: an echo that CAN be bisected all the way down to
+    exempted single lines is expected (by design, rule 2) to end up
+    "done" — this test pins the case where it can't."""
+    monkeypatch.setattr(translator, "_MAX_BISECT_DEPTH", 1)
+
+    async def echo_stream(
+        prompt: str, *, max_tokens: int, temperature: float, respect_pause: bool,
+    ) -> AsyncIterator[str]:
+        yield _transcript_section(prompt)
+
+    from src.llm import client as llm_client
+    monkeypatch.setattr(llm_client, "stream_complete", echo_stream)
+
+    raw_text = "\n".join(_lines(8)) + "\n"
+    job = _seed_job(raw_text=raw_text)
+
+    await translator.enqueue_translation(job.id, "ru")
+    await _drain_tasks()
+
+    with session_scope() as session:
+        row = session.get(TranscriptTranslation, (job.id, "ru"))
+        assert row is not None
+        assert row.status == "partial"
+        assert row.error is not None and "8 of 8" in row.error
+        assert row.text is not None
+        for line in _lines(8):
+            assert line in row.text
+
+
+# ---------------------------------------------------------------------------
+# Task 2 diagnostic: does the observed fallback boundary line up with
+# bisection-in-half, or does it just track wherever the model's own
+# behavior changes?
+#
+# Live observation (two different models, same job): lines 0-33 came back
+# as an echo and were accepted (pre-fix bug), 34-126 were genuinely
+# translated, 127-138 honestly fell back. 34 ~= 139/4 raised the
+# possibility that this is just deterministic bisection-in-half applied
+# twice (139 -> 69/70 -> 34/35/35/35), not a separate bug.
+#
+# This test builds a ~139-line group against a stub LLM that echoes one
+# sub-range, translates another, and always garbles a third (forcing a
+# real fallback), with the echo/garble boundaries placed AWAY from any
+# bisection cut point of 139 (69, then 34/35, then 17/18, ...). If the
+# final fallback boundary in the OUTPUT were an artifact of bisection
+# halving, it would snap toward one of those cut points; if it's
+# content-driven, it lands exactly where the stub's own behavior changes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bisection_boundary_tracks_content_not_halving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    n = 139
+    lines = _lines_n(n)
+    # Deliberately NOT aligned with 139's bisection cut points (69, 34/35,
+    # 17/18, ...): the echo/translate boundary sits at 50, the
+    # translate/garble boundary at 110.
+    echo_end = 50
+    garble_start = 110
+
+    async def stub(
+        prompt: str, *, max_tokens: int, temperature: float, respect_pause: bool,
+    ) -> AsyncIterator[str]:
+        prompt_lines = prompt.rstrip("\n").split("\n")
+        out = []
+        for line in prompt_lines:
+            m = re.match(r"^(\[(\d{2}):(\d{2})\])(.*)$", line)
+            assert m is not None
+            marker, mm, ss, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+            idx = int(mm) * 60 + int(ss)
+            if idx < echo_end:
+                out.append(f"{marker}{rest}")  # echo
+            elif idx < garble_start:
+                out.append(f"{marker} translated{rest}")
+            else:
+                out.append("garbage, no marker at all")  # forces a real failure
+        yield "\n".join(out) + "\n"
+
+    from src.llm import client as llm_client
+    monkeypatch.setattr(llm_client, "stream_complete", stub)
+
+    budget = translator._CallBudget(1000)
+    output, _fallback_count = await translator._translate_group(
+        lines, _RU, _PROMPT, depth=0, budget=budget, source_lang="en",
+    )
+
+    untranslated = [
+        i for i, (src, out) in enumerate(zip(lines, output, strict=True)) if src == out
+    ]
+
+    # The observed boundary must match the CONTENT boundary (50, 110) —
+    # not any of 139's bisection cut points (69, 34, 35, 17, 18, ...).
+    # This is what actually happens: bisection only decides WHEN to
+    # retry (on a verification failure), never WHERE the model's own
+    # echo/translate/garble behavior changes within a call that verifies
+    # fine as a whole. So the hypothesis in the live-data comment above
+    # does NOT hold as a general mechanism — a boundary that happens to
+    # sit near a bisection cut point (like the observed ~34) is
+    # coincidental, not caused by "deterministic bisection-in-half
+    # applied twice".
+    assert untranslated[0] == 0
+    assert untranslated[-1] == n - 1
+    # The echoed prefix (content-driven) survives untouched...
+    assert set(range(0, echo_end)) <= set(untranslated)
+    # ...but genuinely translated lines in between must NOT appear as
+    # "untranslated" just because they sit near a bisection cut point.
+    assert 60 not in untranslated
+    assert 100 not in untranslated
+
+
+# ---------------------------------------------------------------------------
 # _stream_group — streaming loop guard
 # ---------------------------------------------------------------------------
 

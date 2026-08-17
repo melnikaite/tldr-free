@@ -416,10 +416,53 @@ honest `partial` status, never a silently dropped chunk.
    group's lines carry a marker, `_align_translation` drops to an
    emptiness/degeneration check only. Bisection and the `partial` outcome
    still apply on top of that weaker check.
-7. **Pause-aware**: between groups (`_checkpoint_pause_translation`) and
+7. **Structural verification alone can't tell a translation from a
+   copy — closed with a GROUP-level echo check.** Everything above
+   (markers match, no repetition loop, no degenerate run) is satisfied by
+   a model that just echoes its input back. Measured live on job
+   `cWiAdufn-6j8` (139-line English transcript → Russian): `qwen3-1.7b`
+   returned 139/139 lines byte-identical to the source and the old check
+   accepted it — status `done`, `error=null`, user sees "translated" text
+   that never was. `gemma-4-e4b-it-qat-q4_0` did it partially: 45 lines
+   identical, only 12 honestly flagged, the other 33 slipped through.
+   `_group_is_echo` compares each line's text AFTER the marker (never the
+   marker itself — that's contractually required to match, not evidence)
+   against the source, `.strip()`-normalized, and flags the group ONLY
+   when the WHOLE group matches — never per-line, since a single line
+   legitimately matching the source (a number, a proper noun, "OK",
+   "2024") is unremarkable and must not trip this. An echo verdict is fed
+   back through `_align_translation` as `None`, i.e. it is not a new
+   failure mode — it goes down the exact same
+   retry/bisection/leaf-fallback path as a missing marker or a
+   degenerate run. Two guards on top of the whole-group rule: (1) groups
+   of size 1 are never flagged — once bisection has narrowed a mismatch
+   down to a single line, that line matching the source is the NORMAL
+   case, and flagging it would stop bisection from ever converging; (2)
+   skipped when the job's `transcript_language` is known and equals the
+   target — a same-language "translation" is supposed to come back
+   identical (though `enqueue_translation` already short-circuits that
+   case before any LLM call happens). If `transcript_language` is
+   unknown (`None`), the check runs anyway rather than guessing via an
+   alphabet heuristic — `source_lang` is threaded through explicitly from
+   `Job.transcript_language` down through every bisection/retry call
+   rather than inferred.
+
+   Known residual gap, and it's a direct consequence of the size-1
+   exemption above, not an oversight: a model that echoes UNCONDITIONALLY
+   regardless of how small the ask is will, once bisection reaches
+   single-line granularity, have those lines accepted — matching a lone
+   line is indistinguishable from the legitimate case. This only bites
+   when bisection depth/budget is enough to actually reach size-1 on the
+   affected span; if it isn't (depth or the per-job call budget runs out
+   first), the whole remaining unresolved span still falls back honestly.
+   A mid-batch echo embedded inside an otherwise-successfully-verified
+   larger call (some lines echo, most translate, and the call as a whole
+   verifies fine) is also not caught by design — rule is whole-group-only,
+   deliberately, to avoid false positives on legitimate short matches.
+8. **Pause-aware**: between groups (`_checkpoint_pause_translation`) and
    inside `stream_complete(respect_pause=True)`. Same pause flag as the
    summary path.
-8. **Restart-safe**: rows left in `running` at daemon startup get
+9. **Restart-safe**: rows left in `running` at daemon startup get
    re-enqueued by `re_enqueue_running_on_startup` (called from
    `main.lifespan`) — the source text is in the DB and the language code
    is on the row, nothing external is needed. Restart-continued

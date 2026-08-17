@@ -440,8 +440,71 @@ def _has_degenerate_run(lines: list[str], threshold: int) -> bool:
     return _longest_repeat_run(lines) > threshold
 
 
+# Below this many lines, a group matching the source is normal rather than
+# suspicious: after bisection has narrowed down to a single line, that line
+# legitimately matching the original (a number, a proper noun, "OK",
+# "2024") happens all the time and is not evidence of an echo. See
+# ``_group_is_echo``.
+_ECHO_MIN_GROUP_SIZE = 2
+
+
+def _group_is_echo(
+    source_texts: list[str],
+    translated_texts: list[str],
+    *,
+    source_lang: str | None,
+    target_lang: str,
+) -> bool:
+    """True when an ENTIRE group's translated text is byte-identical
+    (modulo surrounding whitespace) to the source — the signature of a
+    model that copied its input instead of translating it (measured live:
+    qwen3-1.7b returned 139/139 lines identical to an English source
+    translated to Russian; our structural-only check accepted it).
+
+    Deliberately a GROUP-level check, not per-line: a single line
+    legitimately matching the source is unremarkable (numbers, proper
+    nouns, "OK", "2024") and happens constantly, but the model echoing the
+    WHOLE group is not — that's rule 1 of the design. Two guards keep this
+    from misfiring:
+
+    - Groups of size < ``_ECHO_MIN_GROUP_SIZE`` are never flagged. Once
+      bisection has narrowed a mismatch down to one line, that line
+      matching the original is the NORMAL case, not an echo — flagging it
+      would roll back correctly-translated short lines forever (bisection
+      would never converge).
+    - Skipped outright when ``source_lang`` is known and equals
+      ``target_lang`` — a same-language "translation" is SUPPOSED to come
+      back identical (though in practice ``enqueue_translation`` already
+      short-circuits that case before any LLM call happens). If
+      ``source_lang`` is unavailable (``None``), we do not guess via
+      alphabet heuristics — the check runs, on the theory that an unknown
+      source is more likely a detection gap than a same-language request.
+
+    ``source_texts``/``translated_texts`` must already be the comparable
+    per-line units — the text AFTER the ``[MM:SS]`` marker for
+    marker-bearing input (the marker is contractually required to match;
+    it isn't evidence either way), or the whole line for markerless input.
+    Compared with ``.strip()`` so trivial whitespace differences don't mask
+    an echo.
+    """
+    if source_lang is not None and source_lang == target_lang:
+        return False
+    if len(source_texts) < _ECHO_MIN_GROUP_SIZE:
+        return False
+    if len(source_texts) != len(translated_texts):
+        return False
+    return all(
+        s.strip() == t.strip()
+        for s, t in zip(source_texts, translated_texts, strict=True)
+    )
+
+
 def _align_translation(
-    input_lines: list[str], output_lines: list[str],
+    input_lines: list[str],
+    output_lines: list[str],
+    *,
+    source_lang: str | None = None,
+    target_lang: str = "",
 ) -> list[str] | None:
     """Verify and rebuild ``output_lines`` against ``input_lines``.
 
@@ -449,7 +512,13 @@ def _align_translation(
     - a degenerate repeated run in the output,
     - (marker-bearing input) an input marker that can't be found, forward
       of the cursor, anywhere in the output,
-    - (markerless input) an empty output.
+    - (markerless input) an empty output,
+    - the group as a whole is an ECHO of the source — see
+      ``_group_is_echo``. This is structurally indistinguishable from a
+      "perfect" translation (markers match, no repeats) but means
+      translation never actually happened; it is treated exactly like any
+      other verification failure, i.e. it goes down the same
+      retry/bisection/fallback path, never a new status.
 
     On success for marker-bearing input, returns EXACTLY
     ``len(input_lines)`` lines, each rebuilt as the INPUT's own marker
@@ -461,14 +530,20 @@ def _align_translation(
     Markerless input (the ``raw_text`` fallback source for PDF/HTML/legacy
     jobs — no ``[MM:SS]`` markers to verify against) has no way to check
     line-for-line correctness, so we accept the output as-is once it's
-    non-empty and free of a degenerate run; the returned list is whatever
-    the model produced, not necessarily ``len(input_lines)`` long.
+    non-empty, free of a degenerate run, and not a whole-group echo; the
+    returned list is whatever the model produced, not necessarily
+    ``len(input_lines)`` long.
 
     The degeneration threshold is relative to THIS input (see
     ``_degenerate_run_threshold``) — a faithful translation of a
     genuinely-repetitive source (real Whisper transcripts can legitimately
     repeat one line dozens of times) must not be rejected just because it
     repeats too.
+
+    ``source_lang``/``target_lang`` feed the echo check's same-language
+    exception (see ``_group_is_echo``) — pass the job's own
+    ``transcript_language`` explicitly rather than defaulting and letting
+    the check silently skip that exception.
     """
     if _has_degenerate_run(output_lines, _degenerate_run_threshold(input_lines)):
         return None
@@ -480,7 +555,13 @@ def _align_translation(
     marker_count = sum(1 for p in parsed_in if p is not None)
     if marker_count / len(input_lines) < _MARKERLESS_MARKER_FRACTION:
         joined = "\n".join(output_lines).strip()
-        return list(output_lines) if joined else None
+        if not joined:
+            return None
+        if _group_is_echo(
+            input_lines, output_lines, source_lang=source_lang, target_lang=target_lang,
+        ):
+            return None
+        return list(output_lines)
 
     if marker_count != len(input_lines):
         # Predominantly marked, but at least one line in THIS particular
@@ -493,9 +574,11 @@ def _align_translation(
     n_out = len(output_lines)
     cursor = 0
     result: list[str] = []
+    source_rests: list[str] = []
+    translated_rests: list[str] = []
     for parsed in parsed_in:
         assert parsed is not None
-        marker, _input_rest = parsed
+        marker, input_rest = parsed
         marker_secs = _marker_seconds(marker)
         match_idx = None
         matched_rest = ""
@@ -520,7 +603,14 @@ def _align_translation(
             text = text.rstrip() + " " + " ".join(absorbed)
 
         result.append(f"{marker}{text}")
+        source_rests.append(input_rest)
+        translated_rests.append(text)
         cursor = k
+
+    if _group_is_echo(
+        source_rests, translated_rests, source_lang=source_lang, target_lang=target_lang,
+    ):
+        return None
 
     return result
 
@@ -609,6 +699,7 @@ async def _translate_group(
     depth: int,
     budget: _CallBudget,
     on_delta: Callable[[str], None] | None = None,
+    source_lang: str | None = None,
 ) -> tuple[list[str], int]:
     """Translate ``lines`` (a group from ``pack_lines``, or a bisected
     slice of one), verifying alignment and repairing by narrowing the
@@ -626,6 +717,11 @@ async def _translate_group(
        recurse into both halves independently.
     4. Depth limit or call budget exhausted → fall back the WHOLE
        (sub-)group to source, counted.
+
+    ``source_lang`` (the job's ``transcript_language``, may be ``None`` if
+    unknown) is threaded through to ``_align_translation`` unchanged at
+    every depth so the echo check's same-language exception applies
+    consistently, including to bisected sub-groups and single-line retries.
     """
     if not lines:
         return [], 0
@@ -634,7 +730,9 @@ async def _translate_group(
         return list(lines), len(lines)
 
     output_lines = await _stream_group(lines, lang, prompt_template, on_delta=on_delta)
-    aligned = _align_translation(lines, output_lines)
+    aligned = _align_translation(
+        lines, output_lines, source_lang=source_lang, target_lang=lang.code,
+    )
     if aligned is not None:
         return aligned, 0
 
@@ -642,7 +740,9 @@ async def _translate_group(
         if not budget.try_consume():
             return list(lines), 1
         retry_output = await _stream_group(lines, lang, prompt_template, on_delta=on_delta)
-        retry_aligned = _align_translation(lines, retry_output)
+        retry_aligned = _align_translation(
+            lines, retry_output, source_lang=source_lang, target_lang=lang.code,
+        )
         if retry_aligned is not None:
             return retry_aligned, 0
         return list(lines), 1
@@ -658,10 +758,12 @@ async def _translate_group(
     # is harmless because ``_publish_pct`` only ever moves forward.
     mid = len(lines) // 2
     left_out, left_fallback = await _translate_group(
-        lines[:mid], lang, prompt_template, depth=depth + 1, budget=budget, on_delta=on_delta,
+        lines[:mid], lang, prompt_template, depth=depth + 1, budget=budget,
+        on_delta=on_delta, source_lang=source_lang,
     )
     right_out, right_fallback = await _translate_group(
-        lines[mid:], lang, prompt_template, depth=depth + 1, budget=budget, on_delta=on_delta,
+        lines[mid:], lang, prompt_template, depth=depth + 1, budget=budget,
+        on_delta=on_delta, source_lang=source_lang,
     )
     return left_out + right_out, left_fallback + right_fallback
 
@@ -703,11 +805,12 @@ async def _run(job_id: str, lang: Language) -> None:
     the backend unreachable) — a model that merely mangles its output no
     longer fails the whole job, it degrades to ``partial``.
     """
-    source_text = await _wait_for_source_text(job_id, lang.code)
-    if source_text is None:
+    waited = await _wait_for_source_text(job_id, lang.code)
+    if waited is None:
         # Job failed during extraction or was deleted; status already
         # recorded by ``_wait_for_source_text``.
         return
+    source_text, source_lang = waited
 
     _update_status(job_id, lang.code, status="running", progress_percent=0)
     _publish_translation_event(job_id, lang.code, "running", 0, None)
@@ -802,7 +905,7 @@ async def _run(job_id: str, lang: Language) -> None:
 
             output_lines, fallback_count = await _translate_group(
                 group, lang, prompt_template,
-                depth=0, budget=budget, on_delta=_on_delta,
+                depth=0, budget=budget, on_delta=_on_delta, source_lang=source_lang,
             )
             all_output_lines.extend(output_lines)
             total_fallback += fallback_count
@@ -874,8 +977,14 @@ async def _checkpoint_pause_translation() -> None:
     log.info("translator: resumed")
 
 
-async def _wait_for_source_text(job_id: str, language_code: str) -> str | None:
-    """Poll until source transcript text is available, then return it.
+async def _wait_for_source_text(
+    job_id: str, language_code: str,
+) -> tuple[str, str | None] | None:
+    """Poll until source transcript text is available, then return
+    ``(text, source_lang)`` — ``source_lang`` is the job's own
+    ``transcript_language`` (may be ``None`` if never detected), threaded
+    through explicitly so the echo check's same-language exception (see
+    ``_group_is_echo``) never has to guess.
 
     Source preference (in order):
     1. ``Job.raw_segments_json`` rendered as one-line-per-segment via
@@ -904,7 +1013,8 @@ async def _wait_for_source_text(job_id: str, language_code: str) -> str | None:
             # Prefer fine-grained segments when present.
             text = _source_text_from_job(job)
             if text:
-                return text
+                source_lang = getattr(job, "transcript_language", None)
+                return text, source_lang
             if job.status == "failed":
                 err = "parent job failed during extraction"
                 _update_status(

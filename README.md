@@ -187,6 +187,37 @@ measured on.
 
 </details>
 
+<details>
+<summary><strong>Low-memory machine?</strong> Gemma 4 E2B — measured, with caveats</summary>
+
+E2B is the smallest model this project has measured end to end, and
+`scripts/smart-install.sh` already picks it when unified memory is tight.
+Numbers from one 4-minute, 139-line English video on Apple Silicon against
+a llama.cpp/LocalAI backend, with `reasoning_effort: "none"`:
+
+| | Gemma 4 E4B | Gemma 4 E2B | Qwen3 1.7B |
+|---|---|---|---|
+| Summary (into Russian) | 16 s, accurate | 10 s, slightly shallower | 8 s, English headings, grammar slips |
+| Transcript translation en→ru | 245 s, 139/139 lines | 132 s, 101/139 — the rest flagged `partial` | 91 s, 29/139 — unusable |
+
+So **E2B is fine for summaries and Q&A, and partial for transcript
+translation**: about a quarter of the lines come back in the source
+language, honestly marked rather than silently passed off as translated.
+Below E2B translation stops working altogether.
+
+Disk: ~3.1 GB for E2B weights plus ~0.9 GB for the vision projector if you
+want video-picture Q&A (E4B: ~4.8 GB + ~0.9 GB).
+
+**`reasoning_effort` matters more than model size here.** Left unset on a
+llama.cpp/LocalAI backend, Gemma 4 spends its output budget thinking and
+the translation collapses — the same E4B run scored 139/139 lines with
+`"none"` and 25/139 with the field unset. Set it.
+
+One video, one language pair, one machine — treat these as an order of
+magnitude, not a benchmark.
+
+</details>
+
 ### Cloud backends (optional)
 
 Local is the default and needs no API key at all. If you'd rather point
