@@ -29,7 +29,7 @@ from src import paths
 
 log = logging.getLogger(__name__)
 
-DAEMON_VERSION = "0.1.0"
+DAEMON_VERSION = "1.0.0"
 DAEMON_API_VERSION = 4
 
 

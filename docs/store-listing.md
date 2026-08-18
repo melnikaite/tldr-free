@@ -262,28 +262,32 @@ in `extension/manifest.firefox.json`):
 - [x] **Icons** — all three sizes the manifest declares are present:
       `extension/public/icons/icon16.png`, `icon48.png`, `icon128.png`
       (plus a source `icon.svg`). Nothing further needed here.
-- [ ] **Screenshots** — `docs/screenshots/` currently has:
-      `sidepanel-youtube.png`, `sidepanel-pdf.png`, `sidepanel-podcast.png`,
-      `qa-video-frame.png`, `library.png`. These cover summary/timecodes,
-      PDF, podcast/Whisper, video-frame Q&A, and the library — good
-      material for the listing's image gallery. **Missing: a first-run /
-      onboarding screenshot** (what a brand-new user sees before any
-      backend is configured, e.g. the options page or a "no daemon
-      detected" state) — worth adding since the daemon-required nature of
-      the extension needs to be obvious from the listing images, not just
-      the text. None of the existing five show that.
+- [x] **Screenshots** — `docs/screenshots/` covers summary/timecodes, PDF,
+      podcast/Whisper, video-frame Q&A and the library, and now also the
+      first-run states (`sidepanel-welcome.png`, `sidepanel-welcome-model.png`)
+      so the daemon-required nature is visible in the images and not only in
+      the text. Note the size rule: store screenshots must be 1280×800 or
+      640×400, which a 400px-wide panel capture is not — the listing-ready
+      composite is `docs/store-assets/screenshot-welcome-1280x800.png`, with
+      the real panel document rendered inside it.
 - [ ] **Privacy policy** — `PRIVACY.md` (repo root) exists and is current
       (dated 2026-08-18); use its GitHub URL as the store's privacy policy
       link.
 - [x] **Manifest version** — `extension/manifest.json` and
-      `extension/manifest.firefox.json` both declare `"version": "0.1.0"`.
-      Consistent between the two; bump before each store submission per
-      Chrome Web Store's version-monotonicity requirement.
-- [ ] **Store listing assets not yet in the repo**: promotional tile
-      images (Chrome Web Store wants specific pixel-dimension promo
-      images separate from in-listing screenshots) and a category
-      selection — neither exists in code and both need to be picked by
-      hand in the dashboard.
+      `extension/manifest.firefox.json` both declare `"version": "1.0.0"`,
+      and `DAEMON_VERSION` matches so a diagnostics report doesn't show two
+      different numbers for one release. `DAEMON_API_VERSION` is deliberately
+      NOT tied to this — it tracks schema compatibility, not the release.
+      Bump before each submission per the store's version-monotonicity rule.
+- [x] **Promo tiles** — `docs/store-assets/promo-small-440x280.png` (the
+      card image) and `promo-marquee-1400x560.png` (featured placements
+      only). Brand-only by design — no fabricated UI, no screenshot
+      collage — in the palette of `docs/logo-banner.svg`. Regenerable from
+      the harnesses in that directory; see its README.
+- [ ] **Still to do by hand in the dashboard**: category selection, the
+      developer account and its one-time $5 fee, and the reviewer API key
+      (issue it with a small spend cap, paste it into the reviewer notes,
+      revoke it after approval — it must not live in this repository).
 
 ---
 

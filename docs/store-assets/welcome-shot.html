@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Renders the REAL sidepanel welcome component with the REAL panel stylesheet,
+     at side-panel width, so the screenshot shows what the extension shows. -->
+<link rel="stylesheet" href="../../extension/src/sidepanel/style.css">
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { width: 400px; }
+  #summary { padding: 12px 14px; }
+</style>
+</head>
+<body>
+  <div id="summary"></div>
+  <script type="module">
+    import { buildWelcomeView } from "../../extension/src/sidepanel/welcome.js";
+    const step = new URLSearchParams(location.search).get("step") || "daemon";
+    const health = step === "model"
+      ? { llm_backend_reachable: false, llm_backend_error: "connection refused (http://127.0.0.1:1240/v1)" }
+      : null;
+    const view = buildWelcomeView(step, health, { onCheckAgain() {}, onOpenOptions() {} });
+    document.getElementById("summary").appendChild(view);
+  </script>
+</body>
+</html>

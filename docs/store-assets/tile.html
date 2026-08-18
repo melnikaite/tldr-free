@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Chrome Web Store promo tiles. Brand-only by design: no fabricated UI, no
+     screenshot collage. Palette taken from docs/logo-banner.svg (#1a73e8 on
+     white wordmark) so the tiles match the README banner already in the repo. -->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #1a73e8; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+  }
+  body.small  { width: 440px;  height: 280px; flex-direction: column; justify-content: center; text-align: center; padding: 26px 24px; }
+  body.large  { width: 1400px; height: 560px; flex-direction: row; gap: 72px; padding: 0 96px; }
+
+  .word { font-weight: 900; letter-spacing: -0.03em; line-height: 0.92; }
+  .free { font-weight: 600; opacity: 0.72; letter-spacing: 0.02em; }
+  .tag  { font-weight: 500; line-height: 1.32; }
+  .sub  { font-weight: 400; opacity: 0.78; line-height: 1.4; }
+
+  .small .word { font-size: 82px; }
+  .small .free { font-size: 26px; margin-top: 2px; }
+  .small .tag  { font-size: 17px; margin-top: 16px; max-width: 360px; }
+
+  .large .brand { flex: 0 0 auto; }
+  .large .word { font-size: 190px; }
+  .large .free { font-size: 56px; margin-top: 4px; }
+  .large .copy { flex: 1 1 auto; }
+  .large .tag  { font-size: 42px; max-width: 700px; }
+  .large .sub  { font-size: 25px; margin-top: 22px; max-width: 700px; }
+</style>
+</head>
+<body>
+<script>
+  const size = new URLSearchParams(location.search).get("size") || "small";
+  document.body.className = size;
+  const brand = `<div class="brand"><div class="word">TLDR</div><div class="free">free</div></div>`;
+  if (size === "small") {
+    document.body.innerHTML = brand +
+      `<div class="tag">Summaries, subtitles, translation and Q&amp;A — on your own machine.</div>`;
+  } else {
+    document.body.innerHTML = brand +
+      `<div class="copy">` +
+      `<div class="tag">Summaries, subtitles, translation and Q&amp;A for pages, PDFs, audio and video.</div>` +
+      `<div class="sub">Runs against a model on your own machine — free, and nothing leaves it. Or bring your own cloud key. Open source.</div>` +
+      `</div>`;
+  }
+</script>
+</body>
+</html>

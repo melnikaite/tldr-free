@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TLDR free",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Summaries, subtitles, translation and Q&A for pages, PDFs, audio and video. Free and 100% private on your own machine.",
   "browser_specific_settings": {
     "gecko": {
