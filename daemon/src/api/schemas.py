@@ -731,3 +731,100 @@ class ConfigTestResponse(BaseModel):
     latency_ms: int | None = None
     steps: list[ConfigTestStepResult] = []
     suggestions: ConfigTestSuggestions = Field(default_factory=ConfigTestSuggestions)
+
+
+# ---------------------------------------------------------------------------
+# GET /diagnostics — a report meant to leave the machine (pasted into a
+# GitHub issue), so its shape is dictated entirely by what must NEVER be in
+# it. See src/api/diagnostics.py for the scrubbing this response is built
+# through — this model only documents the result.
+# ---------------------------------------------------------------------------
+
+
+class DiagnosticsJobInfo(BaseModel):
+    """Metadata for the single job requested via ``?job_id=`` — deliberately
+    everything BUT the content: no ``title``, ``url``, ``raw_text``, or
+    ``summary_md``. ``error`` is scrubbed the same way the log tail is (see
+    ``diagnostics.py#_scrub``) since a transcript/page error message can
+    itself contain a URL or a home-directory path."""
+    job_id: str
+    kind: str
+    status: str
+    progress_stage: str | None
+    error: str | None
+    transcript_source: str | None
+
+
+class DiagnosticsLLMConfigOut(BaseModel):
+    """``LLMConfigOut`` minus ``api_key_hint`` — see
+    ``DiagnosticsConfigOut`` for why the hint is dropped rather than just
+    scrubbed. ``base_url`` is passed through ``diagnostics.py``'s
+    ``_redact_api_keys`` (but NOT ``_redact_urls``): a configured backend
+    address is exactly the kind of thing a diagnosis needs (local or
+    cloud), unlike a page/video URL the user processed."""
+    base_url: str
+    model: str
+    context_length: int
+    single_pass_token_limit: int
+    max_concurrent_calls: int
+    reasoning_effort: str | None
+    api_key_set: bool
+    api_key_source: ApiKeySource
+
+
+class DiagnosticsWhisperConfigOut(BaseModel):
+    """``WhisperConfigOut`` minus ``api_key_hint`` — see
+    ``DiagnosticsLLMConfigOut``."""
+    base_url: str
+    model: str
+    max_upload_mb: int
+    api_key_set: bool
+    api_key_source: ApiKeySource
+
+
+class DiagnosticsConfigOut(BaseModel):
+    """Same information as ``ConfigResponse``, minus what a report leaving
+    the machine must never carry:
+
+    - ``api_key_hint`` (either section) is DROPPED, not merely redacted.
+      It exists in ``GET /config`` so the options-page UI can show "key
+      ending in ...XXXX" — useful there because the user already knows
+      their own key and is just confirming which one is saved. In a
+      diagnostics report read by a stranger it answers no question
+      ``api_key_set`` doesn't already answer, while being 4 real
+      characters of a live secret. Dropping the field is also
+      structurally stronger than nulling it — nothing has to remember to
+      scrub it, because it was never on this model to begin with.
+    - ``config_path``/``overrides_path`` are scrubbed (home directory →
+      ``~``) rather than dropped — they're absolute filesystem paths on
+      the reporter's own machine, useful for "which file did you edit",
+      but the leading ``/Users/<name>`` leaks the account name otherwise.
+    """
+    llm: DiagnosticsLLMConfigOut
+    whisper: DiagnosticsWhisperConfigOut
+    output: OutputConfigOut
+    storage: StorageConfigOut
+    config_path: str
+    overrides_path: str
+    keychain_available: bool
+
+
+class DiagnosticsResponse(BaseModel):
+    """Everything ``GET /diagnostics`` hands back for the user to review and
+    paste into a bug report themselves — nothing here is ever sent anywhere
+    by the daemon. See the module docstring of ``src/api/diagnostics.py``
+    for the full list of what's deliberately excluded.
+    """
+    daemon_version: str
+    python_version: str
+    platform: str
+    health: HealthResponse
+    config: DiagnosticsConfigOut
+    # Already scrubbed (see diagnostics.py#_scrub) — home paths replaced with
+    # "~", non-local URLs replaced with a placeholder, either API key
+    # redacted if it somehow ended up in a log line.
+    log_tail: str
+    # status -> count, e.g. {"done": 12, "failed": 1}.
+    job_status_summary: dict[str, int]
+    # Populated only when the request carried ?job_id=; null otherwise.
+    job: DiagnosticsJobInfo | None = None

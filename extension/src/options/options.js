@@ -20,6 +20,27 @@ const daemonUrlInput = /** @type {HTMLInputElement} */ (document.getElementById(
 const saveDaemonBtn = /** @type {HTMLButtonElement} */ (document.getElementById("save-daemon"));
 const daemonStatusEl = /** @type {HTMLElement} */ (document.getElementById("daemon-status"));
 
+// --- Diagnostics section ------------------------------------------------
+
+const buildDiagnosticsBtn = /** @type {HTMLButtonElement} */ (
+  document.getElementById("build-diagnostics")
+);
+const diagnosticsStatusEl = /** @type {HTMLElement} */ (
+  document.getElementById("diagnostics-status")
+);
+const diagnosticsActionsEl = /** @type {HTMLElement} */ (
+  document.getElementById("diagnostics-actions")
+);
+const copyDiagnosticsBtn = /** @type {HTMLButtonElement} */ (
+  document.getElementById("copy-diagnostics")
+);
+const saveDiagnosticsBtn = /** @type {HTMLButtonElement} */ (
+  document.getElementById("save-diagnostics")
+);
+const diagnosticsReportEl = /** @type {HTMLTextAreaElement} */ (
+  document.getElementById("diagnostics-report")
+);
+
 // --- Settings section (LLM / Whisper / Output) -------------------------
 
 const settingsFieldset = /** @type {HTMLFieldSetElement} */ (
@@ -825,6 +846,55 @@ saveDaemonBtn.addEventListener("click", async () => {
   // different) daemon at the new address.
   await loadSettings();
   await refreshLlmModelList();
+});
+
+// Report text currently shown, so Copy/Save act on exactly what the user
+// is looking at rather than re-fetching (and potentially getting a
+// different job_status_summary mid-review).
+let lastDiagnosticsText = "";
+
+buildDiagnosticsBtn.addEventListener("click", async () => {
+  diagnosticsStatusEl.textContent = "Building…";
+  diagnosticsStatusEl.className = "hint";
+  diagnosticsActionsEl.hidden = true;
+  diagnosticsReportEl.hidden = true;
+  buildDiagnosticsBtn.disabled = true;
+  try {
+    const report = await daemon.getDiagnostics();
+    lastDiagnosticsText = JSON.stringify(report, null, 2);
+    diagnosticsReportEl.value = lastDiagnosticsText;
+    diagnosticsReportEl.hidden = false;
+    diagnosticsActionsEl.hidden = false;
+    diagnosticsStatusEl.textContent =
+      "Report built below. Nothing is sent anywhere — review it, then copy or save it yourself.";
+    diagnosticsStatusEl.className = "hint";
+  } catch (err) {
+    diagnosticsStatusEl.textContent = `Failed to build report: ${formatRequestError(err)}`;
+    diagnosticsStatusEl.className = "hint err";
+  } finally {
+    buildDiagnosticsBtn.disabled = false;
+  }
+});
+
+copyDiagnosticsBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(lastDiagnosticsText);
+    diagnosticsStatusEl.textContent = "Copied to clipboard.";
+    diagnosticsStatusEl.className = "hint ok";
+  } catch (err) {
+    diagnosticsStatusEl.textContent = `Copy failed: ${err instanceof Error ? err.message : String(err)}`;
+    diagnosticsStatusEl.className = "hint err";
+  }
+});
+
+saveDiagnosticsBtn.addEventListener("click", () => {
+  const blob = new Blob([lastDiagnosticsText], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tldr-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 });
 
 (async function init() {

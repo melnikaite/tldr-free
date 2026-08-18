@@ -22,7 +22,13 @@ from pydantic import ValidationError
 
 from src import config as config_mod
 
-_MINIMAL_YAML = """
+
+def _minimal_yaml(data_dir: Path) -> str:
+    # `data_dir` is unused by any assertion in this file (it's here only
+    # because Config requires a value) — always the test's own tmp_path
+    # rather than a shared literal like "/tmp" regardless, on general
+    # principle (see the incident writeup in `.claude/ops.md`).
+    return f"""
 llm:
   base_url: http://127.0.0.1:1240/v1
   api_key: dummy
@@ -36,9 +42,9 @@ whisper:
   model: whisper
 output:
   language: en
-youtube: {}
+youtube: {{}}
 storage:
-  data_dir: /tmp
+  data_dir: {data_dir}
   db_filename: tldr.db
 """.strip()
 
@@ -48,7 +54,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Fresh template at tmp_path/tldr.yaml; overrides at the sibling
     tldr.local.yaml (not yet created). Returns the template path."""
     config_file = tmp_path / "tldr.yaml"
-    config_file.write_text(_MINIMAL_YAML)
+    config_file.write_text(_minimal_yaml(tmp_path))
     overrides_file = tmp_path / "tldr.local.yaml"
 
     monkeypatch.setenv("TLDR_CONFIG", str(config_file))

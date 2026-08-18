@@ -13,9 +13,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api import ai, events, health, jobs, workers
+from src.api import ai, diagnostics, events, health, jobs, workers
 from src.api import config as config_api
 from src.config import DAEMON_VERSION, get_config
+from src.logging_setup import configure_logging
 from src.storage import repo
 from src.storage.db import dispose_engine, init_engine
 from src.storage.migrations import run_migrations
@@ -29,10 +30,7 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config = get_config()
-    logging.basicConfig(
-        level=getattr(logging, config.logging.level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-    )
+    configure_logging(config)
     log.info("TLDR daemon v%s starting", DAEMON_VERSION)
 
     engine = init_engine()
@@ -105,3 +103,4 @@ app.include_router(events.router)
 app.include_router(workers.router)
 app.include_router(health.router)
 app.include_router(config_api.router)
+app.include_router(diagnostics.router)

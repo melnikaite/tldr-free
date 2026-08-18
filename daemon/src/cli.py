@@ -16,13 +16,27 @@ import logging
 import sys
 
 from src import selfupdate, service
-from src.config import DAEMON_VERSION
+from src.config import DAEMON_VERSION, get_config
+from src.logging_setup import truncate_legacy_launchd_logs_once
 
 
 def _serve(host: str, port: int) -> int:
     import threading
 
     import uvicorn
+
+    # One-time cleanup of the pre-rotation launchd log files (see
+    # logging_setup.py's docstring) — deliberately NOT in src.main's FastAPI
+    # lifespan. The lifespan also runs under `TestClient(app)` in the test
+    # suite (that's the point of a lifespan — tests exercise it like any
+    # other startup path), and truncating "whatever daemon.{out,err}.log
+    # happens to exist at storage.data_dir" is a real-filesystem side effect
+    # that has no place firing every time a test spins up the app. Doing it
+    # here instead means it only ever runs from the actual native
+    # (`tldr-daemon`) entrypoint, which the test suite never calls — making
+    # "tests truncate someone's real logs" impossible by construction
+    # rather than by every test file remembering to isolate storage.data_dir.
+    truncate_legacy_launchd_logs_once(get_config())
 
     # Native counterpart of the docker-entrypoint upgrade; no-op in Docker
     # (entrypoint sets TLDR_SKIP_PKG_UPDATE=1) and under pytest.

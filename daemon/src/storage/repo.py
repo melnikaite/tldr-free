@@ -646,6 +646,16 @@ def list_jobs(
         return rows, total
 
 
+def count_jobs_by_status() -> dict[str, int]:
+    """Job counts grouped by ``status`` — the "jobs by status" summary in
+    ``GET /diagnostics``. Deliberately just counts (no title/url/content),
+    so it's safe to include verbatim in a report meant to leave the
+    machine."""
+    with session_scope() as session:
+        stmt = select(Job.status, func.count()).group_by(Job.status)
+        return {status: int(count) for status, count in session.exec(stmt).all()}
+
+
 def find_pending_for_restart() -> list[Job]:
     """Return all jobs left in ``queued`` or ``running`` state.
 

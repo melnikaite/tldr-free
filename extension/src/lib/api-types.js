@@ -582,5 +582,88 @@
  * @property {ConfigTestSuggestions} [suggestions]
  */
 
+// ---------------------------------------------------------------------------
+// GET /diagnostics — a report meant to be pasted into a bug report by the
+// USER themselves; the daemon never sends it anywhere. Everything here has
+// already been scrubbed daemon-side (see daemon/src/api/diagnostics.py):
+// non-loopback URLs replaced with a placeholder, the home directory
+// replaced with "~", either API key redacted even as a fragment (the
+// api_key_hint field itself is dropped outright from `config`, not just
+// scrubbed — see DiagnosticsLLMConfigOut). No page title, page/video URL,
+// or transcript content is ever included at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * Metadata for the single job requested via `?job_id=` — deliberately
+ * everything BUT the content: no title, url, raw_text, or summary_md.
+ * `error` is scrubbed the same way `log_tail` is.
+ *
+ * @typedef {object} DiagnosticsJobInfo
+ * @property {string} job_id
+ * @property {JobKind} kind
+ * @property {JobStatus} status
+ * @property {string | null} progress_stage
+ * @property {string | null} error
+ * @property {TranscriptSource | null} transcript_source
+ */
+
+/**
+ * `LLMConfigOut` minus `api_key_hint` — dropped outright (not just
+ * scrubbed) since it's 4 real characters of the configured key and
+ * `api_key_set` already answers "is one configured". `base_url` is
+ * redacted only if it happens to contain the raw key itself (defense in
+ * depth) — a configured backend address is diagnostic-relevant, unlike a
+ * page/video URL, so it's NOT replaced just for being non-loopback.
+ *
+ * @typedef {object} DiagnosticsLLMConfigOut
+ * @property {string} base_url
+ * @property {string} model
+ * @property {number} context_length
+ * @property {number} single_pass_token_limit
+ * @property {number} max_concurrent_calls
+ * @property {string | null} reasoning_effort
+ * @property {boolean} api_key_set
+ * @property {ApiKeySource} api_key_source
+ */
+
+/**
+ * `WhisperConfigOut` minus `api_key_hint` — see `DiagnosticsLLMConfigOut`.
+ *
+ * @typedef {object} DiagnosticsWhisperConfigOut
+ * @property {string} base_url
+ * @property {string} model
+ * @property {number} max_upload_mb
+ * @property {boolean} api_key_set
+ * @property {ApiKeySource} api_key_source
+ */
+
+/**
+ * Same information as `ConfigResponse`, minus `api_key_hint` (either
+ * section, dropped) and with `config_path`/`overrides_path` scrubbed of
+ * the home directory (kept, not dropped — still useful without the
+ * username).
+ *
+ * @typedef {object} DiagnosticsConfigOut
+ * @property {DiagnosticsLLMConfigOut} llm
+ * @property {DiagnosticsWhisperConfigOut} whisper
+ * @property {OutputConfigOut} output
+ * @property {StorageConfigOut} storage
+ * @property {string} config_path
+ * @property {string} overrides_path
+ * @property {boolean} keychain_available
+ */
+
+/**
+ * @typedef {object} DiagnosticsResponse
+ * @property {string} daemon_version
+ * @property {string} python_version
+ * @property {string} platform
+ * @property {HealthResponse} health
+ * @property {DiagnosticsConfigOut} config
+ * @property {string} log_tail          - already scrubbed; tail of the daemon's rotating log file
+ * @property {Record<string, number>} job_status_summary  - status -> count
+ * @property {DiagnosticsJobInfo | null} [job]  - only set when ?job_id= was passed
+ */
+
 // Marker export so editors recognise this as an ES module.
 export {};

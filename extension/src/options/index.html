@@ -84,6 +84,14 @@
       }
       #test-suggestions ul { margin: 0.25rem 0 0.5rem; padding-left: 1.25rem; }
       #apply-suggestions-status { margin-left: 0.5rem; }
+      #diagnostics-report {
+        width: 100%;
+        box-sizing: border-box;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.8rem;
+        margin-top: 0.75rem;
+      }
+      #diagnostics-actions button { margin-right: 0.5rem; }
     </style>
   </head>
   <body>
@@ -218,6 +226,26 @@
 
       <button id="save-daemon">Save</button>
       <span id="daemon-status"></span>
+    </section>
+
+    <section>
+      <h2>Diagnostics</h2>
+      <p class="hint">
+        Builds a report for a bug report: daemon version, health, config
+        (secrets redacted), a scrubbed tail of the daemon's log, and a
+        summary of your jobs by status. Home paths are replaced with
+        "~" and any URL that isn't a local backend address (127.0.0.1 /
+        localhost) is redacted — no page/video URL, title, or transcript
+        content is ever included. Nothing is sent anywhere automatically;
+        you decide whether to copy or save it.
+      </p>
+      <button id="build-diagnostics" type="button">Build diagnostics report</button>
+      <div id="diagnostics-status" class="hint"></div>
+      <div id="diagnostics-actions" hidden>
+        <button id="copy-diagnostics" type="button">Copy to clipboard</button>
+        <button id="save-diagnostics" type="button">Save to file</button>
+      </div>
+      <textarea id="diagnostics-report" rows="14" readonly hidden></textarea>
     </section>
 
     <script type="module" src="./options.js"></script>

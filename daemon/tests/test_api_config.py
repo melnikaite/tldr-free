@@ -30,7 +30,13 @@ from src.main import app
 from src.storage.db import dispose_engine, init_engine
 from src.storage.migrations import run_migrations
 
-_MINIMAL_YAML = """
+
+def _minimal_yaml(data_dir: Path) -> str:
+    # `data_dir` is always the test's OWN tmp_path — never a shared literal
+    # like "/tmp" (see the incident writeup in `.claude/ops.md`: a shared
+    # or unset data_dir here resolves to a real, possibly live, daemon data
+    # directory once anything writes through `storage.data_dir`).
+    return f"""
 llm:
   base_url: http://127.0.0.1:1240/v1
   api_key: dummy
@@ -44,9 +50,9 @@ whisper:
   model: whisper
 output:
   language: en
-youtube: {}
+youtube: {{}}
 storage:
-  data_dir: /tmp
+  data_dir: {data_dir}
   db_filename: tldr.db
 """.strip()
 
@@ -54,7 +60,7 @@ storage:
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     config_file = tmp_path / "tldr.yaml"
-    config_file.write_text(_MINIMAL_YAML)
+    config_file.write_text(_minimal_yaml(tmp_path))
     overrides_file = tmp_path / "tldr.local.yaml"
 
     monkeypatch.setenv("TLDR_CONFIG", str(config_file))
@@ -142,7 +148,11 @@ def test_get_config_reports_inline_key_as_source_and_never_leaks_it(
     # api_key: "dummy" is the LLMConfig default sentinel → treated as "none".
     # Switch to a real-looking inline key via the template directly.
     config_file = tmp_path / "tldr.yaml"
-    config_file.write_text(_MINIMAL_YAML.replace("api_key: dummy\n  model: test-model", "api_key: sk-inline-AB12\n  model: test-model"))
+    config_file.write_text(
+        _minimal_yaml(tmp_path).replace(
+            "api_key: dummy\n  model: test-model", "api_key: sk-inline-AB12\n  model: test-model"
+        )
+    )
     config_mod.get_config.cache_clear()
 
     r = client.get("/config")
@@ -505,7 +515,7 @@ def test_patch_invalidates_llm_client_cache(client: TestClient) -> None:
 def test_get_config_reports_default_retention_days(client: TestClient) -> None:
     r = client.get("/config")
     assert r.status_code == 200, r.text
-    # StorageConfig default (config.py) — the fixture's _MINIMAL_YAML never
+    # StorageConfig default (config.py) — the fixture's _minimal_yaml() never
     # sets storage.retention_days, so this is the class default.
     assert r.json()["storage"]["retention_days"] == 365
 
@@ -1353,7 +1363,7 @@ def test_get_config_reports_whisper_key_state_and_never_leaks_it(
 ) -> None:
     config_file = tmp_path / "tldr.yaml"
     config_file.write_text(
-        _MINIMAL_YAML.replace(
+        _minimal_yaml(tmp_path).replace(
             "whisper:\n  base_url: http://127.0.0.1:1240/v1\n  api_key: dummy\n  model: whisper",
             "whisper:\n  base_url: http://127.0.0.1:1240/v1\n  api_key: sk-whisper-CD34\n  model: whisper",
         )

@@ -9,6 +9,7 @@ of setup; this one is for the contributor / maintainer view.
 - [First-time setup](#first-time-setup)
 - [Daily commands](#daily-commands)
 - [Reload matrix — what to do when X changed](#reload-matrix)
+- [Logs & diagnostics](#logs--diagnostics)
 - [Troubleshooting](#troubleshooting)
 - [Updating components](#updating-components)
 
@@ -60,6 +61,9 @@ daemon, and the Chrome extension loaded.
 mlx-server logs (if installed) are at `~/.mlx-server/logs/server.{out,err}.log`
 — not visible to `task logs`, which only tails the daemon container.
 
+Native (uv) installs don't have a container to tail — see
+[Logs & diagnostics](#logs--diagnostics) for where those logs live instead.
+
 ## Reload matrix
 
 Chrome and Docker don't auto-pick-up changes the same way. After editing:
@@ -76,6 +80,95 @@ Chrome and Docker don't auto-pick-up changes the same way. After editing:
 
 If you're not sure, `task down && task up` followed by the extension reload
 icon is the universal hammer.
+
+## Logs & diagnostics
+
+**Where logs live**: `<data_dir>/logs/daemon.log` (+ rotated
+`daemon.log.1` … `daemon.log.4`), written by `src/logging_setup.py`. Both
+the app's own log lines and uvicorn's access/error logging go through this
+one `RotatingFileHandler` — 5 MB per file, 4 backups, ~20 MB total ceiling
+(`LOG_MAX_BYTES`/`LOG_BACKUP_COUNT` in that module).
+
+- **Docker**: this is purely additive — `task logs` / `docker compose
+  logs` keep working exactly as before (stdout, rotated by docker's own log
+  driver); the file just gives `GET /diagnostics` something to tail inside
+  the container's data volume too.
+- **In both environments**: `uvicorn.access` never writes a request's query
+  string, only its path — `GET /jobs?url=<page>&limit=1` is logged as
+  `GET /jobs`. This isn't part of the Docker/native split above; it's
+  unconditional, because the query string here routinely IS the page/video
+  URL the user is looking at (or, worse, arbitrary text passed as another
+  parameter) — an access log with it left in is a browsing-history log,
+  not a diagnostic one.
+- **Native (uv/launchd) install**: the rotating file REPLACES stdout/stderr
+  for anything that goes through Python's `logging` module. launchd's
+  `daemon.out.log`/`daemon.err.log` (set by the LaunchAgent's
+  `StandardOutPath`/`StandardErrorPath` — see `src/service.py`) used to
+  receive everything logged and grow unbounded (no rotation possible: the
+  file is opened once by launchd itself, so renaming it out from under that
+  fd doesn't stop it from writing to the old inode). After this change
+  those two files only catch what bypasses `logging` entirely — an
+  interpreter traceback on a hard crash — so they should stay small from
+  here on.
+- **Existing installs**: the first time `tldr-daemon` (the native CLI
+  entrypoint, `src/cli.py`) runs with this code, it truncates
+  `<data_dir>/daemon.out.log`/`daemon.err.log` in place
+  (`os.truncate(..., 0)`, never delete — deleting would orphan launchd's
+  open, `O_APPEND` fd on an invisible, still-growing inode). This is a
+  ONE-TIME migration, guarded by `<data_dir>/logs/.legacy_logs_truncated`,
+  so a later crash-loop restart never wipes out a fresh traceback you
+  haven't had a chance to read yet. No backup copy is kept — those files
+  had accumulated full processed-page/video URLs with zero rotation, which
+  is precisely the problem being fixed, not something worth relocating
+  elsewhere. This truncation deliberately lives ONLY in the native CLI
+  entrypoint, not in the FastAPI app's startup — see [ops.md](ops.md#logging)
+  for why that separation matters (it's the fix for a real incident, not
+  tidiness).
+
+**Diagnostics report**: `GET /diagnostics` (add `?job_id=<id>` for one
+job's metadata — 404s if it doesn't exist), or the "Diagnostics" section on
+the extension's options page (builds the report into a read-only textarea,
+then Copy to clipboard / Save to file — nothing is ever sent anywhere
+automatically). Contains: daemon version + Python/platform info, the full
+`/health` response, the daemon config with secrets redacted (`api_key_set`/
+`api_key_source` — NOT `api_key_hint`, which `GET /config` has but
+diagnostics deliberately drops, see below), the last 300 lines of the
+rotating log, and a count of jobs by status.
+
+Everything text-shaped is scrubbed by `src/api/diagnostics.py` before it's
+returned, by construction rather than by review:
+
+- either API key is redacted even as a fragment (matched against the exact
+  resolved value, same as `POST /config/test`'s existing redaction) —
+  including `api_key_hint` itself, which is dropped from the config block
+  entirely rather than merely redacted: it carries zero diagnostic value
+  beyond what `api_key_set` already reports, while being 4 real characters
+  of the configured key;
+- the home directory is replaced with `~` — including in
+  `config.config_path`/`config.overrides_path`, which are absolute paths on
+  the reporter's own machine and otherwise leak the account name;
+- any URL that ISN'T a loopback address (`127.0.0.1`/`localhost`) is
+  replaced with a placeholder — local-backend addresses
+  (`http://127.0.0.1:1240/...`) are kept since they're exactly what a
+  diagnosis needs to see. This matches a URL whether it's written literally
+  OR percent-encoded (`https%3A%2F%2F...`) — the log tail can contain
+  either, since `uvicorn.access` used to write a request's full query
+  string (including any page URL passed as `?url=`) percent-encoded before
+  the fix described below, and older, already-rotated log files can still
+  have that on disk regardless. `config.llm.base_url`/`config.whisper.base_url`
+  are the one URL-shaped exception: a configured backend address (local or
+  cloud) is diagnostic-relevant config, not browsed content, so it's kept
+  even when non-loopback (only checked for an embedded API key, same as
+  everything else).
+
+Page/video titles, URLs, and transcript/summary content are never put into
+the response in the first place (not scrubbed — just never read) — see
+`DiagnosticsJobInfo` in `src/api/schemas.py`. Separately, `uvicorn.access`
+itself no longer writes a query string to `logs/daemon.log` at all (in
+Docker or native) — `src/logging_setup.py` strips it at the source, since
+data that's never written can't leak from a copied log file either; the
+diagnostics scrubbing above is the safety net for logs that predate that
+fix, not the primary defense.
 
 ## Troubleshooting
 

@@ -5,6 +5,7 @@
  *   AIStreamEvent,
  *   AIStreamRequest,
  *   ChatMessage,
+ *   DiagnosticsResponse,
  *   FrameFetchResponse,
  *   HealthResponse,
  *   JobCreateRequest,
@@ -435,4 +436,20 @@ export const daemon = {
    * @returns {AsyncGenerator<AIStreamEvent, void, void>}
    */
   aiQa: (req) => sseStream("/ai/qa", req),
+
+  /**
+   * Fetch a self-contained diagnostics report for the user to review and
+   * paste into a bug report THEMSELVES — the daemon never sends this
+   * anywhere on its own. Already scrubbed of anything privacy-sensitive
+   * (see api-types.js's DiagnosticsResponse and
+   * daemon/src/api/diagnostics.py) — no page/video URL, no title, no
+   * transcript content, no API key. Pass `jobId` to also get metadata
+   * (kind/status/progress_stage/error/transcript_source only) for one job;
+   * 404s if that job doesn't exist.
+   *
+   * @param {string} [jobId]
+   * @returns {Promise<DiagnosticsResponse>}
+   */
+  getDiagnostics: (jobId) =>
+    request(`/diagnostics${jobId ? `?job_id=${encodeURIComponent(jobId)}` : ""}`),
 };
