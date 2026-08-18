@@ -219,6 +219,10 @@ def test_post_jobs_youtube_without_transcript_defers(client: TestClient) -> None
             break
         time.sleep(0.05)
     assert detail["status"] == "queued", detail
+    # queued_reason (Job.queued_reason, migration v9) mirrors the reason a
+    # live "stage" event would have carried — proves a cold GET /jobs/{id}
+    # can now show it too, not just a live SSE subscriber.
+    assert detail["queued_reason"] == "transcript_unavailable", detail
 
 
 def test_get_jobs_filters_and_total(client: TestClient) -> None:

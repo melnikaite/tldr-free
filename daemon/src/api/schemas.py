@@ -230,6 +230,13 @@ class JobDetails(JobSummary):
     # one candidate. Backfilled as ``[]`` for legacy jobs created before
     # this field existed.
     alt_media_candidates: list[MediaCandidate] = []
+    # Mirrors Job.queued_reason (storage/db.py). Only meaningful when
+    # status == "queued" — one of DeferredReason's three codes explaining
+    # why the transcript fast path deferred this job to the Whisper queue.
+    # This is what lets a cold GET /jobs/{id} show the same explanation a
+    # live SSE `stage("queued", detail=...)` event would have shown a
+    # subscriber at the moment it happened.
+    queued_reason: DeferredReason | None = None
 
 
 class JobListResponse(BaseModel):

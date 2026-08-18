@@ -345,6 +345,39 @@ def _migration_v8(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v9 — Job.queued_reason
+# ---------------------------------------------------------------------------
+# workers/pipeline.py writes this when a YouTube job's transcript fast path
+# (youtube-transcript-api, then yt-dlp captions) is exhausted and the job is
+# about to be handed to the deferred Whisper queue — one of
+# api.schemas.DeferredReason's three string values (transcript_unavailable /
+# transcript_blocked / network_error). Previously that reason only ever
+# reached a live SSE ``stage`` event; a side panel that opened after the job
+# had already settled into ``queued`` had no way to recover it. This column
+# is what lets a cold ``GET /jobs/{id}`` show the same explanation.
+#
+# Null for every pre-existing row and for every job that never parked this
+# way (media jobs dropped straight onto Whisper via ``_run_media`` never had
+# a reason to begin with). Cleared back to ``None`` by ``runner.py``'s
+# ``_process_one`` the moment the job actually resumes (dequeues and starts
+# downloading) — see repo.update_status's ``queued_reason`` sentinel — so it
+# never lingers on a job that later completes normally.
+
+_V9_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN queued_reason TEXT",
+)
+
+
+def _migration_v9(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V9_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -358,6 +391,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (6, _migration_v6),
     (7, _migration_v7),
     (8, _migration_v8),
+    (9, _migration_v9),
 ]
 
 

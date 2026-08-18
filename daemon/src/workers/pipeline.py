@@ -296,6 +296,7 @@ async def _run_youtube(
                 job_id,
                 status=JobStatus.QUEUED.value,
                 progress_stage="queued",
+                queued_reason=reason.value,
             )
             broker.publish(job_id, stage_event("queued", detail=reason.value))
             return

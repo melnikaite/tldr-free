@@ -196,6 +196,7 @@ def _to_details(job: Any) -> JobDetails:
         transcript_language=getattr(job, "transcript_language", None),
         transcript_translations=translations,
         alt_media_candidates=alt_candidates,
+        queued_reason=getattr(job, "queued_reason", None),
     )
 
 

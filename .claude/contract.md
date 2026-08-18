@@ -20,6 +20,16 @@ frame_url) is one instance of this rule, not an exception to it:
 JSDoc typedefs are kept in step the same manual way as everything else
 mirrored here.
 
+`Job.queued_reason` (`storage/db.py`, migration v9) ↔
+`JobDetails.queued_reason` (`schemas.py`) ↔ `JobDetails.queued_reason`
+JSDoc (`api-types.js`) is another instance. It uses the same `_UNSET`
+sentinel trick as `transcript_missing_seconds` in `storage/repo.py`
+(`update_status`'s `queued_reason` kwarg) because it has to be able to
+regress from set back to unset: `workers/pipeline.py` sets it when a
+YouTube job's transcript fast path defers to Whisper,
+`workers/runner.py`'s `_process_one` clears it back to `None` the moment
+that job actually resumes.
+
 ## The export bundle is a second, slower-moving contract
 
 `storage/bundle.py`'s zip format has its own `version` in `manifest.json`,

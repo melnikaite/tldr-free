@@ -115,6 +115,21 @@ class Job(SQLModel, table=True):
     # repo.mark_done write it unconditionally when the Whisper runner
     # passes it, unlike the other optional fields on this model).
     transcript_missing_seconds: float | None = None
+    # Written by workers/pipeline.py when a YouTube job's transcript fast
+    # path (youtube-transcript-api, then yt-dlp captions) is exhausted and
+    # the job is about to be handed to the deferred Whisper queue — one of
+    # api.schemas.DeferredReason's three string values
+    # (transcript_unavailable / transcript_blocked / network_error).
+    # ``None`` for every job that never parked this way (a media job that
+    # drops straight onto Whisper via pipeline._run_media never had a
+    # reason). Critically, this is cleared back to ``None`` the next time
+    # the job actually resumes — runner.py's ``_process_one`` clears it
+    # unconditionally at the point it dequeues and starts real work — so it
+    # never lingers on a job that later completes normally. Same
+    # "must be able to regress from set back to unset" shape as
+    # ``transcript_missing_seconds`` above, which is why repo.py reuses the
+    # same ``_UNSET`` sentinel trick for this field too.
+    queued_reason: str | None = None
 
 
 class Message(SQLModel, table=True):

@@ -3,10 +3,13 @@
 //
 //   - classifyError(rawMessage, health) — job.error / a stringified
 //     fetch-thrown error, for the sidepanel's "error" render state.
-//   - describeQueuedDetail(detail) — a live "stage" event's `detail` when
-//     `stage === "queued"`, for the sidepanel's "streaming" render state
-//     (the job is PARKED, not dead — see that function's docstring for
-//     why this can never be folded into classifyError).
+//   - describeQueuedDetail(detail) — a "queued"-stage `detail` string, for
+//     the sidepanel's "streaming" render state (the job is PARKED, not
+//     dead — see that function's docstring for why this can never be
+//     folded into classifyError). Fed either from a live "stage" event or
+//     from `JobDetails.queued_reason` on a cold `GET /jobs/{id}` load —
+//     both carry the same DeferredReason string, so one function handles
+//     both.
 //
 // See extension.md's error-hint section (if you add an invariant here,
 // mirror it there).
@@ -241,13 +244,17 @@ export function classifyError(rawMessage, health) {
 // pattern as daemon/tests/test_api_jobs.py's
 // test_post_jobs_youtube_without_transcript_defers) confirmed the
 // broker really does publish `{type: "stage", stage: "queued", detail:
-// "transcript_unavailable", ...}`, and confirmed a subsequent
-// `GET /jobs/{id}` carries no trace of the reason anywhere (JobDetails
-// has no field for it — see api/schemas.py). So a job that already sat
-// down as "queued" before the panel (re)opened has no reason to show at
-// all; this can only ever fire for a panel that's live-subscribed via
-// GET /events at the moment the pipeline defers — exactly the "stage"
-// event handling in sidepanel/app.js's `_attachStreamSubscription`.
+// "transcript_unavailable", ...}`.
+//
+// This used to mean a job that already sat down as "queued" before the
+// panel (re)opened had no reason to show at all — `GET /jobs/{id}` carried
+// no trace of it. That gap is closed: `Job.queued_reason` (daemon
+// storage/db.py, migration v9) persists the same string the "stage" event
+// carried, and `JobDetails.queued_reason` (api/schemas.py) surfaces it on
+// `GET /jobs/{id}`. sidepanel/app.js's `_attachStreamSubscription` now
+// calls this function with `job.queued_reason` at cold load, the same way
+// it calls it with a live "stage" event's `detail` — one function, one
+// rendering, regardless of which path fed it.
 //
 // This is why it's a separate function from classifyError: the job is
 // PARKED, waiting on the Whisper queue, not failed — the sidepanel must

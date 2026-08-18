@@ -1300,10 +1300,15 @@ function _attachStreamSubscription(job) {
   const timelineEl = /** @type {HTMLElement} */ (document.getElementById("phase-timeline"));
   const streamEl = /** @type {HTMLElement} */ (document.getElementById("summary-stream"));
   const initialStage = job.progress_stage || "queued";
+  // Only meaningful when initialStage === "queued" — see
+  // JobDetails.queued_reason (api-types.js) and Job.queued_reason
+  // (daemon storage/db.py). Cold GET /jobs/{id} now carries this, so a
+  // reopened panel can explain a parked job the same as a live one.
+  const initialDetail = job.queued_reason ?? undefined;
 
   /** @type {Array<{stage:string, detail:(string|undefined), status:"active"|"done"|"failed", error?:string}>} */
   const phases = [];
-  pushOrUpdatePhase(phases, initialStage, undefined);
+  pushOrUpdatePhase(phases, initialStage, initialDetail);
   renderTimeline(timelineEl, phases);
 
   // Restore any text accumulated before this subscription started.
@@ -1314,11 +1319,11 @@ function _attachStreamSubscription(job) {
   let firstDelta = acc.length === 0;
   /** @type {number | null} */
   let rafId = null;
-  setStage(initialStage);
-  // No detail is known yet at cold load — GET /jobs/{id} carries no trace
-  // of a DeferredReason (see _renderQueuedHint's docstring). Only a LIVE
-  // "stage" event below can ever populate this.
-  _renderQueuedHint(initialStage, undefined);
+  setStage(initialStage, initialDetail);
+  // Cold-load detail: job.queued_reason (only ever set while
+  // status === "queued") reuses the exact same describeQueuedDetail path
+  // a live "stage" event drives below — see _renderQueuedHint's docstring.
+  _renderQueuedHint(initialStage, initialDetail);
 
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
@@ -1509,9 +1514,10 @@ function setStage(stage, detail) {
  * Fills/hides the `#queued-hint` div (see the "streaming" render case)
  * with a human explanation of why a job is PARKED in the "queued" stage
  * — see lib/error-hints.js's `describeQueuedDetail` docstring for why
- * this is a distinct signal/function from the "error" hint, and why it
- * can only ever be populated from a live "stage" event's `detail`, never
- * from a cold `GET /jobs/{id}` load.
+ * this is a distinct signal/function from the "error" hint. Fed either
+ * from a live "stage" event's `detail`, or (cold load) from
+ * `JobDetails.queued_reason` — both funnel through this same function so
+ * there's exactly one place that renders the explanation text.
  *
  * Deliberately NOT the red `.status-block.error` styling — the job is
  * waiting, not dead. Built with textContent/createElement: this renders

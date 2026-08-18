@@ -124,8 +124,15 @@
  *   partial_summary: string | null,
  *   transcript_language: string | null,
  *   transcript_translations: TranscriptTranslationSummary[],
- *   alt_media_candidates: MediaCandidate[]
+ *   alt_media_candidates: MediaCandidate[],
+ *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null
  * }} JobDetails
+ *
+ * ``queued_reason`` mirrors daemon ``Job.queued_reason``. Only meaningful
+ * when ``status === "queued"`` — explains why the transcript fast path
+ * deferred this job to the Whisper queue. Lets a cold ``GET /jobs/{id}``
+ * show the same explanation a live "stage" SSE event would have (see
+ * ``error-hints.js``'s ``describeQueuedDetail``).
  */
 
 /**

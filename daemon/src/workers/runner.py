@@ -306,6 +306,13 @@ async def _process_one(
                 task_job_id,
                 status=JobStatus.RUNNING.value,
                 progress_stage="downloading",
+                # This is THE single unconditional transition out of
+                # status=queued (whether the job got here via the
+                # youtube-deferred-to-whisper path with a reason set, or via
+                # _run_media's direct path with none) — clear any stale
+                # queued_reason exactly once per dequeue, before real work
+                # resumes. See Job.queued_reason's comment in storage/db.py.
+                queued_reason=None,
             )
             broker.publish(task_job_id, stage_event("downloading"))
             audio_path, audio_duration = await youtube.download_audio(

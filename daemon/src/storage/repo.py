@@ -263,8 +263,19 @@ def update_status(
     status: str,
     progress_stage: str | None = None,
     error: str | None = None,
+    queued_reason: str | None = _UNSET,
 ) -> None:
     """Update status (and optionally progress_stage / error) on an existing job.
+
+    ``queued_reason`` uses the same ``_UNSET`` sentinel as
+    ``transcript_missing_seconds`` on ``mark_done``/``set_extracted``, for the
+    same reason: unlike ``progress_stage``/``error`` above (where "don't
+    touch" and "clear to falsy" don't need distinguishing), a job's queued
+    reason legitimately regresses from set back to unset — the Whisper
+    runner clears it explicitly (passing ``None``) the moment a job actually
+    resumes, and that has to be distinguishable from every other caller that
+    simply doesn't know or care about this field and shouldn't blow away a
+    value already on the row.
 
     Emits ``job_event("updated", …)`` for the Library/sidebar.
     """
@@ -277,6 +288,8 @@ def update_status(
             job.progress_stage = progress_stage
         if error is not None:
             job.error = error
+        if queued_reason is not _UNSET:
+            job.queued_reason = queued_reason
         job.updated_at = datetime.utcnow()
         session.add(job)
     _emit_updated(job_id)

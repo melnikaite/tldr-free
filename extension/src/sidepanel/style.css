@@ -820,6 +820,23 @@ body {
   border-color: var(--accent);
 }
 
+/* Whisper-coverage-gap notice (daemon Job.transcript_missing_seconds, see
+   storage/db.py) — shown when Whisper's coverage check found the
+   transcript stops short of the audio's known duration. A sibling of
+   .queued-hint's box shape, but amber (matches .lang-chip--partial's
+   #c90) instead of neutral: this is a caveat about data quality on an
+   otherwise-successful job, not a live status. */
+.transcript-missing-notice {
+  margin: 0 0 0.4rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--assistant-bg);
+  border-radius: 6px;
+  border-left: 3px solid #c90;
+  color: #c90;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
 .transcript-body {
   padding: 0.6rem 0.8rem 2rem;
   line-height: 1.5;

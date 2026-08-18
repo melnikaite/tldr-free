@@ -42,6 +42,9 @@ const langBarEl = /** @type {HTMLElement | null} */ (
 const bodyEl = /** @type {HTMLElement | null} */ (
   document.getElementById("transcript-body")
 );
+const missingNoticeEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("transcript-missing-notice")
+);
 
 // Cache of {jobId+lang → TranscriptResponse} so re-clicking a chip
 // is instant. Cleared on job switch.
@@ -109,6 +112,7 @@ _eventStream.subscribe((event) => {
     // (we don't want to bother re-fetching JobDetails just for chips).
     _job.transcript_translations = next;
     _renderChips();
+    _renderMissingNotice();
     // If the just-completed translation is the language the user is
     // looking at, refetch + re-render the body. /events doesn't carry
     // the text payload itself — translation bodies can be megabytes,
@@ -196,6 +200,7 @@ export function setJob(job) {
   // Same job, just patched fields — re-render chips off the new data
   // without re-fetching the body.
   _renderChips();
+  _renderMissingNotice();
 }
 
 /**
@@ -285,6 +290,7 @@ async function _open() {
 function _renderNoJobState() {
   if (!bodyEl) return;
   if (langBarEl) langBarEl.innerHTML = "";
+  _renderMissingNotice();
   bodyEl.innerHTML = `
     <div class="placeholder-block">
       <p class="muted small">No transcript yet — process this page to extract one.</p>
@@ -321,6 +327,7 @@ async function _showLanguage(lang) {
 
   _currentLang = lang;
   _renderChips();
+  _renderMissingNotice();
 
   const key = `${_job.id}::${lang ?? ""}`;
   let data = _textCache.get(key);
@@ -462,6 +469,37 @@ function _setTimecodeTarget(a) {
 }
 
 // ---------------------------------------------------------------------------
+// Whisper coverage-gap notice (Job.transcript_missing_seconds)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fills/hides ``#transcript-missing-notice`` with a caveat when Whisper's
+ * coverage check (daemon workers/transcribe.py) found the transcript stops
+ * short of the audio's known duration — see
+ * ``JobDetails.transcript_missing_seconds`` (api-types.js) /
+ * ``Job.transcript_missing_seconds`` (daemon storage/db.py). Hidden (no DOM
+ * change) when the value is null/0/absent. Built with textContent, not
+ * innerHTML — same convention as the rest of this module.
+ */
+function _renderMissingNotice() {
+  if (!missingNoticeEl) return;
+  const missing = _job?.transcript_missing_seconds;
+  if (!missing || missing <= 0) {
+    missingNoticeEl.classList.add("hidden");
+    missingNoticeEl.textContent = "";
+    return;
+  }
+  const amount =
+    missing < 60
+      ? `${Math.round(missing)} seconds`
+      : `${Math.round(missing / 60)} minute${Math.round(missing / 60) === 1 ? "" : "s"}`;
+  missingNoticeEl.textContent =
+    `Whisper couldn't make out roughly ${amount} of this recording — ` +
+    "the rest of the transcript should be accurate.";
+  missingNoticeEl.classList.remove("hidden");
+}
+
+// ---------------------------------------------------------------------------
 // Language chips
 // ---------------------------------------------------------------------------
 
@@ -550,6 +588,7 @@ function _renderChips() {
               },
             ];
             _renderChips();
+            _renderMissingNotice();
           }
         }
       })

@@ -87,6 +87,66 @@ def test_update_status_unknown_id_raises(isolated_db) -> None:
         repo.update_status("missing", status="failed", error="x")
 
 
+def test_update_status_sets_queued_reason(isolated_db) -> None:
+    """Passing queued_reason writes it, mirroring workers/pipeline.py's call
+    when a YouTube job's transcript fast path defers to Whisper."""
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.update_status(
+        j.id,
+        status="queued",
+        progress_stage="queued",
+        queued_reason="transcript_unavailable",
+    )
+    out = repo.get_job(j.id)
+    assert out is not None
+    assert out.queued_reason == "transcript_unavailable"
+
+
+def test_update_status_omitting_queued_reason_leaves_it_untouched(isolated_db) -> None:
+    """Sentinel behavior: a caller that doesn't pass queued_reason at all
+    (e.g. a plain status flip unrelated to the queued-reason mechanism) must
+    not clobber a value already on the row."""
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.update_status(
+        j.id,
+        status="queued",
+        progress_stage="queued",
+        queued_reason="network_error",
+    )
+    # No queued_reason kwarg at all here.
+    repo.update_status(j.id, status="queued", progress_stage="queued")
+    out = repo.get_job(j.id)
+    assert out is not None
+    assert out.queued_reason == "network_error"
+
+
+def test_update_status_clears_queued_reason_on_resume(isolated_db) -> None:
+    """Regression test: a job with queued_reason set, then a subsequent
+    update_status(..., queued_reason=None) call (simulating runner.py's
+    resume-clear in _process_one), must leave queued_reason cleared — it
+    must not get stuck forever on a job that goes on to complete normally."""
+    j = repo.create_job(url="https://x", kind="youtube")
+    repo.update_status(
+        j.id,
+        status="queued",
+        progress_stage="queued",
+        queued_reason="transcript_blocked",
+    )
+    out = repo.get_job(j.id)
+    assert out is not None
+    assert out.queued_reason == "transcript_blocked"
+
+    repo.update_status(
+        j.id,
+        status="running",
+        progress_stage="downloading",
+        queued_reason=None,
+    )
+    out2 = repo.get_job(j.id)
+    assert out2 is not None
+    assert out2.queued_reason is None
+
+
 def test_mark_done_persists_summary_and_clears_error(isolated_db) -> None:
     j = repo.create_job(url="https://x", kind="page")
     repo.update_status(j.id, status="running", error="transient")

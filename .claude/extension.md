@@ -259,10 +259,10 @@ different UI and mean different things:
   always a genuinely failed/dead job.
 - **`describeQueuedDetail(detail)`** — for the `"streaming"` render
   state's `#queued-hint` div (`app.js`'s `_renderQueuedHint()`, called
-  from the live "stage" event handler in `_attachStreamSubscription`).
-  Explains a job PARKED in `stage === "queued"` with a `detail` matching
-  one of `api.schemas.DeferredReason`'s three codes
-  (`daemon/src/api/schemas.py:69`: `transcript_unavailable`,
+  both from cold load and from the live "stage" event handler in
+  `_attachStreamSubscription`). Explains a job PARKED in `stage ===
+  "queued"` with a `detail` matching one of `api.schemas.DeferredReason`'s
+  three codes (`daemon/src/api/schemas.py:69`: `transcript_unavailable`,
   `transcript_blocked`, `network_error` — the transcript fast path
   deferred to Whisper, or the retry loop feeding it gave up). Rendered
   in a neutral `.queued-hint` box, never the error styling: the job is
@@ -287,14 +287,19 @@ run against the real pipeline (mocked network calls only, same fixture
 pattern as `daemon/tests/test_api_jobs.py`'s
 `test_post_jobs_youtube_without_transcript_defers`) confirmed the broker
 really does publish `{type: "stage", stage: "queued", detail:
-"transcript_unavailable", ...}`, and confirmed a subsequent
-`GET /jobs/{id}` carries no trace of the reason anywhere — `JobDetails`
-has no field for it. So these codes can only ever be shown to a panel
-that is live-subscribed via `GET /events` at the exact moment the
-pipeline defers; a panel that opens/reopens after a job has already
-settled into `queued` has no way to know why (this is a real, currently
-unfixed gap — not something the extension can paper over without the
-daemon persisting the reason somewhere `GET /jobs/{id}` can read).
+"transcript_unavailable", ...}`.
+
+A cold-load gap used to exist here — `GET /jobs/{id}` carried no trace of
+the reason, so a panel that opened/reopened after a job had already
+settled into `queued` couldn't say why. That's fixed: `Job.queued_reason`
+(daemon `storage/db.py`, migration v9) persists the same string the
+`stage` event carries, and `JobDetails.queued_reason` (`api/schemas.py`)
+surfaces it on `GET /jobs/{id}`. `_attachStreamSubscription` now passes
+`job.queued_reason` into `pushOrUpdatePhase`/`setStage`/
+`_renderQueuedHint` at cold load, the same way it passes a live event's
+`detail` — one function renders both. `DeferredReason` still never
+reaches `job.error`/`classifyError`, which is why these remain two
+functions, not one.
 
 Invariants if you touch this:
 
