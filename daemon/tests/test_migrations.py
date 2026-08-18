@@ -51,7 +51,7 @@ def _trigger_names(engine) -> set[str]:
 def test_migrations_create_core_tables(fresh_engine) -> None:
     """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1, 2, 3, 4, 5, 6, 7]
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8]
 
     tables = _table_names(fresh_engine)
     for required in ("job", "message", "transcript_translation", "_migrations"):
@@ -80,12 +80,14 @@ def test_migrations_create_core_tables(fresh_engine) -> None:
     assert "frame_refs_json" in message_cols
     # v7 added job.added_at
     assert "added_at" in job_cols
+    # v8 added job.transcript_missing_seconds
+    assert "transcript_missing_seconds" in job_cols
 
 
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1, 2, 3, 4, 5, 6, 7]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8]
     assert second == []  # nothing new to apply
 
     tables = _table_names(fresh_engine)
@@ -111,10 +113,9 @@ def test_migration_runner_is_idempotent(fresh_engine) -> None:
 
 def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
-    v5 (as if this code predated v6), then upgrade — v6 (and, since this
-    fixture stops at v5, v7 right behind it — there's nothing between them
-    to stop at) should apply, and frame_refs_json must land without
-    touching anything else."""
+    v5 (as if this code predated v6), then upgrade — v6 and every migration
+    added since (v7, v8 — there's nothing between them to stop at) should
+    apply, and frame_refs_json must land without touching anything else."""
     v1_through_v5 = [m for m in MIGRATIONS if m[0] <= 5]
     assert [v for v, _ in v1_through_v5] == [1, 2, 3, 4, 5]
 
@@ -141,9 +142,9 @@ def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
         raw.close()
     assert "frame_refs_json" not in cols_before
 
-    # The upgrade: v6 and v7 are both new from this v5 baseline.
+    # The upgrade: v6, v7, and v8 are all new from this v5 baseline.
     applied = run_migrations(fresh_engine)
-    assert applied == [6, 7]
+    assert applied == [6, 7, 8]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -193,8 +194,9 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
     """Simulates every real pre-existing daemon install: stop the runner at
     v6 (as if this code predated v7), insert several rows with DIFFERENT
     created_at values using only the v1-v6 schema (no added_at column exists
-    yet), then upgrade — only v7 should apply, and every row's added_at
-    must equal ITS OWN created_at, not a single backfill-time value."""
+    yet), then upgrade — v7 and every migration added since (v8) should
+    apply, and every row's added_at must equal ITS OWN created_at, not a
+    single backfill-time value."""
     v1_through_v6 = [m for m in MIGRATIONS if m[0] <= 6]
     assert [v for v, _ in v1_through_v6] == [1, 2, 3, 4, 5, 6]
 
@@ -239,7 +241,7 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
     assert "added_at" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [7]
+    assert applied == [7, 8]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -257,6 +259,80 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
         assert stored_created_at == created_at
         # Backfilled to ITS OWN created_at, not a single shared timestamp.
         assert stored_added_at == created_at
+
+
+# ---------------------------------------------------------------------------
+# v8 regression — same class of bug the v6/v7 tests above guard against: a
+# DB that already ran v1-v7 (every real pre-existing install as of the
+# transcript-coverage feature) must pick up ONLY v8 on the next start, and
+# the actual write path (repo.set_extracted / repo.mark_done persisting a
+# coverage shortfall) must work against the freshly-upgraded schema.
+# ---------------------------------------------------------------------------
+
+
+def test_v8_applies_alone_on_a_db_already_at_v7(fresh_engine) -> None:
+    """Simulates every real pre-existing daemon install: stop the runner at
+    v7, then upgrade — only v8 should apply, and transcript_missing_seconds
+    must land without touching anything else."""
+    v1_through_v7 = [m for m in MIGRATIONS if m[0] <= 7]
+    assert [v for v, _ in v1_through_v7] == [1, 2, 3, 4, 5, 6, 7]
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(_MIGRATIONS_TABLE_DDL)
+        cur.close()
+        for version, migration in v1_through_v7:
+            migration(raw)
+            _record_applied(raw, version)
+        raw.commit()
+    finally:
+        raw.close()
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_before = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "transcript_missing_seconds" not in cols_before
+
+    applied = run_migrations(fresh_engine)
+    assert applied == [8]
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_after = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "transcript_missing_seconds" in cols_after
+
+    # End-to-end: a Whisper job flagged incomplete, and a later successful
+    # retry clearing that flag — both write paths that broke before v8.
+    job = repo.create_job(url="https://x", kind="youtube")
+    repo.set_extracted(
+        job.id,
+        raw_text="partial transcript",
+        transcript_source="whisper",
+        transcript_missing_seconds=360.0,
+    )
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.transcript_missing_seconds == 360.0
+
+    repo.mark_done(
+        job.id,
+        raw_text="full transcript",
+        summary_md="summary",
+        transcript_source="whisper",
+        transcript_missing_seconds=None,
+    )
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.transcript_missing_seconds is None
 
 
 def test_pragmas_are_applied(fresh_engine) -> None:

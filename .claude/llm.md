@@ -219,6 +219,254 @@ changes needed in `runner.py` or elsewhere. Intentionally NOT applied to the
 YouTube caption fast path (`pipeline.py`), which builds segments directly
 from `youtube-transcript-api`/yt-dlp and is measured clean.
 
+## Transcript coverage: a "done" job can still be silently short
+
+Measured live TWICE on the same ~21.5 min video, two different failures:
+
+- Job `3IXBfawKZrj7` (chunked upload): Whisper decode-looped 205 s into a
+  648 s chunk, repeating an already-said sentence for the rest of the
+  chunk. The collapse above correctly folded that run down to one segment
+  near the START of the gap — nothing checked that the run then continued
+  to the chunk's own end, so ~6 minutes of real speech afterward vanished.
+- Job `Y7odGFeN7agb` (same video, re-run on an earlier version of this
+  fix, single-request upload — the file fit under the cap, no chunking at
+  all): Whisper produced normal speech to 728.9 s, then nothing until one
+  stray one-word segment ("2025.") at 1290.9 s of a 1291.6 s file — 9m22s
+  missing from the MIDDLE, with one trailing word dragging the last
+  segment's `end` to within a second of the real duration.
+
+The first version of this check compared only the LAST kept segment's
+`end` against the known duration, and the second case is exactly why
+that's wrong: that shape reads as ~100% covered by an end-of-last-segment
+test while 52% of the audio's actual runtime (669 s of 1292 s) produced
+nothing. The hole isn't reliably at the tail, and chunking isn't the
+cause either — the two failures happened at different timestamps on
+different upload paths against the exact same file, so this has to work
+identically whether or not the file got chunked.
+
+`workers/transcribe.py` checks this deterministically instead of
+trusting the model — but, as of this rewrite, with **no size-based
+correctness threshold at all**. An earlier version flagged a unit as
+short only when its worst gap exceeded a fixed 90s, on the theory that
+short gaps are "probably fine". That conflates two different questions:
+how much a false positive costs (one extra, bounded Whisper call —
+cheap) versus whether content actually went missing, which no size
+threshold can answer, only guess. A real measured loss of ~40s — well
+under that old 90s cutoff — would have passed through silently; it's
+exactly the shape the rewrite below closes.
+
+**Every suspicious interval gets re-transcribed and re-checked; the
+question "was this actually speech?" is answered by what comes back, not
+by how big the hole was.** Two sources feed the suspicious-interval list,
+merged (`_merge_intervals`, so an overlap between the two isn't
+double-counted):
+
+- `timecodes.collapse_repeated_segments` now returns `(kept_segments,
+  discarded_runs)` — `discarded_runs` is a list of `DiscardedRun(start,
+  end)`, the EXACT span of segments a collapsed run threw away (the run's
+  first occurrence is kept; `start`/`end` bound everything from the
+  second occurrence's own start through the last occurrence's own end).
+  This is known precisely at the moment collapse discards it — no
+  arithmetic guessing required downstream.
+- `_find_gaps` remains as a safety net for the shape a discarded run
+  can't cover: Whisper returning nothing at all for a span, with no
+  repeat-run for collapse to have discarded anything from (the measured
+  `Y7odGFeN7agb` case — a stray trailing segment, no repeat loop
+  involved).
+
+The only threshold left, `_MIN_RECHECK_SECONDS` (~5s), is a **cost
+regulator, not a correctness gate**: an interval below it isn't
+re-transcribed at all (an ordinary breath/pause isn't worth a Whisper
+call), but there is no size above it that's treated as "probably fine" —
+every interval that clears it gets checked, regardless of how far above
+5s it sits. Getting this constant slightly wrong costs a few extra cheap
+Whisper calls in one direction, or checking a few more short-but-real
+pauses in the other — never a silently-accepted content loss the way the
+old 90s threshold could.
+
+**Deciding "was that actually speech?" — and a regression from getting
+this distinction wrong.** A first version of this rewrite folded a
+degenerate repeated run (a hallucination loop reproducing on the recheck
+itself) into the same "not speech" verdict as confirmed silence. That
+shipped, ran on the same measured video, and made things WORSE than
+before this whole feature existed: a 562s hole that provably contained
+live dialogue (manually verified: 20s hand-transcribed at the same
+offset came back with real conversation) got reported as "not lost
+content" with `missing_seconds` silently going to 0/`None` — coverage
+dropped from 88% to 52% while the job LOOKED clean. The reasoning error:
+"a loop means it's not real content" is backwards. A loop means the
+recheck reproduced the SAME kind of failure the original transcription
+had — we still don't know what's there, which is a different, weaker
+claim than "confirmed no speech". Silence and "still unknown" must never
+share a verdict.
+
+So the classification is now explicitly THREE-way, split across two
+independent checks:
+
+- `_is_confirmed_silence` — the ONLY verdict allowed to exclude a window
+  from `missing_seconds` and log "not lost content". Structural, in
+  order: (1) empty/whitespace-only → confirmed silence; (2) only
+  punctuation/dash characters (a bare `-`) → confirmed silence; (3) the
+  text as a WHOLE is made of bracket/asterisk/paren annotations
+  (`*Dramatic music*`, `[Musik]`, `(laughs)`) → confirmed silence (real
+  dialogue with an incidental parenthetical aside does not match — the
+  whole text has to be annotations, not merely contain one). Matching
+  structure rather than known phrases matters here too — measured live,
+  one backend produced 172 CONSECUTIVE `*Musik*` segments over a musical
+  stretch where a different backend said `*Dramatic music*` once for the
+  same kind of audio.
+- A degenerate repeated run, checked SEPARATELY by `_ensure_coverage`
+  itself via `collapse_repeated_segments` directly on the recheck's own
+  segments (not folded into `_is_confirmed_silence`): NEVER added to
+  `missing_seconds`'s exclusion list, NEVER logged as "not lost". What
+  DOES survive is `collapse_repeated_segments`'s own first-occurrence
+  rule — usually the real content recognized before the loop took over —
+  spliced in exactly like real speech, rather than discarding the whole
+  slice. The remainder past that point stays exactly as suspicious as
+  before: either re-sliced-and-retried within budget, or, honestly,
+  still counted as missing.
+- Otherwise (real speech): spliced in in full.
+
+A window confirmed silent is left untouched (whatever was there — the
+collapsed representative segment, or nothing — stays). A window that
+can't even be re-checked (ffmpeg unavailable to cut it, or the budget
+below ran out before reaching it) conservatively counts as missing too —
+not knowing what's there is not the same as confirming it's fine.
+
+**The recheck's own ASK SIZE matters, not just whether one happens.** The
+same live incident above traced back to a second cause: `_ensure_coverage`
+was cutting and re-sending the ENTIRE suspicious interval in one request
+— 562s in that case — which reproduces the exact conditions Whisper
+already failed under (a long, hard-to-track request is what triggers a
+decode loop in the first place), so of course it fails the same way
+again. The manual 20s probe worked precisely because it was short.
+`_MAX_RECHECK_SLICE_SECONDS` (90s) caps how much audio ANY single recheck
+request may cover; a suspicious interval longer than that is split into
+consecutive slices (`_split_into_slices`) and rechecked slice by slice,
+never as one oversized ask. 90s sits comfortably above the 20s probe
+(real margin, not a bare minimum) while staying far below both measured
+failure sizes — roughly 2x clear of the 205s chunk-internal decode loop
+and 6x clear of the 562s regression — and divides that worst measured
+hole into a manageable ~7 slices. Only the FIRST slice of an oversized
+interval is eligible for the leading-edge `_PREFIX_DISTRUST_SECONDS`
+widening below — an internal split point between two slices of the same
+interval is an artificial chop point we introduced, not a genuine gap
+edge Whisper actually drifted before, so widening there would just
+re-transcribe extra already-good audio for no reason.
+
+**Rechecks are budgeted and memoized, not merely counted per-gap.**
+`_MAX_COVERAGE_RECHECKS` (12) bounds the number of Whisper calls per unit
+of work (the single request, or one chunk) — ONE shared counter across
+every slice of every suspicious interval in the unit, deliberately: it's
+what stops one oversized hole's slicing from silently consuming the
+entire budget and starving every other suspicious interval in the same
+unit, since once an interval's own slices are all checked it stops
+competing for budget. A slice already rechecked this call is never asked
+again (a `checked` set keyed by rounded `(start, end)`) — the same
+"don't ask a deterministic decoder the same question twice" discipline
+`workers/translator.py` uses for its bisection retries. Together these
+guarantee the loop terminates regardless of how many distinct suspicious
+intervals — or how large any one of them is — a pathological transcript
+produces. 12 comes directly from the slice size: the worst measured hole
+(562s) needs `ceil(562 / 90) = 7` slices to fully re-cover; 12 leaves
+headroom for a second hole in the same unit, or for a slice that only
+partially resolves (a degenerate repeat needing a follow-up on its own
+remainder) — while staying a small, fixed, auditable number.
+
+**Why `collapse_repeated_segments` still collapses to the run's FIRST
+segment, not its last** (a "more honest timeline" alternative was
+considered and rejected): on the FIRST measured failure, Whisper's raw,
+PRE-collapse segment timestamps kept climbing in step with real audio
+time even while hallucinating — the repeated sentence's `end` reached the
+chunk's true end regardless, so a check over the raw segments would have
+seen full nominal coverage and missed the bug entirely. Collapsing to the
+run's first occurrence (current behaviour, unchanged) is what
+manufactures the interval this check reads; extending the collapsed
+segment's `end` to the run's last occurrence would silently erase it. On
+the SECOND failure this particular argument doesn't even apply — there
+was no repeat-run to collapse, Whisper's own raw output already had the
+gap — but the conclusion holds either way: check the collapsed segments,
+every suspicious interval, not just the worst one.
+
+When a suspicious interval is confirmed as speech, `_ensure_coverage`
+splices in ONLY that interval's own recheck (never the whole unit, and
+never "everything after some point"). Each recheck re-cuts the audio
+`_RETRY_BACKOFF_SECONDS` (5s) past BOTH edges of the interval, rather than
+resending identical bytes: a deterministic decoder asked the exact same
+question twice has no reason to answer differently, and a cut boundary
+landing mid-phrase is a known trigger for this kind of failure, so
+shifting both edges is the one lever actually likely to change the
+outcome. Which CONFIRMED segments survive the splice is keyed on the
+interval's own boundaries, not the backoff-extended cut window — a
+segment that ends at/before the interval's own start or begins at/after
+its own end survives whole; splitting on the cut window instead would
+drop an entire long confirmed segment (possibly minutes) just because
+its last few seconds fall inside the backoff margin.
+
+**The retry's OWN output also has to be clipped to those same gap
+boundaries before splicing** — `_clip_to_gap`, added after a live re-run
+of the fix above surfaced the seam it missed: the backoff context is
+there purely for the decoder, but an unclipped retry re-transcribes that
+few-second margin too, so it comes back TWICE (once from the confirmed
+neighbor, once from the retry) — measured live as two duplicated long
+lines at the splice seam. Worse, a segment the retry places inside that
+margin can start BEFORE an already-confirmed segment, which breaks the
+non-decreasing-`start` order every downstream consumer assumes:
+`build_marked_text`'s timecodes go backward, and `workers/translator.py`'s
+`_align_translation` — which walks the output with a forward-only cursor
+matching markers by value — desyncs on a marker that appears earlier than
+where its cursor already is, producing a spurious `partial` translation
+that has nothing to do with the model. `_clip_to_gap` drops anything the
+retry produced entirely inside the backoff margin and clamps anything
+straddling an edge to it, then sorts what's left by `start` (the backend
+is generally well-ordered, but nothing guarantees it, and letting a
+single out-of-order pair through would reintroduce the same defect).
+`_ensure_coverage` asserts the final list is non-decreasing by `start` on
+every return path as a cheap backstop — by construction it always holds
+given a well-ordered input, so a failure means a bug in this splice logic,
+not bad transcript data.
+
+**The prefix immediately before a gap can't be trusted just because it has
+no gap of its own** — `_PREFIX_DISTRUST_SECONDS` (30s), added after a
+second live re-run of the fix above surfaced a seamless duplicate: the
+same dialogue appeared twice, once from the original transcription and
+once from the retry, with no gap and no overlap-with-a-confirmed-neighbor
+to catch it. The tell was in the ORIGINAL segments' timing: the five
+segments right before the gap were each marked EXACTLY 1.000s long — real
+Whisper output is never that round — while a re-cut of that same span
+produced the same dialogue with normal, live-sounding durations instead.
+Whisper doesn't only drop content once it falls into a hallucination
+loop; it can drift for a while BEFORE the loop starts, misattributing
+real speech to earlier, wrong timestamps as it loses sync. So the retry
+target's leading edge is `gap_start - _PREFIX_DISTRUST_SECONDS`, not
+`gap_start` itself — deliberately asymmetric with the trailing edge's
+`_RETRY_BACKOFF_SECONDS` (5s), since nothing measured shows the same
+drift happening on the way OUT of a gap. 30s is 3x the ~10s over which
+the drift was observably visible via those suspiciously-round durations,
+because that 10s is just where the symptom happened to become visible,
+not necessarily where the drift actually began — a false positive here
+only costs a bounded extra retranscription of already-fine audio, never
+lost content (the retry's cut still covers that same audio, just
+re-reads it), so the margin errs generous. Both `_clip_to_gap` and the
+prefix/suffix split above key off this same widened boundary, not the
+gap's own `gap_start` — everything else about the splice (bounded
+retries, monotonicity assertion, cost of a false positive) is unchanged.
+
+If rechecks don't resolve every suspicious interval as either spliced-in
+speech or confirmed non-speech, the job still completes normally (no
+special status, restart-safety/soft-pause untouched) but
+`workers/runner.py` persists the summed length of everything still open
+above the cost cutoff on `Job.transcript_missing_seconds` (migration v8)
+and logs it — mirrored to the API as `JobSummary.transcript_missing_seconds`
+/ `extension/src/lib/api-types.js`. `None` means either "not a Whisper
+job" or "checked, nothing suspicious survived above the cost cutoff"; a
+positive value means this "done" job is known to be missing that much
+SPEECH somewhere (never confirmed music/noise/silence — see
+`_is_confirmed_silence` above; a degenerate repeated run that never got
+resolved counts here too, deliberately, since it's still unknown, not
+confirmed silent), so the Library/Transcript tab can say so instead of
+looking exactly like a complete one.
+
 ## Marker-per-line cap
 
 The LLM sometimes attaches every timecode it saw near a point to one

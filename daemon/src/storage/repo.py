@@ -41,6 +41,15 @@ log = logging.getLogger(__name__)
 # nanoid: URL-safe alphabet, 12 chars (~71 bits — collision-safe at our scale).
 _ID_LENGTH = 12
 
+# Sentinel distinguishing "caller didn't pass transcript_missing_seconds"
+# (leave the column alone) from "caller passed None" (clear it explicitly).
+# Every other optional kwarg here uses "None means leave alone" because
+# those values never legitimately regress from known back to unknown — but
+# transcript_missing_seconds DOES: a retried job that gets full coverage on
+# its second attempt must be able to clear a shortfall a first attempt left
+# behind, not have it stick forever because "not None" was already true.
+_UNSET: Any = object()
+
 
 def _new_id() -> str:
     return str(_nanoid_generate(size=_ID_LENGTH))
@@ -119,6 +128,7 @@ def insert_imported_job(
     alt_media_candidates_json: str | None,
     messages: list[dict[str, Any]],
     translations: list[dict[str, Any]],
+    transcript_missing_seconds: float | None = None,
 ) -> Job:
     """Insert a fully-formed Job (plus its Messages + TranscriptTranslations)
     as one atomic transaction — used by ``storage.bundle`` when importing an
@@ -167,6 +177,12 @@ def insert_imported_job(
     per job and catch failures per-job so one bad job in a batch doesn't
     abort the rest (see ``bundle.import_bundle``).
 
+    ``transcript_missing_seconds`` round-trips the exporting machine's
+    coverage-shortfall flag (see ``workers/transcribe.py``); ``None`` for
+    every bundle written before that column existed, same as a Whisper job
+    whose coverage came back complete — an old bundle just can't say which,
+    and treats them identically (no shortfall shown).
+
     Emits ``job_event("created", …)`` same as ``create_job`` so an open
     Library page renders the imported row live.
     """
@@ -193,6 +209,7 @@ def insert_imported_job(
         transcript_language=transcript_language,
         raw_segments_json=raw_segments_json,
         alt_media_candidates_json=alt_media_candidates_json,
+        transcript_missing_seconds=transcript_missing_seconds,
     )
     with session_scope() as session:
         session.add(job)
@@ -276,6 +293,7 @@ def mark_done(
     video_id: str | None = None,
     transcript_language: str | None = None,
     raw_segments_json: str | None = None,
+    transcript_missing_seconds: float | None = _UNSET,
 ) -> None:
     """Finalise a job with status=done, persisting all extracted fields.
 
@@ -283,6 +301,13 @@ def mark_done(
     Setting it here AND in ``set_extracted`` is redundant on the happy path,
     but ``set_extracted`` is what catches mid-pipeline failures (summary
     errors after transcription succeeded), so both paths persist it.
+
+    ``transcript_missing_seconds`` (see ``workers/transcribe.py``'s coverage
+    check) is only ever passed by the Whisper runner; the fast-path pipeline
+    never passes it and the column stays untouched (``None`` forever) for
+    those jobs. When the Whisper runner DOES pass it — even explicitly
+    ``None``, meaning "checked, fully covered" — it's written unconditionally
+    so a successful retry can clear a shortfall a previous attempt left set.
 
     Emits ``job_event("updated", …)`` so the Library row flips to done with the
     final title in one event.
@@ -306,6 +331,8 @@ def mark_done(
             job.transcript_language = transcript_language
         if raw_segments_json is not None:
             job.raw_segments_json = raw_segments_json
+        if transcript_missing_seconds is not _UNSET:
+            job.transcript_missing_seconds = transcript_missing_seconds
         job.completed_at = now
         job.updated_at = now
         job.error = None
@@ -323,6 +350,7 @@ def set_extracted(
     video_id: str | None = None,
     transcript_language: str | None = None,
     raw_segments_json: str | None = None,
+    transcript_missing_seconds: float | None = _UNSET,
 ) -> None:
     """Persist extraction output mid-pipeline (before the summary call).
 
@@ -335,6 +363,9 @@ def set_extracted(
     ``title`` overwrites the existing value when provided — the caller is
     expected to pass a more authoritative source (e.g. yt-dlp metadata) than
     whatever the extension guessed at job-creation time.
+
+    ``transcript_missing_seconds`` — see ``mark_done``'s docstring; same
+    "unconditional write when passed, untouched when omitted" contract.
 
     Emits ``job_event("updated", …)`` — this is the path that surfaces the
     canonical YouTube title to the Library mid-pipeline.
@@ -354,6 +385,8 @@ def set_extracted(
             job.transcript_language = transcript_language
         if raw_segments_json is not None:
             job.raw_segments_json = raw_segments_json
+        if transcript_missing_seconds is not _UNSET:
+            job.transcript_missing_seconds = transcript_missing_seconds
         job.updated_at = now
         session.add(job)
     _emit_updated(job_id)

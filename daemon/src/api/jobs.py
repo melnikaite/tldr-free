@@ -122,6 +122,7 @@ def _to_summary(job: Any) -> JobSummary:
         transcript_source=(
             TranscriptSource(job.transcript_source) if job.transcript_source else None
         ),
+        transcript_missing_seconds=getattr(job, "transcript_missing_seconds", None),
         created_at=job.created_at,
         added_at=getattr(job, "added_at", None) or job.created_at,
         updated_at=job.updated_at,
@@ -183,6 +184,7 @@ def _to_details(job: Any) -> JobDetails:
         transcript_source=(
             TranscriptSource(job.transcript_source) if job.transcript_source else None
         ),
+        transcript_missing_seconds=getattr(job, "transcript_missing_seconds", None),
         created_at=job.created_at,
         added_at=getattr(job, "added_at", None) or job.created_at,
         updated_at=job.updated_at,

@@ -99,6 +99,22 @@ class Job(SQLModel, table=True):
     # Cleared (with the file unlinked) on mark_done and on delete_job.
     audio_path: str | None = None
     audio_duration_seconds: float | None = None
+    # Set by workers/transcribe.py's coverage check (Whisper jobs only) when
+    # the transcript's last segment still falls short of the audio's known
+    # duration after bounded retries — see transcribe.TranscribeResult and
+    # transcribe._ensure_coverage for the full mechanism, and
+    # timecodes.collapse_repeated_segments for why a repetition-loop
+    # collapse can create exactly this gap. ``None`` means either "not a
+    # Whisper job" (PAGE/PDF/YouTube-caption jobs never touch this column)
+    # or "checked, coverage was complete" — a job can look identical to the
+    # user in both cases, which is fine: only a non-null, positive value is
+    # actionable. A job's status stays "done" either way (soft-pause /
+    # restart-safety are unaffected); this is purely an honesty flag on top
+    # of an otherwise normal completion, cleared back to None if a later
+    # retry of the same job achieves full coverage (repo.set_extracted /
+    # repo.mark_done write it unconditionally when the Whisper runner
+    # passes it, unlike the other optional fields on this model).
+    transcript_missing_seconds: float | None = None
 
 
 class Message(SQLModel, table=True):

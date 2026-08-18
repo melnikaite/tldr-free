@@ -316,6 +316,35 @@ def _migration_v7(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v8 — Job.transcript_missing_seconds
+# ---------------------------------------------------------------------------
+# Whisper occasionally decode-loops near the end of a chunk/file and never
+# recovers real speech afterwards; workers/transcribe.py's coverage check
+# now retries that tail a bounded number of times, and this column is where
+# it reports a shortfall that survived retries — a job that otherwise looks
+# perfectly normal (status="done", no error) but whose transcript is known
+# to stop short of the material's actual length. See
+# transcribe.TranscribeResult.missing_seconds / transcribe._ensure_coverage.
+#
+# Null for every pre-existing row (no way to retroactively know) and for
+# every non-Whisper transcript source (PAGE/PDF/YouTube-caption jobs never
+# write this column at all) — both read the same as "nothing to report".
+
+_V8_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN transcript_missing_seconds REAL",
+)
+
+
+def _migration_v8(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V8_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -328,6 +357,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (5, _migration_v5),
     (6, _migration_v6),
     (7, _migration_v7),
+    (8, _migration_v8),
 ]
 
 

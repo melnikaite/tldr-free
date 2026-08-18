@@ -184,6 +184,7 @@ def _write_job_entry(zf: zipfile.ZipFile, job: Job) -> None:
         "transcript_language": job.transcript_language,
         "raw_segments_json": job.raw_segments_json,
         "alt_media_candidates_json": job.alt_media_candidates_json,
+        "transcript_missing_seconds": job.transcript_missing_seconds,
         "messages": [
             {
                 "role": m.role,
@@ -492,6 +493,7 @@ def _import_one_job(
                 transcript_language=payload.get("transcript_language"),
                 raw_segments_json=payload.get("raw_segments_json"),
                 alt_media_candidates_json=payload.get("alt_media_candidates_json"),
+                transcript_missing_seconds=payload.get("transcript_missing_seconds"),
                 messages=messages,
                 translations=translations,
             )

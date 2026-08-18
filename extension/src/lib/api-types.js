@@ -79,6 +79,12 @@
  * @property {number | null} duration_seconds
  * @property {string | null} progress_stage
  * @property {TranscriptSource | null} transcript_source
+ * @property {number | null} [transcript_missing_seconds] - estimated seconds
+ *   of source audio Whisper never reliably transcribed after retrying (see
+ *   daemon workers/transcribe.py's coverage check). null/absent for
+ *   non-Whisper jobs and for complete Whisper transcripts. A positive value
+ *   means this "done" job's transcript is known to stop short of the
+ *   material's actual length — worth flagging in the UI, not just ignoring.
  * @property {string} created_at  ISO datetime string
  * @property {string} added_at    ISO datetime string - when this job appeared
  *   on THIS machine. Equal to created_at for everything processed locally;

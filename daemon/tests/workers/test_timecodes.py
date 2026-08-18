@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from src.workers.timecodes import (
+    DiscardedRun,
     build_marked_text,
     cap_markers_in_stream,
     cap_markers_per_line,
@@ -379,16 +380,23 @@ def _segs(texts: list[str], *, step: float = 1.0, start: float = 0.0) -> list[di
 def test_collapse_291_run_of_identical_long_sentence() -> None:
     text = "I'm not sure if I'm doing that right."
     segs = _segs([text] * 291)
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert len(out) == 1
     assert out[0] == segs[0]
+    # Exactly one discarded run, spanning the SECOND occurrence's start
+    # through the run's LAST occurrence's end — not the kept first segment.
+    assert discarded == [DiscardedRun(start=segs[1]["start"], end=segs[-1]["end"])]
 
 
 def test_collapse_57_run_of_short_ja() -> None:
     segs = _segs(["Ja."] * 57)
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert len(out) == 1
     assert out[0] == segs[0]
+    # The short-segment threshold (6) only gates WHETHER a run this long
+    # collapses at all; once it does, everything but the first occurrence
+    # is dropped, same as any other collapsing run.
+    assert discarded == [DiscardedRun(start=segs[1]["start"], end=segs[-1]["end"])]
 
 
 def test_collapse_near_duplicate_drifting_trio() -> None:
@@ -403,9 +411,10 @@ def test_collapse_near_duplicate_drifting_trio() -> None:
             "He was also interested in the world of science and technology.",
         ]
     )
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert len(out) == 1
     assert out[0] == segs[0]
+    assert discarded == [DiscardedRun(start=segs[1]["start"], end=segs[-1]["end"])]
 
 
 def test_collapse_near_dup_pair_never_collapses() -> None:
@@ -416,26 +425,31 @@ def test_collapse_near_dup_pair_never_collapses() -> None:
     # A near-dup run of length 2 must never collapse, unlike an exact-dup
     # pair of long segments (which does, per _LONG_SEGMENT_RUN_THRESHOLD).
     segs = _segs([">> That's locked in?", ">> It's locked in."])
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert out == segs
+    assert discarded == []
 
 
 def test_collapse_short_dialogue_survives() -> None:
     # 5 consecutive "Ja." is real call-and-response dialogue, not a
     # hallucination loop — short-segment threshold tolerates this.
     segs = _segs(["Ja."] * 5)
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert out == segs
+    assert discarded == []
 
 
 def test_collapse_noop_when_no_repetition() -> None:
     segs = _segs(["First sentence here.", "Second sentence here.", "Third one."])
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert out == segs
+    assert discarded == []
 
 
 def test_collapse_empty_segments() -> None:
-    assert collapse_repeated_segments([]) == []
+    out, discarded = collapse_repeated_segments([])
+    assert out == []
+    assert discarded == []
 
 
 def test_collapse_non_consecutive_repeats_survive() -> None:
@@ -443,8 +457,27 @@ def test_collapse_non_consecutive_repeats_survive() -> None:
     # consecutive run — collapse_repeated_segments never dedupes globally.
     text = "This sentence legitimately recurs in the transcript."
     segs = _segs([text, "Unrelated middle content here.", text])
-    out = collapse_repeated_segments(segs)
+    out, discarded = collapse_repeated_segments(segs)
     assert out == segs
+    assert discarded == []
+
+
+def test_collapse_multiple_runs_each_reported() -> None:
+    # Two separate collapsed runs in one transcript — both must be reported,
+    # in order, and independently of each other's boundaries.
+    segs = (
+        _segs(["Ja."] * 10, start=0.0)
+        + _segs(["Unrelated middle content."], start=10.0)
+        + _segs(["Nein."] * 8, start=11.0)
+    )
+    out, discarded = collapse_repeated_segments(segs)
+    assert [s["text"] for s in out] == ["Ja.", "Unrelated middle content.", "Nein."]
+    ja_run = segs[:10]
+    nein_run = segs[11:]
+    assert discarded == [
+        DiscardedRun(start=ja_run[1]["start"], end=ja_run[-1]["end"]),
+        DiscardedRun(start=nein_run[1]["start"], end=nein_run[-1]["end"]),
+    ]
 
 
 # --- cap_markers_per_line -----------------------------------------------------

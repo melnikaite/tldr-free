@@ -372,6 +372,59 @@ def test_insert_imported_job_sets_added_at_now_keeps_bundle_created_at(
     assert before <= job.added_at <= after
 
 
+def test_insert_imported_job_round_trips_transcript_missing_seconds(
+    isolated_db,
+) -> None:
+    """storage.bundle round-trips the exporting machine's coverage-shortfall
+    flag (see workers/transcribe.py); omitting it (older bundles) must not
+    crash and defaults to None (read the same as "coverage complete")."""
+    job = repo.insert_imported_job(
+        job_id=repo.generate_job_id(),
+        url="https://imported-incomplete.example",
+        kind="youtube",
+        title="Partial transcript",
+        duration_seconds=None,
+        created_at=datetime(2024, 1, 1),
+        completed_at=None,
+        raw_text="hello",
+        summary_md="**hi**",
+        transcript_source="whisper",
+        video_id=None,
+        transcript_language="en",
+        raw_segments_json=None,
+        alt_media_candidates_json=None,
+        messages=[],
+        translations=[],
+        transcript_missing_seconds=360.0,
+    )
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.transcript_missing_seconds == 360.0
+
+    # Not passed at all (pre-feature bundle) -> defaults to None, not a crash.
+    legacy = repo.insert_imported_job(
+        job_id=repo.generate_job_id(),
+        url="https://imported-legacy.example",
+        kind="page",
+        title="Legacy bundle entry",
+        duration_seconds=None,
+        created_at=datetime(2020, 1, 1),
+        completed_at=None,
+        raw_text="hello",
+        summary_md="**hi**",
+        transcript_source="trafilatura",
+        video_id=None,
+        transcript_language=None,
+        raw_segments_json=None,
+        alt_media_candidates_json=None,
+        messages=[],
+        translations=[],
+    )
+    reloaded_legacy = repo.get_job(legacy.id)
+    assert reloaded_legacy is not None
+    assert reloaded_legacy.transcript_missing_seconds is None
+
+
 def test_imported_job_not_swept_by_cutoff_that_would_catch_its_created_at(
     isolated_db,
 ) -> None:

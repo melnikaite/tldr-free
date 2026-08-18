@@ -156,6 +156,19 @@ async def _process_one(
         )
         transcribe_done = True
 
+        # transcribe_audio already retried a short chunk/file before giving
+        # up — a nonzero missing_seconds here means the transcript is known
+        # to stop short of the material's real length even though the job
+        # is about to complete normally (status=done, no error). Log it
+        # loudly and persist it so the job doesn't look silently complete.
+        if whisper_result.missing_seconds:
+            log.warning(
+                "runner: %s transcript may be missing ~%.0fs of trailing "
+                "audio — coverage retries were exhausted",
+                task_job_id, whisper_result.missing_seconds,
+            )
+        transcript_missing_seconds = whisper_result.missing_seconds or None
+
         raw_text = timecodes.build_marked_text(
             whisper_result.segments,
             window_seconds=cfg.youtube.segment_window_seconds,
@@ -205,6 +218,7 @@ async def _process_one(
                 transcript_source=TranscriptSource.WHISPER.value,
                 transcript_language=whisper_language,
                 raw_segments_json=raw_segments_json,
+                transcript_missing_seconds=transcript_missing_seconds,
             )
         except Exception:
             log.exception("set_extracted failed for %s; continuing", task_job_id)
@@ -261,6 +275,7 @@ async def _process_one(
             video_id=video_id,
             transcript_language=whisper_language,
             raw_segments_json=raw_segments_json,
+            transcript_missing_seconds=transcript_missing_seconds,
         )
         broker.publish(task_job_id, done_event(summary))
     finally:

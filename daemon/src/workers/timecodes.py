@@ -11,7 +11,8 @@ Public surface:
 Also in this module (not part of the marker-formatting algorithm above, but
 kept alongside the other strip_*/cap_* transcript-hygiene helpers for the
 same reason strip_transcript_tail_noise lives here):
-    collapse_repeated_segments(segments) -> list[Segment]   # Whisper repetition-loop collapse
+    collapse_repeated_segments(segments) -> tuple[list[Segment], list[DiscardedRun]]
+                                                             # Whisper repetition-loop collapse
     cap_markers_per_line(text, max_markers=1) -> str        # cap markers per summary line
     cap_markers_in_stream(stream, max_markers=1) -> AsyncIterator[str]  # streaming wrapper for the above
 
@@ -47,6 +48,7 @@ import difflib
 import math
 import re
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 # A bracketed inline marker the LLM emits where a timecode *would* go but none
@@ -108,6 +110,15 @@ def _segment_start(seg: Mapping[str, Any]) -> float:
 def _segment_text(seg: Mapping[str, Any]) -> str:
     text = seg.get("text") or ""
     return str(text).strip()
+
+
+def _segment_end(seg: Mapping[str, Any]) -> float:
+    """``end`` if present, else fall back to ``start`` (a zero-length span
+    rather than a crash on a malformed/partial segment dict)."""
+    end = seg.get("end")
+    if end is None:
+        return _segment_start(seg)
+    return float(end)
 
 
 def build_marked_text(segments: list[dict[str, Any]], window_seconds: int) -> str:
@@ -299,7 +310,32 @@ def _segments_are_near_duplicates(a: str, b: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= _NEAR_DUP_RATIO
 
 
-def collapse_repeated_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+@dataclass(frozen=True)
+class DiscardedRun:
+    """The ``[start, end)`` span of segments ``collapse_repeated_segments``
+    dropped from one collapsed run.
+
+    The run's FIRST occurrence survives in the function's returned segment
+    list (unchanged); ``start``/``end`` here bound only what got REMOVED —
+    from the second occurrence's own ``start`` through the run's last
+    occurrence's own ``end``. This is exact, not a derived estimate: the
+    collapse loop knows precisely which slice of the input (``segments[i +
+    1:run_end]``) it is throwing away, at the moment it throws it away.
+
+    Callers (``workers/transcribe.py``'s coverage check) use this directly
+    as a suspicious interval worth re-verifying, instead of re-deriving an
+    approximation of the same fact after the fact by diffing collapsed vs.
+    uncollapsed coverage arithmetic — the "guess the hole from what's left"
+    approach this dataclass replaces.
+    """
+
+    start: float
+    end: float
+
+
+def collapse_repeated_segments(
+    segments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[DiscardedRun]]:
     """Collapse consecutive Whisper hallucination-loop repeats to one segment.
 
     Walks the segments once, grouping CONSECUTIVE runs whose texts are
@@ -334,14 +370,20 @@ def collapse_repeated_segments(segments: list[dict[str, Any]]) -> list[dict[str,
     (measured clean, 0-5% duplicate lines) — see ``transcribe.transcribe_audio``
     for the hook point.
 
+    Returns ``(kept_segments, discarded_runs)``. ``discarded_runs`` is one
+    ``DiscardedRun`` per run that actually collapsed, in the order those
+    runs occur in the input — see ``DiscardedRun`` for exactly what its
+    bounds mean and why callers want it.
+
     Pure: same input -> same output. Segments are returned as-is (not copied)
     so identity-sensitive callers see the original dicts for kept segments.
     """
     if not segments:
-        return list(segments)
+        return list(segments), []
 
     texts = [_segment_text(s) for s in segments]
     out: list[dict[str, Any]] = []
+    discarded: list[DiscardedRun] = []
     n = len(segments)
     i = 0
     while i < n:
@@ -365,10 +407,18 @@ def collapse_repeated_segments(segments: list[dict[str, Any]]) -> list[dict[str,
             collapse = run_len >= _NEAR_DUP_RUN_THRESHOLD
         if collapse:
             out.append(segments[i])
+            dropped = segments[i + 1 : run_end]
+            if dropped:
+                discarded.append(
+                    DiscardedRun(
+                        start=_segment_start(dropped[0]),
+                        end=_segment_end(dropped[-1]),
+                    )
+                )
         else:
             out.extend(segments[i:run_end])
         i = run_end
-    return out
+    return out, discarded
 
 
 # Phantom phrases Whisper invents over trailing silence / outro music — it has
@@ -792,6 +842,7 @@ async def cap_markers_in_stream(
 
 
 __all__ = [
+    "DiscardedRun",
     "build_marked_text",
     "cap_markers_in_stream",
     "cap_markers_per_line",

@@ -170,6 +170,15 @@ class JobSummary(BaseModel):
     duration_seconds: int | None
     progress_stage: str | None     # "extracting" | "transcribing" | "summarizing" | None when idle/done
     transcript_source: TranscriptSource | None
+    # Estimated seconds of the source audio Whisper never reliably
+    # transcribed, after retrying (see daemon/src/workers/transcribe.py's
+    # coverage check). ``None`` for non-Whisper jobs and for Whisper jobs
+    # whose coverage came back complete. A non-null, positive value means
+    # this job completed normally (status="done", no error) but its
+    # transcript is known to stop short of the material's actual length —
+    # surfaced so the Library/Transcript tab can flag it instead of the job
+    # looking silently whole.
+    transcript_missing_seconds: float | None = None
     created_at: datetime
     # When this row appeared ON THIS MACHINE — distinct from created_at (when
     # the material was processed). Equal to created_at for every normally
