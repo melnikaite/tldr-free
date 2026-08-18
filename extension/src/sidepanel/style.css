@@ -376,25 +376,32 @@ body {
   margin: 0 0 0.75rem;
 }
 
+/* Command above, Copy button below — NOT side by side. The install command
+   is ~95 characters and the side panel is ~400px wide, so a flex row left it
+   visibly cut off mid-URL ("curl -fsSL https://raw.githubuserc…"), which
+   reads as broken on the first screen a new user ever sees. Wrapping the
+   whole command is worth the two extra lines. */
 .welcome-command {
   display: flex;
-  align-items: stretch;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 0.4rem;
   margin: 0 0 0.75rem;
 }
 .welcome-command pre {
-  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
   margin: 0;
   padding: 0.5rem 0.6rem;
   background: var(--assistant-bg);
   border-radius: 4px;
-  overflow-x: auto;
   font-size: 0.8rem;
 }
 .welcome-command code {
   background: transparent;
   padding: 0;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .welcome-copy-btn {
   flex-shrink: 0;
