@@ -114,6 +114,17 @@
     return inside.length > 0 ? inside : candidates;
   }
 
+  // Reject media whose *known* duration is below this many seconds — both
+  // <video> and <audio>. This is deliberately NOT a visibility/controls
+  // check: a hidden <audio> with no `controls`, driven by its own JS, is
+  // the NORMAL way real audio players are built (SoundCloud, Bandcamp, any
+  // custom podcast player), so filtering on visibility would break the
+  // audio path entirely. Duration is the only reliable signal — UI
+  // notification sounds ("ding") run 0.2-3s; the shortest meaningful
+  // spoken clip is well above that. 12s sits comfortably above the former
+  // and below the latter.
+  const MIN_MEDIA_DURATION_SECONDS = 12;
+
   /**
    * @returns {{el: HTMLMediaElement, mediaUrl: string, kind: "video"|"audio",
    *           label: string, score: number}[]}
@@ -135,6 +146,12 @@
       const vw = /** @type {HTMLVideoElement} */ (el).videoWidth || 0;
       const area = rect.width * rect.height;
       if (isVideo && area < 5000 && vw < 100) continue;
+      // Duration reject (video AND audio). Only fires on a known finite
+      // number below the threshold — NaN/Infinity/unset (preload="none",
+      // never played — completely normal for a script-driven hidden
+      // player) must NOT be rejected here.
+      const dur = el.duration;
+      if (Number.isFinite(dur) && dur < MIN_MEDIA_DURATION_SECONDS) continue;
       const idx = isVideo ? ++videoIdx : ++audioIdx;
       out.push({
         el,
@@ -307,25 +324,17 @@
     return document.title || null;
   }
 
-  // ----- entry --------------------------------------------------------------
-
-  whenReady(() => {
-    const found = findMedia();
-    if (found) {
-      chrome.runtime.sendMessage({
-        type: "extracted-media",
-        url: location.href,
-        // Primary (top-scored) drives job creation; alternates surface in
-        // the sidepanel as a "wrong source?" chip so the user can switch
-        // without re-running the whole pipeline.
-        mediaUrl: found.primary.mediaUrl,
-        altCandidates: found.alternates,
-        title: extractTitle(),
-      });
-      return;
-    }
-
-    // No media on the page — fall back to Readability article extraction.
+  /**
+   * Readability article extraction, falling back to raw innerText on
+   * failure. Shared by both messages below: the no-media path uses it as
+   * the page's actual content; the media path uses it as a best-effort
+   * fallback the daemon can summarize instead of audio (e.g. a hidden
+   * notification-sound element that got past the duration filter, or a
+   * media job whose transcript comes back empty).
+   *
+   * @returns {{title: string | null, text: string}}
+   */
+  function extractPageText() {
     let title = null;
     let text = "";
     try {
@@ -338,6 +347,34 @@
       text = document.body ? document.body.innerText : "";
       console.warn("[TLDR] Readability failed, using fallback:", err);
     }
+    return { title, text };
+  }
+
+  // ----- entry --------------------------------------------------------------
+
+  whenReady(() => {
+    const found = findMedia();
+    if (found) {
+      const { text } = extractPageText();
+      chrome.runtime.sendMessage({
+        type: "extracted-media",
+        url: location.href,
+        // Primary (top-scored) drives job creation; alternates surface in
+        // the sidepanel as a "wrong source?" chip so the user can switch
+        // without re-running the whole pipeline.
+        mediaUrl: found.primary.mediaUrl,
+        altCandidates: found.alternates,
+        title: extractTitle(),
+        // Best-effort page text so the daemon has something to fall back
+        // to when the media turns out not to be summarizable (too short /
+        // empty transcript) — see background.js's handleExtractedMedia.
+        text,
+      });
+      return;
+    }
+
+    // No media on the page — fall back to Readability article extraction.
+    const { title, text } = extractPageText();
     chrome.runtime.sendMessage({
       type: "extracted-page",
       url: location.href,

@@ -56,6 +56,126 @@ Dedup: a second POST for an in-flight `(job_id, lang)` is a no-op —
 the existing row's status is returned. UI binds Enter on the language
 input directly to this endpoint without debouncing.
 
+## Media jobs: duration probe + page-text fallback
+
+The extension's `<video>`/`<audio>` detection filters by duration, not
+visibility (see [extension.md](extension.md) — the audio path exists for
+hidden, script-driven players, so filtering by visibility would break real
+podcast/lecture support). That filter can still be wrong — the DOM's
+`el.duration` may be unknown client-side, or the server-side probe below may
+disagree — so `kind=media` jobs get a second, independent check before the
+(slow) yt-dlp download ever starts, plus a fallback if Whisper still comes
+back empty.
+
+Establishing "is this clip long enough to plausibly contain speech" turned
+out to need THREE tiers, not one — the first tier alone silently failed to
+fire for the exact case it was built for (see below), which is why a
+duration below threshold can now be discovered at three different points
+in the pipeline, and why the transcript-quality check downstream (further
+below) had to be tightened independently.
+
+**Tier 1 — yt-dlp metadata probe (free, pre-download).**
+`runner._process_one`, gated to `kind == "media"` AND no cached audio to
+reuse (a retry that already has downloaded audio skips straight to
+transcribing, same as before), calls `youtube.fetch_video_metadata` — the
+same `extract_info(url, download=False)` probe already used
+post-transcription for YouTube title/language backfill — BEFORE the
+download step. When the early probe DID run, its result is reused for the
+post-transcription title/language backfill instead of calling
+`fetch_video_metadata` a second time.
+
+**This tier alone is not sufficient.** yt-dlp's *generic* extractor — the
+one that handles a plain static-asset URL like `/assets/notification.mp3`
+served by a real web app, as opposed to a media-platform URL yt-dlp has a
+dedicated extractor for — does NOT report a `duration` via
+`extract_info(download=False)` for that shape of URL. Confirmed live: both
+a 3s and a 40s static file came back `duration: None`. Since "a UI
+notification ding on a plain static URL" is exactly the case this whole
+mechanism exists to catch, tier 1 alone routinely never fires for it, and
+the job would proceed straight to download + Whisper every time without
+the tiers below.
+
+**Tier 2 — URL-direct ffprobe (optional, best-effort, pre-download).** If
+tier 1 came back with no known duration, `runner._process_one` tries
+`transcribe.probe_url_duration(url)`: ffprobe reading the duration
+directly off the URL, no download. ffmpeg's http(s) protocol supports
+byte-range requests, so for a normal seekable static file this is
+typically 1-2 small requests rather than a full download. Guarded by a
+hard wall-clock `subprocess.run(..., timeout=...)` (protocol-agnostic — it
+kills the subprocess regardless of what it's doing internally, so a slow/
+non-seekable/hostile server can never hang the single Whisper worker) and
+swallows every failure mode (missing ffprobe, non-zero exit, timeout,
+unparseable output) to `None`, falling through with zero behavior change.
+Does not forward cookies — an authenticated URL simply fails this probe (a
+disclosed limitation, not a reliability regression) and falls through to
+the normal cookie-aware download.
+
+**Whichever of tier 1/2 first produces a known duration below
+`runner.MEDIA_MIN_DURATION_SECONDS` (12.0, mirrors the extension's
+`MIN_MEDIA_DURATION_SECONDS`) skips the download + Whisper transcribe
+entirely** and the job falls back to page text (below). Still unknown
+after both -> falls through to the normal download path, unmodified.
+
+**Tier 3 — local ffprobe on the downloaded file (required, post-download,
+pre-Whisper).** This is the tier that actually catches the static-asset
+case: after `youtube.download_audio` returns, if duration is STILL
+unknown, `runner._process_one` calls `transcribe.probe_duration(audio_
+path)` — a thin async wrapper around the same `_probe_duration`/`ffprobe`
+helper `transcribe.py` already uses internally for chunked transcription —
+on the real, now-local file. This is authoritative: the file exists, so
+ffprobe either reads its real duration or genuinely can't (ffmpeg
+unavailable/corrupt file), in which case behavior is unchanged (proceeds to
+Whisper as before). If it reveals a duration below threshold, Whisper is
+never called — the job goes straight to the page-text fallback.
+
+Because this reject happens AFTER a real download (unlike tiers 1-2), the
+downloaded file needs the same "delete, don't keep for retry" cleanup a
+normal success gets, even though `transcribe_audio` was never called. The
+`finally` block's cleanup branch keys off `transcribe_done` to choose
+delete-vs-keep; this path sets `transcribe_done = True` before returning to
+reach that same branch — see the comment at that assignment and at the
+`finally` block for why `transcribe_done` no longer literally means
+"Whisper ran".
+
+**The transcript-usability fallback.** Separately, if Whisper actually runs
+(all three duration tiers were inconclusive, or confirmed the clip is long
+enough) but its output carries no usable content, the same fallback
+triggers rather than summarizing garbage into a fabricated-looking result.
+This used to check only `not raw_text.strip()` (literal emptiness) — too
+weak: Whisper fed a few seconds of a real "ding" hallucinated a short,
+plausible-looking, NON-empty transcript (e.g. `"[chime]"`), which sailed
+through that check and produced a real fabricated summary in production.
+The check is now `transcribe.transcript_is_unusable(whisper_result.
+segments)` — reusing (not reimplementing) `_is_confirmed_silence` (empty/
+punctuation-only/annotation-only) plus a degenerate-repeated-run check via
+`timecodes.collapse_repeated_segments`. Checked against the raw segment
+list, not the `[MM:SS]`-marked `raw_text` string — the marker brackets
+would make the annotation-only check misfire on a real transcript. This is
+purely a `kind=media` thing — the youtube fast/deferred paths are untouched.
+
+**The fallback itself** (`runner._fallback_to_page_text`, shared by all of
+the triggers above) summarizes `WhisperTask.page_text` — extension-supplied text,
+extracted alongside the media candidate by `extract.js`'s
+`extractPageText()` (see extension.md) — instead of audio.
+`from_audio_transcript=False` (it isn't a transcript), and it persists via
+`set_extracted`/`mark_done` with **`transcript_source=TranscriptSource.
+PAGE_EXTRACT`** — reusing the same enum value the `kind=page` Readability
+path already uses, deliberately, rather than adding a new one. The
+combination of `kind=media` + `transcript_source=page_extract` on the row IS
+the signal that page text, not audio, was summarized; also logged at
+`log.info`. If `page_text` is empty/missing (e.g. an old extension build
+that predates this field) or the resulting summary is empty, it raises
+`RuntimeError` with a specific message — `_process_one`'s existing "raises
+on any failure, caller (`whisper_worker`) calls `mark_failed`" contract
+handles it the same as any other failure; the fallback never calls
+`mark_failed` itself.
+
+`WhisperTask.page_text` follows the exact same ephemerality convention as
+`media_url` (see "Media and PDF jobs are ephemeral on restart" below): it
+rides along only inside the in-flight task, not a DB column, and is lost on
+daemon restart — a restart already marks in-flight media jobs failed via
+`re_enqueue_pending`, so this adds no new gap.
+
 ## Media and PDF jobs are ephemeral on restart
 
 YouTube jobs are recoverable: `Job.url` is the canonical URL and

@@ -126,6 +126,7 @@ async def run_pipeline(
                 job_id,
                 media_url=media_url,
                 page_title=page_title,
+                page_text=page_text,
                 cookies=cookies,
             )
         elif kind == JobKind.PDF:
@@ -388,12 +389,13 @@ async def _run_media(
     *,
     media_url: str,
     page_title: str | None,  # noqa: ARG001  — title is read from the DB row by the worker
+    page_text: str | None,
     cookies: list[Any],
 ) -> None:
     broker = get_broker()
     try:
         await get_queue().put(
-            WhisperTask(job_id=job_id, url=media_url, cookies=cookies)
+            WhisperTask(job_id=job_id, url=media_url, cookies=cookies, page_text=page_text)
         )
     except Exception as exc:
         log.exception("failed to enqueue media job %s", job_id)

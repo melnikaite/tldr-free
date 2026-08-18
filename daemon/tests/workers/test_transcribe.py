@@ -844,6 +844,54 @@ def test_is_confirmed_silence_short_legitimate_repeat_is_not_confirmed_silence()
 
 
 # ---------------------------------------------------------------------------
+# transcript_is_unusable — the public "is there anything worth summarizing
+# here?" gate used by runner.py's media page-text fallback. Reuses (does
+# not reimplement) _is_confirmed_silence plus a degenerate-repeated-run
+# check via timecodes.collapse_repeated_segments — see its own docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_transcript_is_unusable_empty_segments() -> None:
+    assert transcribe.transcript_is_unusable([]) is True
+    assert (
+        transcribe.transcript_is_unusable(
+            [{"start": 0.0, "end": 1.0, "text": "   "}]
+        )
+        is True
+    )
+
+
+def test_transcript_is_unusable_annotation_only() -> None:
+    assert (
+        transcribe.transcript_is_unusable(
+            [{"start": 0.0, "end": 3.0, "text": "[chime]"}]
+        )
+        is True
+    )
+
+
+def test_transcript_is_unusable_degenerate_repeated_run() -> None:
+    # Not confirmed silence (_is_confirmed_silence says False — real words),
+    # but a hallucination-loop-shaped repeat that collapse_repeated_segments
+    # discards from: transcript_is_unusable must still call this unusable,
+    # unlike the weaker "not raw_text.strip()" check it replaces in runner.py.
+    segs = [
+        {"start": float(i), "end": float(i + 1), "text": "I'm not sure about this."}
+        for i in range(5)
+    ]
+    assert transcribe._is_confirmed_silence(segs) is False
+    assert transcribe.transcript_is_unusable(segs) is True
+
+
+def test_transcript_is_unusable_real_speech_is_usable() -> None:
+    segs = [
+        {"start": 0.0, "end": 2.0, "text": "Hello, this is a real transcript."},
+        {"start": 2.0, "end": 4.5, "text": "It has more than one sentence."},
+    ]
+    assert transcribe.transcript_is_unusable(segs) is False
+
+
+# ---------------------------------------------------------------------------
 # _ensure_coverage integration: a recheck's verdict decides splice + missing.
 # ---------------------------------------------------------------------------
 

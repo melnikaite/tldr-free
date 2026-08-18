@@ -34,6 +34,27 @@ async def test_put_get_basic_round_trip() -> None:
     q.task_done()
 
 
+def test_whisper_task_page_text_defaults_to_none() -> None:
+    # page_text rides along transiently (like media_url does, per
+    # re_enqueue_pending's comment) — defaulting to None keeps every
+    # existing call site (youtube tasks never set it) unaffected.
+    task = WhisperTask(job_id="j1", url="https://youtu.be/x")
+    assert task.page_text is None
+
+
+@pytest.mark.asyncio
+async def test_whisper_task_page_text_round_trips_through_queue() -> None:
+    q = WhisperQueue()
+    task = WhisperTask(
+        job_id="j1", url="https://example.com/clip.mp3", cookies=[],
+        page_text="extracted page content",
+    )
+    await q.put(task)
+    got = await q.get()
+    assert got.page_text == "extracted page content"
+    q.task_done()
+
+
 def test_snapshot_initial_zero() -> None:
     q = WhisperQueue()
     assert q.snapshot() == (0, 0)

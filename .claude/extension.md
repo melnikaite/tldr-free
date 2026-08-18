@@ -24,6 +24,39 @@ pipelines stalls subsequent fetches in DevTools-invisible ways. The global
 `/events` stream with a client-side `job_id` filter gets the same per-job
 view over one socket.
 
+## Media detection: duration-based reject, not visibility-based
+
+`content/extract.js`'s `collectNativeMedia()` accepts any `<video>`/`<audio>`
+with a resolvable src — including elements with no `controls` attribute and
+zero on-screen size. That's deliberate: a hidden `<audio>` driven entirely by
+its own JS is the NORMAL way real audio players are built (SoundCloud,
+Bandcamp, any custom podcast widget), and filtering on visibility/`controls`
+would break exactly the sites the audio path exists for.
+
+The one filter that IS applied to both `<video>` and `<audio>` is
+**duration**: `MIN_MEDIA_DURATION_SECONDS` (12s) rejects an element only when
+`el.duration` is a **known finite number** below the threshold. `NaN` /
+`Infinity` / unset (e.g. `preload="none"`, never played — normal for a
+script-driven hidden player) is never rejected on this basis — an unplayed
+element simply hasn't reported a duration yet, which is not evidence it's
+short. This exists to stop invisible zero-duration UI sounds ("ding" on
+notification, click, etc.) from being treated as summarizable content; the
+existing on-screen-size filter for `<video>` (area/videoWidth check) is
+unrelated and untouched.
+
+The daemon has a matching, independently-gated probe before it ever
+downloads a `kind=media` job's audio — see [workers.md](workers.md).
+
+Because a hidden/short media element can still slip past this filter (a
+probe run server-side can disagree with the DOM value, or duration is simply
+unknown client-side), `extract.js` now also does a best-effort page-text
+extraction (`extractPageText()`, the same Readability-or-innerText logic the
+no-media `extracted-page` branch has always used) and includes it as a
+`text` field on the `extracted-media` message. `background.js`'s
+`handleExtractedMedia` forwards it as `page_text` on the `JobCreateRequest`
+so the daemon has something to summarize instead of audio if the media turns
+out not to be speech, or Whisper returns nothing.
+
 ## PDF tabs bypass content-script extraction
 
 Chrome's built-in PDF viewer is a `chrome-extension://…` page that

@@ -36,6 +36,14 @@ class WhisperTask:
     job_id: str
     url: str
     cookies: list[Cookie] = field(default_factory=list)
+    # Extension-supplied page text, carried transiently for kind=media jobs
+    # only (mirrors how ``media_url`` itself lives only inside the in-flight
+    # task — see ``re_enqueue_pending``'s comment below). Used by
+    # ``runner._process_one`` as a fallback summary source when the media
+    # clip is too short to contain speech or Whisper returns an empty
+    # transcript. Lost on daemon restart, same as ``media_url`` — a restart
+    # already marks in-flight media jobs failed, so this adds no new gap.
+    page_text: str | None = None
 
 
 class WhisperQueue:

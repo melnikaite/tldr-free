@@ -275,7 +275,7 @@ async function handleExtractedPage(msg, sourceTabId) {
  * That covers session cookies for player auth, CDN signing tokens, etc.,
  * without leaking unrelated cookies from sibling subdomains.
  *
- * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], title?:string|null}} msg
+ * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], title?:string|null, text?:string}} msg
  * @param {number|null} sourceTabId
  */
 async function handleExtractedMedia(msg, sourceTabId) {
@@ -305,6 +305,11 @@ async function handleExtractedMedia(msg, sourceTabId) {
     media_url: msg.mediaUrl,
     alt_media_candidates: altCandidates.length ? altCandidates : null,
     page_title: msg.title || null,
+    // Best-effort page text extracted alongside the media candidate — the
+    // daemon falls back to summarizing this when the media turns out too
+    // short to contain speech, or its transcript comes back empty (see
+    // workers/runner.py's page-text fallback).
+    page_text: msg.text || "",
     cookies,
   };
   await submitJob(req, sourceTabId);

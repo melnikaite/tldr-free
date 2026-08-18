@@ -735,6 +735,25 @@ def _is_confirmed_silence(segments: list[dict[str, Any]]) -> bool:
     return bool(_ANNOTATION_ONLY_RE.match(joined))
 
 
+def transcript_is_unusable(segments: list[dict[str, Any]]) -> bool:
+    """True when segments carry no usable content — reused (not
+    reimplemented) by runner.py's media page-text fallback gate: empty/
+    punctuation-only/annotation-only (``_is_confirmed_silence``), OR a
+    degenerate repeated run (``collapse_repeated_segments`` discarded
+    something, e.g. a Whisper hallucination loop over near-silent audio).
+
+    Deliberately checked against the raw segment list, NOT
+    ``timecodes.build_marked_text``'s ``[MM:SS]``-marked string — the
+    marked-up text would make ``_is_confirmed_silence``'s bracket-annotation
+    check misfire on a real, non-garbage transcript (every marked line
+    starts with a `[MM:SS]` bracket).
+    """
+    if _is_confirmed_silence(segments):
+        return True
+    _collapsed, discarded = collapse_repeated_segments(segments)
+    return bool(discarded)
+
+
 def _split_into_slices(
     start: float, end: float, max_len: float
 ) -> list[tuple[float, float, bool]]:
@@ -1197,6 +1216,75 @@ def _probe_duration(audio_path: Path) -> float | None:
         return None
 
 
+async def probe_duration(path: Path) -> float | None:
+    """Async wrapper around ``_probe_duration`` for a LOCAL file path.
+
+    Mirrors the internal ``asyncio.to_thread(_probe_duration, audio_path)``
+    call already used by ``_transcribe_chunked`` — exposed publicly so
+    ``runner.py`` can probe a just-downloaded file's real duration before
+    deciding whether to call Whisper at all. This is the required fallback
+    tier for ``kind=media`` jobs whose yt-dlp metadata probe came back with
+    no duration (e.g. a plain static-asset URL — yt-dlp's generic extractor
+    doesn't report ``duration`` for those via ``extract_info(download=
+    False)``, so the pre-download probe alone is not sufficient): download
+    proceeds as normal (cheap), then this runs on the real file, before the
+    (expensive, and — if the clip turns out to be a UI sound effect —
+    fabrication-prone) Whisper call.
+    """
+    return await asyncio.to_thread(_probe_duration, path)
+
+
+def _probe_duration_url(url: str, *, timeout: float = 5.0) -> float | None:
+    """Best-effort duration probe directly against ``url``, no download.
+
+    ffmpeg's http(s) protocol supports byte-range requests, so for a normal
+    seekable static file ffprobe typically needs only 1-2 small requests to
+    read the container's duration metadata — genuinely cheaper than
+    downloading first. Optional/bonus tier, tried before yt-dlp's download
+    step for a ``kind=media`` job whose yt-dlp metadata probe came back with
+    no duration (see ``runner.py``).
+
+    Deliberately conservative:
+    - A hard wall-clock ``timeout`` via ``subprocess.run(..., timeout=...)``
+      is protocol-agnostic — it kills the ffprobe subprocess regardless of
+      what it's doing internally (DNS, TLS handshake, a slow/non-seekable/
+      hostile server holding the connection open), so this can never hang
+      the single Whisper worker.
+    - EVERY failure mode (missing ffprobe, non-zero exit, timeout,
+      unparseable output) swallows to ``None`` and falls through to the
+      normal download path with zero behavior change on failure.
+    - No cookies are forwarded to ffprobe (real added complexity for an
+      optional path) — an authenticated URL simply fails this probe, an
+      acceptable, disclosed limitation, and falls through to the normal
+      (cookie-aware) yt-dlp download, which is NOT a reliability regression.
+    """
+    ffprobe = _ffmpeg_bin("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+                "-of", "csv=p=0", url,
+            ],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        )
+        return float(out.stdout.strip())
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+        ValueError,
+    ) as exc:
+        log.info("transcribe: ffprobe URL duration probe failed (%s)", exc)
+        return None
+
+
+async def probe_url_duration(url: str, *, timeout: float = 5.0) -> float | None:
+    """Async wrapper around ``_probe_duration_url``. See its docstring."""
+    return await asyncio.to_thread(_probe_duration_url, url, timeout=timeout)
+
+
 def _split_audio(
     audio_path: Path, num_chunks: int, chunk_seconds: float
 ) -> list[tuple[Path, float]]:
@@ -1258,4 +1346,10 @@ def _normalise_segments(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
-__all__ = ["transcribe_audio", "TranscribeResult"]
+__all__ = [
+    "transcribe_audio",
+    "TranscribeResult",
+    "transcript_is_unusable",
+    "probe_duration",
+    "probe_url_duration",
+]
