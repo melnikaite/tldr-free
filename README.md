@@ -787,7 +787,9 @@ step at all.
 TLDR runs entirely on your own machine and talks to no server of its own.
 See [PRIVACY.md](PRIVACY.md) for exactly what data the extension and
 daemon touch (including the cookie-forwarding and web-search cases), what's
-stored locally, and how to delete it.
+stored locally, and how to delete it. Chrome Web Store submission copy
+(permission justifications, data-use disclosure, listing text) is drafted
+in [docs/store-listing.md](docs/store-listing.md).
 
 ## License
 

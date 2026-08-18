@@ -43,4 +43,6 @@ a call site). Written for Chrome Web Store / AMO review and for contributors.
 
 No page content, cookie, or transcript ever leaves the machine via the
 extension: the only network destination in extension code is the local
-daemon (`http://127.0.0.1:8765`). See [privacy-policy.md](privacy-policy.md).
+daemon (`http://127.0.0.1:8765`). See [`PRIVACY.md`](../PRIVACY.md) for the
+canonical privacy policy, and [`store-listing.md`](store-listing.md) for the
+same justifications phrased for the Chrome Web Store dashboard fields.
