@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TLDR free",
   "version": "0.1.0",
-  "description": "Local summaries and Q&A with clickable timecodes for pages, PDFs, YouTube and any media. Nothing leaves your machine.",
+  "description": "Summaries, subtitles, translation and Q&A for pages, PDFs, audio and video. Free and 100% private on your own machine.",
   "browser_specific_settings": {
     "gecko": {
       "id": "tldr@melnikaite.github.io",
