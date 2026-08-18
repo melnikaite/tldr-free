@@ -355,6 +355,112 @@ body {
 }
 .summarize-btn:disabled { opacity: 0.6; cursor: progress; }
 
+/* ---------------------------------------------------------------------------
+ * First-run welcome screen (sidepanel/welcome.js) — shown instead of the
+ * "no summary yet" placeholder when GET /health says the daemon or its
+ * configured model backend isn't ready. Left-aligned prose block, unlike
+ * the centered .placeholder-block/.status-block, because this has enough
+ * content (command block, two option cards) that centering would hurt
+ * readability.
+ * ------------------------------------------------------------------------- */
+
+.welcome-block {
+  padding: 1.25rem 1rem;
+  text-align: left;
+}
+.welcome-title {
+  margin: 0 0 0.75rem;
+  font-size: 1.15rem;
+}
+.welcome-block p {
+  margin: 0 0 0.75rem;
+}
+
+.welcome-command {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+  margin: 0 0 0.75rem;
+}
+.welcome-command pre {
+  flex: 1;
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  background: var(--assistant-bg);
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+.welcome-command code {
+  background: transparent;
+  padding: 0;
+  white-space: pre;
+}
+.welcome-copy-btn {
+  flex-shrink: 0;
+  padding: 0.4rem 0.8rem;
+  font: inherit;
+  font-size: 0.85rem;
+  background: none;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.welcome-copy-btn:hover { background: var(--accent); color: #fff; }
+
+.welcome-docs-link {
+  display: inline-block;
+  margin: 0 0 0.75rem;
+  color: var(--accent);
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.welcome-docs-link:hover { text-decoration: underline; }
+
+.welcome-option-card {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--assistant-bg);
+  border-radius: 6px;
+}
+.welcome-option-card h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.95rem;
+}
+.welcome-option-card p { margin: 0; }
+
+.welcome-health-detail {
+  word-break: break-word;
+}
+
+.welcome-options-btn {
+  display: block;
+  margin: 0 0 0.6rem;
+  padding: 0.5rem 1.1rem;
+  font: inherit;
+  font-weight: 500;
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.welcome-options-btn:hover { opacity: 0.9; }
+
+.welcome-check-btn {
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  font-size: 0.85rem;
+  background: none;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.welcome-check-btn:hover { background: var(--assistant-bg); }
+.welcome-check-btn:disabled { opacity: 0.6; cursor: progress; }
+
 .spinner {
   width: 24px;
   height: 24px;

@@ -29,7 +29,7 @@
 //   chrome.storage.session.activeUrl    → URL the panel is following
 
 import { daemon } from "../lib/daemon-client.js";
-import { classifyError, describeQueuedDetail } from "../lib/error-hints.js";
+import { classifyError, describeQueuedDetail, isDaemonUnreachable } from "../lib/error-hints.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { buildFrameRow } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
@@ -41,6 +41,7 @@ import {
   clearChat,
 } from "./chat.js";
 import * as transcript from "./transcript.js";
+import { buildWelcomeView } from "./welcome.js";
 
 /** Remember the id we last broadcast so we only reset the tab on real switches. */
 let _lastBroadcastJobId = /** @type {string | null} */ (null);
@@ -358,9 +359,36 @@ chrome.runtime.onMessage.addListener((msg) => {
       console.error("[TLDR] job-created", e),
     );
   } else if (msg.type === "extraction-error") {
-    renderState({ mode: "error", message: msg.error || "Failed to extract page content." });
+    handleExtractionError(msg.error).catch((e) =>
+      console.error("[TLDR] extraction-error handling", e),
+    );
   }
 });
+
+/**
+ * A job failed to even get created (content-script injection failed, or the
+ * background service worker's POST /jobs threw). Most causes deserve the
+ * plain error box same as before — but "the daemon isn't running" is the
+ * exact first-impression bug this file's welcome screen exists to fix: a
+ * brand new install with nothing configured yet used to land here and show
+ * the same red box a broken year-old install would. Route to the welcome
+ * screen instead when this looks like that case AND we've never seen the
+ * daemon answer /health before (see `_gateIdleOnHealth`'s docstring for why
+ * a returning user still gets the classic error, not the welcome screen).
+ *
+ * @param {string | undefined} rawError
+ */
+async function handleExtractionError(rawError) {
+  const message = rawError || "Failed to extract page content.";
+  if (isDaemonUnreachable(message)) {
+    const { daemonEverReachable } = await chrome.storage.local.get("daemonEverReachable");
+    if (!daemonEverReachable) {
+      renderState({ mode: "welcome", step: "daemon", health: null });
+      return;
+    }
+  }
+  renderState({ mode: "error", message });
+}
 
 /**
  * The user just submitted a job. background.js broadcasts this every time
@@ -455,10 +483,92 @@ async function bootstrap() {
   ]);
   await seedBadge();
   if (activeJobId) {
+    // An existing job takes precedence over the health gate below — if it's
+    // cached and done, there's nothing to warn about; if loading it fails,
+    // loadAndRender's own error path (existing behaviour) handles that.
     await loadAndRender(activeJobId);
-  } else if (activeUrl) {
-    renderState({ mode: "no-summary", url: activeUrl });
+    return;
   }
+  const handled = await _gateIdleOnHealth(activeUrl);
+  if (handled) return;
+  if (activeUrl) renderState({ mode: "no-summary", url: activeUrl });
+}
+
+// ---------------------------------------------------------------------------
+// First-run welcome screen — gates the idle ("no job for this tab") view
+// behind GET /health so a fresh install sees setup guidance instead of the
+// same error box a broken long-time install gets. See welcome.js for the
+// rendered content and extension.md's "Side panel lifecycle" section for
+// the full reasoning.
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe /health once. Never throws — an unreachable daemon IS one of the
+ * three outcomes this module cares about, not something callers need to
+ * catch separately.
+ *
+ * @returns {Promise<{ ok: true, health: import("../lib/api-types.js").HealthResponse } | { ok: false, error: unknown }>}
+ */
+async function _probeHealth() {
+  try {
+    const health = await daemon.health({ signal: AbortSignal.timeout(5000) });
+    return { ok: true, health };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+/**
+ * Gate an idle render (no active job for the current tab) behind GET
+ * /health. Three-way split, all derived from one probe:
+ *
+ *   - daemon unreachable, `daemonEverReachable` never set → this is a
+ *     fresh install with nothing configured yet: render the welcome
+ *     screen's step 1 (install the daemon).
+ *   - daemon unreachable, `daemonEverReachable` already set → a long-time
+ *     user whose daemon just crashed/stopped. Showing "Welcome to TLDR"
+ *     to them would be wrong (see welcome.js's module docstring), so this
+ *     renders the SAME "error" state (and therefore the same
+ *     `classifyError` "The daemon isn't running" hint) a failed job would
+ *     have shown — no new copy, no new logic, just surfaced proactively
+ *     instead of waiting for a click to fail first.
+ *   - daemon reachable but `llm_backend_reachable === false` → welcome
+ *     screen's step 2 (pick a model), regardless of history: the daemon
+ *     answering at all already rules out "never installed anything".
+ *   - everything fine → returns false; caller renders its normal idle view.
+ *
+ * @param {string | undefined} url
+ * @returns {Promise<boolean>} true if this function already rendered a
+ *   state (caller must not also render); false to proceed normally.
+ */
+async function _gateIdleOnHealth(url) {
+  const probe = await _probeHealth();
+  if (!probe.ok) {
+    const { daemonEverReachable } = await chrome.storage.local.get("daemonEverReachable");
+    if (daemonEverReachable) {
+      renderState({ mode: "error", message: stringifyError(probe.error) });
+    } else {
+      renderState({ mode: "welcome", step: "daemon", health: null });
+    }
+    return true;
+  }
+  if (probe.health.llm_backend_reachable === false) {
+    renderState({ mode: "welcome", step: "model", health: probe.health, url });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * "Check again" button handler for the welcome screen — re-runs the same
+ * gate and falls back to the normal "no summary yet" idle view once
+ * everything's ready, without requiring the user to close/reopen the panel.
+ *
+ * @param {string | undefined} url
+ */
+async function _recheckIdleHealth(url) {
+  const handled = await _gateIdleOnHealth(url);
+  if (!handled) renderState({ mode: "no-summary", url: url || "" });
 }
 
 /**
@@ -490,7 +600,8 @@ async function handleSetActiveTab(msg) {
   if (jobId === null) {
     setActiveJob(null);
     clearChat();
-    renderState({ mode: "no-summary", url });
+    const handled = await _gateIdleOnHealth(url);
+    if (!handled) renderState({ mode: "no-summary", url });
     window.scrollTo({ top: 0 });
     return;
   }
@@ -658,6 +769,7 @@ async function loadAndRender(jobId) {
 /** @typedef {(
  *   | { mode: "loading" }
  *   | { mode: "no-summary", url: string }
+ *   | { mode: "welcome", step: "daemon" | "model", health: import("../lib/api-types.js").HealthResponse | null, url?: string }
  *   | { mode: "error", message: string, job?: import("../lib/api-types.js").JobDetails | null }
  *   | { mode: "done", job: import("../lib/api-types.js").JobDetails, content: string }
  *   | { mode: "streaming", job: import("../lib/api-types.js").JobDetails }
@@ -699,6 +811,18 @@ function renderState(state) {
       setStage(null);
       syncChatEnabled(false);
       return;
+
+    case "welcome": {
+      const view = buildWelcomeView(state.step, state.health, {
+        onCheckAgain: () => _recheckIdleHealth(state.url),
+        onOpenOptions: () => chrome.runtime.openOptionsPage(),
+      });
+      summaryEl.innerHTML = "";
+      summaryEl.appendChild(view);
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+    }
 
     case "error": {
       const titleHtml = _titleHtml(state.job || null);
@@ -760,6 +884,7 @@ function _stateKey(state) {
   switch (state.mode) {
     case "loading":    return "loading";
     case "no-summary": return `no-summary:${state.url || ""}`;
+    case "welcome":    return `welcome:${state.step}:${state.health?.llm_backend_error || ""}`;
     case "error":      return `error:${state.job?.id || ""}:${state.message}`;
     case "done":       return `done:${state.job.id}:${state.content?.length ?? 0}`;
     case "streaming":  return `streaming:${state.job.id}`;

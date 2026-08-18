@@ -134,6 +134,59 @@ sidepanel/app.js loadHistory(id) (parallel):
    GET /jobs/{id}/messages → render saved bubbles
 ```
 
+## First-run welcome screen — idle view is gated behind GET /health
+
+Any render of the idle view (no job for the current tab — bootstrap with
+no `activeJobId`, or `handleSetActiveTab`'s `jobId === null` phase) first
+goes through `app.js`'s `_gateIdleOnHealth(url)`, which probes `GET
+/health` once and picks one of four outcomes:
+
+- **daemon unreachable, `chrome.storage.local.daemonEverReachable` never
+  set** → this is a fresh install with nothing configured yet. Renders
+  `sidepanel/welcome.js`'s step **"daemon"**: what the daemon is, the
+  native-install one-liner (copy button) mirrored from README.md's
+  "Install — native, no Docker" section, and a link to the full
+  instructions.
+- **daemon unreachable, `daemonEverReachable` already set** → a
+  previously-working install whose daemon just died. Renders the SAME
+  `"error"` state (and therefore `error-hints.js`'s `classifyError` "The
+  daemon isn't running" hint) a failed job would show — proactively,
+  instead of waiting for a click to fail first. Deliberately NOT the
+  welcome screen: see `welcome.js`'s module docstring for why showing
+  "Welcome to TLDR" to a year-old install would be dishonest.
+- **daemon reachable but `health.llm_backend_reachable === false`** →
+  `welcome.js`'s step **"model"**: the daemon (already confirmed running)
+  stays in the loop either way; the choice is local (free/private, needs
+  memory — numbers mirrored from README.md) vs. cloud (your key, your
+  account, content leaves the machine). Shown regardless of
+  `daemonEverReachable` — the daemon answering at all already rules out
+  "nothing installed".
+- **everything reachable** → `_gateIdleOnHealth` returns `false` and the
+  caller renders the normal `"no-summary"` idle placeholder as before.
+
+`daemon.health()` (lib/daemon-client.js) sets `daemonEverReachable = true`
+on every successful response (whatever `status` says — "degraded" still
+counts, only a thrown fetch means "unreachable"), from ANY caller
+(options/library/sidepanel), so the flag reflects the whole extension's
+history, not just this one check.
+
+The same daemon-unreachable classification also intercepts the OTHER path
+that used to hit the raw error box first: `background.js`'s
+`extraction-error` broadcast (content-script injection failure, or a
+failed `POST /jobs` — the literal "click the toolbar button, get an
+error" bug this screen exists to fix). `app.js`'s `handleExtractionError`
+reuses `error-hints.js`'s exported `isDaemonUnreachable(text)` (the same
+regex `classifyError`'s first branch matches on — never duplicated) to
+decide welcome-vs-classic-error the same way, without a second `/health`
+round-trip.
+
+Each welcome step has its own "Check again" button
+(`_recheckIdleHealth(url)`) that re-runs the same gate and falls back to
+`"no-summary"` once things are ready — no panel reload needed. `"welcome"`
+is its own `renderState` mode (own `ViewState` variant, own `_stateKey`),
+not a branch inside `case "error"` — the two are rendered, and mean,
+different things.
+
 ## Tab tracking — when the panel switches jobs
 
 `background.js` listens to `tabs.onActivated`, `tabs.onUpdated` (URL change
@@ -256,6 +309,10 @@ Invariants if you touch this:
 - **`error-hints.js` stays framework-free** (no `chrome.*`, no DOM) so it
   can run under plain `node --check`/a Node script for regression-checking
   against real captured strings.
+- **`isDaemonUnreachable(rawMessage)`** exports `classifyError`'s first
+  regex test standalone — the first-run welcome screen (see above) reuses
+  it to decide welcome-vs-classic-error from a raw `extraction-error`
+  string, instead of duplicating the pattern.
 - **Never let a `DeferredReason` code reach `classifyError`.** If the
   daemon ever changes to surface these through `job.error` instead of (or
   in addition to) the stage `detail`, that's a deliberate design change —
@@ -267,6 +324,10 @@ Invariants if you touch this:
 - `chrome.storage.session.activeJobId` — currently shown job (clears on browser close)
 - `chrome.storage.session.activeUrl` — last normalized URL synced
 - `chrome.storage.local.daemonUrl` — daemon endpoint (default `http://localhost:8765`)
+- `chrome.storage.local.daemonEverReachable` — set `true` by
+  `daemon.health()` (lib/daemon-client.js) on its first-ever successful
+  `/health` response from any surface; distinguishes a fresh install from
+  a returning user in the first-run welcome screen (see above)
 
 ## Reloading after edits
 

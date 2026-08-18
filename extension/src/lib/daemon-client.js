@@ -134,7 +134,22 @@ export const daemon = {
    * @param {RequestInit} [init] standard fetch init — pass `{ signal }` for timeout/cancel
    * @returns {Promise<HealthResponse>}
    */
-  health: (init) => request("/health", init),
+  health: async (init) => {
+    const resp = await request("/health", init);
+    // Reaching this line means the daemon answered at all (whatever its
+    // `status` field says — "degraded" still counts, only a network
+    // failure would have thrown above). Recorded so the sidepanel's
+    // first-run welcome screen (sidepanel/welcome.js, gated in
+    // sidepanel/app.js's `_gateIdleOnHealth`) can tell "never installed
+    // the daemon" apart from "daemon crashed after working fine for a
+    // year" the next time /health can't be reached — see
+    // extension.md's "Side panel lifecycle" section. Every /health caller
+    // (options, sidepanel, background) contributes to this, not just the
+    // welcome-screen check, so the flag reflects the whole extension's
+    // history, not just one surface's.
+    chrome.storage.local.set({ daemonEverReachable: true }).catch(() => {});
+    return resp;
+  },
 
   /**
    * @param {JobCreateRequest} req

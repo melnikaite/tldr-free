@@ -47,6 +47,23 @@
 const DAEMON_UNREACHABLE_RE =
   /failed to fetch|networkerror when attempting to fetch|load failed|fetch failed|err_connection_refused/i;
 
+/**
+ * Whether `rawMessage` looks like the daemon itself couldn't be reached at
+ * all (dead socket, wrong port, daemon never started) — the same signal
+ * `classifyError`'s first branch matches on. Exported separately so the
+ * sidepanel's first-run welcome screen (app.js's `_gateIdleOnHealth`) can
+ * reuse this ONE classification instead of re-implementing it: a raw
+ * `extraction-error` message (background.js's createJob POST failing) needs
+ * the same test to decide "show the welcome screen" vs "show the normal
+ * error box", without duplicating the regex.
+ *
+ * @param {string} rawMessage
+ * @returns {boolean}
+ */
+export function isDaemonUnreachable(rawMessage) {
+  return DAEMON_UNREACHABLE_RE.test(String(rawMessage ?? ""));
+}
+
 // ---------------------------------------------------------------------------
 // Pattern 2 — context/token-size overflow. Mirrors
 // `daemon/src/api/config.py::_looks_like_context_overflow` exactly: a
@@ -126,7 +143,7 @@ export function classifyError(rawMessage, health) {
   // nothing else about the message (or `health`) can be trusted: the
   // fetch never reached the daemon, so there's no backend/job context to
   // read anything else out of.
-  if (DAEMON_UNREACHABLE_RE.test(text)) {
+  if (isDaemonUnreachable(text)) {
     return {
       title: "The daemon isn't running",
       explanation:
