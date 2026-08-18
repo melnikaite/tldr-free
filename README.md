@@ -782,6 +782,13 @@ architecture, event model, worker invariants, dev runbook. `task test` runs
 ruff + mypy + pytest in the daemon container; the extension has no build
 step at all.
 
+## Privacy
+
+TLDR runs entirely on your own machine and talks to no server of its own.
+See [PRIVACY.md](PRIVACY.md) for exactly what data the extension and
+daemon touch (including the cookie-forwarding and web-search cases), what's
+stored locally, and how to delete it.
+
 ## License
 
 MIT.
