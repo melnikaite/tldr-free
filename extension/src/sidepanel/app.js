@@ -29,6 +29,7 @@
 //   chrome.storage.session.activeUrl    → URL the panel is following
 
 import { daemon } from "../lib/daemon-client.js";
+import { classifyError, describeQueuedDetail } from "../lib/error-hints.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { buildFrameRow } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
@@ -708,10 +709,16 @@ function renderState(state) {
         ${titleHtml}
         <div class="status-block error">
           <p><strong>Error.</strong></p>
-          <p class="muted small">${escapeHtml(state.message)}</p>
+          <div class="error-hint"></div>
           ${retryHtml}
         </div>
       `;
+      // Fire-and-forget: fills in the .error-hint div once GET /health
+      // (best-effort) comes back. Never blocks the raw-text fallback,
+      // which is built synchronously below.
+      _renderErrorHint(state.message).catch((e) =>
+        console.warn("[TLDR] error hint rendering failed:", e),
+      );
       _bindRetryButton(state.job || null);
       setStage(null);
       syncChatEnabled(false);
@@ -738,6 +745,7 @@ function renderState(state) {
       summaryEl.innerHTML =
         `${titleHtml}` +
         `<ul class="timeline" id="phase-timeline"></ul>` +
+        `<div class="queued-hint" id="queued-hint" hidden></div>` +
         `<div class="markdown-body" id="summary-stream"></div>`;
       _attachStreamSubscription(state.job);
       // Chat is disabled while streaming: daemon /ai/qa requires status=done.
@@ -1082,6 +1090,76 @@ function _bindRetryButton(job) {
 }
 
 /**
+ * Fills the `.error-hint` div from the current "error" render with a
+ * human-readable explanation (see lib/error-hints.js) above the raw text,
+ * which always stays available under a "Technical details" `<details>`.
+ *
+ * GET /health feeds the "model backend unreachable"/"auth" branches — a
+ * short timeout so a dead daemon (which can't answer /health either)
+ * doesn't leave this hanging; a failed probe just means those two
+ * branches can't fire, not that the whole hint is skipped.
+ *
+ * Built with textContent/createElement throughout, not innerHTML: `message`
+ * and `health.llm_backend_error` both come from the daemon/backend, i.e.
+ * untrusted input.
+ *
+ * @param {string} message
+ */
+async function _renderErrorHint(message) {
+  const container = summaryEl.querySelector(".error-hint");
+  if (!container) return; // state moved on before this ran
+
+  /** @type {import("../lib/api-types.js").HealthResponse | null} */
+  let health = null;
+  try {
+    health = await daemon.health({ signal: AbortSignal.timeout(6000) });
+  } catch {
+    health = null;
+  }
+
+  // The view may have moved on to a different render while /health was
+  // in flight (retry, job switch, …) — bail rather than paint a stale
+  // hint into a container that isn't the current one any more.
+  if (summaryEl.querySelector(".error-hint") !== container) return;
+
+  const hint = classifyError(message, health);
+  container.textContent = "";
+
+  if (hint) {
+    const titleP = document.createElement("p");
+    titleP.className = "error-hint-title";
+    const strong = document.createElement("strong");
+    strong.textContent = hint.title;
+    titleP.appendChild(strong);
+    container.appendChild(titleP);
+
+    const explanationP = document.createElement("p");
+    explanationP.className = "muted small";
+    explanationP.textContent = hint.explanation;
+    container.appendChild(explanationP);
+
+    if (hint.action?.kind === "open-options") {
+      const actionBtn = document.createElement("button");
+      actionBtn.type = "button";
+      actionBtn.className = "error-hint-action";
+      actionBtn.textContent = hint.action.label;
+      actionBtn.addEventListener("click", () => chrome.runtime.openOptionsPage());
+      container.appendChild(actionBtn);
+    }
+  }
+
+  const details = document.createElement("details");
+  details.className = "error-hint-details";
+  const summaryNode = document.createElement("summary");
+  summaryNode.textContent = "Technical details";
+  details.appendChild(summaryNode);
+  const rawP = document.createElement("p");
+  rawP.textContent = message;
+  details.appendChild(rawP);
+  container.appendChild(details);
+}
+
+/**
  * Wire up the live event-stream subscription for a streaming job. Expects
  * `summaryEl` to already contain the streaming skeleton (timeline + stream
  * div). The unsubscribe handle goes into `activeStreamUnsubscribe`; any
@@ -1112,6 +1190,10 @@ function _attachStreamSubscription(job) {
   /** @type {number | null} */
   let rafId = null;
   setStage(initialStage);
+  // No detail is known yet at cold load — GET /jobs/{id} carries no trace
+  // of a DeferredReason (see _renderQueuedHint's docstring). Only a LIVE
+  // "stage" event below can ever populate this.
+  _renderQueuedHint(initialStage, undefined);
 
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
@@ -1137,6 +1219,7 @@ function _attachStreamSubscription(job) {
       setStage(ev.stage, ev.detail);
       pushOrUpdatePhase(phases, ev.stage, ev.detail || undefined);
       renderTimeline(timelineEl, phases);
+      _renderQueuedHint(ev.stage, ev.detail);
     } else if (ev.type === "delta") {
       if (firstDelta) {
         markAllDone(phases);
@@ -1295,6 +1378,55 @@ function setStage(stage, detail) {
   }
   stageBadgeEl.classList.remove("hidden");
   stageBadgeEl.textContent = detail ? `${stage} · ${detail}` : stage;
+}
+
+/**
+ * Fills/hides the `#queued-hint` div (see the "streaming" render case)
+ * with a human explanation of why a job is PARKED in the "queued" stage
+ * — see lib/error-hints.js's `describeQueuedDetail` docstring for why
+ * this is a distinct signal/function from the "error" hint, and why it
+ * can only ever be populated from a live "stage" event's `detail`, never
+ * from a cold `GET /jobs/{id}` load.
+ *
+ * Deliberately NOT the red `.status-block.error` styling — the job is
+ * waiting, not dead. Built with textContent/createElement: this renders
+ * from the daemon's own event stream, i.e. untrusted input.
+ *
+ * @param {string | null | undefined} stage
+ * @param {string | null | undefined} detail
+ */
+function _renderQueuedHint(stage, detail) {
+  const el = /** @type {HTMLElement | null} */ (document.getElementById("queued-hint"));
+  if (!el) return;
+  el.textContent = "";
+
+  const info = stage === "queued" ? describeQueuedDetail(detail) : null;
+  if (!info) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  const titleP = document.createElement("p");
+  titleP.className = "queued-hint-title";
+  const strong = document.createElement("strong");
+  strong.textContent = info.title;
+  titleP.appendChild(strong);
+  el.appendChild(titleP);
+
+  const explanationP = document.createElement("p");
+  explanationP.className = "muted small";
+  explanationP.textContent = info.explanation;
+  el.appendChild(explanationP);
+
+  if (info.action?.kind === "open-options") {
+    const actionBtn = document.createElement("button");
+    actionBtn.type = "button";
+    actionBtn.className = "queued-hint-action";
+    actionBtn.textContent = info.action.label;
+    actionBtn.addEventListener("click", () => chrome.runtime.openOptionsPage());
+    el.appendChild(actionBtn);
+  }
 }
 
 /** @param {number} n */

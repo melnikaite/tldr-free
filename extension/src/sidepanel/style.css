@@ -267,6 +267,67 @@ body {
 }
 .retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Human-readable error hint (lib/error-hints.js) shown above the raw
+   error text — see the "error" case in renderState(). Text reverts to the
+   normal foreground color despite living inside .status-block.error,
+   which otherwise tints everything error-red; only the title keeps that
+   emphasis. */
+.error-hint { width: 100%; text-align: left; color: var(--fg); }
+.error-hint-title { margin: 0 0 0.3rem; }
+.error-hint-title strong { color: var(--error); }
+.error-hint p { color: var(--fg); }
+.error-hint-action {
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  background: none;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.error-hint-action:hover { background: var(--accent); color: #fff; }
+.error-hint-details {
+  margin-top: 0.6rem;
+  font-size: 0.85em;
+}
+.error-hint-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+.error-hint-details > summary:hover { color: var(--accent); }
+.error-hint-details p {
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Parked-job notice (lib/error-hints.js's describeQueuedDetail) — shown
+   inside the "streaming" render case above the phase timeline while a job
+   sits in "queued" waiting on Whisper. Neutral surface color deliberately
+   NOT the .status-block.error red — the job is waiting, not dead. */
+.queued-hint {
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--assistant-bg);
+  border-radius: 6px;
+  text-align: left;
+}
+.queued-hint-title { margin: 0 0 0.3rem; color: var(--fg); }
+.queued-hint p { margin: 0; }
+.queued-hint-action {
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  background: none;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.queued-hint-action:hover { background: var(--accent); color: #fff; }
+
 .placeholder-block {
   display: flex;
   flex-direction: column;

@@ -130,8 +130,11 @@ export const daemon = {
    */
   baseUrl: () => getBaseUrl(),
 
-  /** @returns {Promise<HealthResponse>} */
-  health: () => request("/health"),
+  /**
+   * @param {RequestInit} [init] standard fetch init — pass `{ signal }` for timeout/cancel
+   * @returns {Promise<HealthResponse>}
+   */
+  health: (init) => request("/health", init),
 
   /**
    * @param {JobCreateRequest} req

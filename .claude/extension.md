@@ -157,6 +157,78 @@ the `done` event for a streaming job. Two defences in `app.js`:
 If you find a way to lose the final state again, add a third defence in
 the same place. Don't paper over with polling.
 
+## Error hints — raw backend text isn't the whole story
+
+`lib/error-hints.js` turns raw backend text into something a human can
+act on, for TWO unrelated signals — keep them separate, they render into
+different UI and mean different things:
+
+- **`classifyError(rawMessage, health)`** — for the `"error"` render
+  state (`app.js`'s `_renderErrorHint()`). Pattern-matches `job.error` (or
+  a stringified fetch/thrown error), plus a best-effort `GET /health`,
+  into `{ title, explanation, action }` for the failures that account for
+  almost everything seen on localhost: daemon unreachable, model backend
+  unreachable/unauthorized, context overflow, model not found, stream
+  stall. Rendered inside the red `.status-block.error` box — this is
+  always a genuinely failed/dead job.
+- **`describeQueuedDetail(detail)`** — for the `"streaming"` render
+  state's `#queued-hint` div (`app.js`'s `_renderQueuedHint()`, called
+  from the live "stage" event handler in `_attachStreamSubscription`).
+  Explains a job PARKED in `stage === "queued"` with a `detail` matching
+  one of `api.schemas.DeferredReason`'s three codes
+  (`daemon/src/api/schemas.py:69`: `transcript_unavailable`,
+  `transcript_blocked`, `network_error` — the transcript fast path
+  deferred to Whisper, or the retry loop feeding it gave up). Rendered
+  in a neutral `.queued-hint` box, never the error styling: the job is
+  waiting, not dead.
+
+Both fetch a raw signal, classify it, and render via
+`textContent`/`createElement` (never `innerHTML` — the raw message,
+`health.llm_backend_error`, and the stage `detail` are all
+backend-controlled strings), with `app.js` owning the
+`action.kind === "open-options"` → `chrome.runtime.openOptionsPage()`
+wiring in both cases. `classifyError` additionally keeps the raw text
+visible under a "Technical details" `<details>` (the queued-hint has no
+raw-text fallback to preserve — the compact stage badge/timeline still
+shows the bare `detail` code alongside it, same as before).
+
+**Why these two are different functions, not one:** traced through
+`daemon/src/workers/pipeline.py`, a `DeferredReason` only ever feeds a
+log line and `stage_event("queued", detail=reason.value)` — it is never
+passed to `mark_failed`, so no `job.error` string can ever carry it.
+Verified empirically, not just by reading the source: a throwaway pytest
+run against the real pipeline (mocked network calls only, same fixture
+pattern as `daemon/tests/test_api_jobs.py`'s
+`test_post_jobs_youtube_without_transcript_defers`) confirmed the broker
+really does publish `{type: "stage", stage: "queued", detail:
+"transcript_unavailable", ...}`, and confirmed a subsequent
+`GET /jobs/{id}` carries no trace of the reason anywhere — `JobDetails`
+has no field for it. So these codes can only ever be shown to a panel
+that is live-subscribed via `GET /events` at the exact moment the
+pipeline defers; a panel that opens/reopens after a job has already
+settled into `queued` has no way to know why (this is a real, currently
+unfixed gap — not something the extension can paper over without the
+daemon persisting the reason somewhere `GET /jobs/{id}` can read).
+
+Invariants if you touch this:
+
+- **No guessed diagnosis.** Both functions return `null` when nothing
+  matches; the caller's existing fallback (raw text, or a hidden
+  `#queued-hint`) is what renders then. Never widen a pattern just to
+  "cover" an unrecognized string — a wrong diagnosis is worse than none.
+- **Classify by message content, not status code** — mirrors
+  `daemon/src/api/config.py::_looks_like_context_overflow` for the context
+  bucket (context/tokens + an overflow word), since backends relay the
+  same failure at different HTTP status codes.
+- **`error-hints.js` stays framework-free** (no `chrome.*`, no DOM) so it
+  can run under plain `node --check`/a Node script for regression-checking
+  against real captured strings.
+- **Never let a `DeferredReason` code reach `classifyError`.** If the
+  daemon ever changes to surface these through `job.error` instead of (or
+  in addition to) the stage `detail`, that's a deliberate design change —
+  update this doc and decide then whether `classifyError` needs its own
+  branch, rather than silently duplicating `describeQueuedDetail`'s logic.
+
 ## State (chrome.storage)
 
 - `chrome.storage.session.activeJobId` — currently shown job (clears on browser close)
