@@ -267,6 +267,26 @@ storage:
   db_filename: tldr.db
   retention_days: 365               # daemon deletes jobs older than this; 0 disables
 
+# ---------------------------------------------------------------------------
+# Q&A (follow-up questions in the side panel).
+#
+# web_search: true (default) — when the processed material doesn't fully
+# answer your question, the daemon runs a DuckDuckGo text search built from
+# your question, then fetches and cleans a handful of the resulting pages,
+# to enrich the answer. This means a search-engine query derived from your
+# question, and requests to whatever pages DuckDuckGo returns, go out over
+# the internet — separate from your configured LLM backend and from the
+# original page/video fetch. The side panel shows a "searching" stage while
+# this happens, so it's never silent (see PRIVACY.md's "Web search for Q&A").
+#
+# web_search: false — disables this entirely: no DuckDuckGo query, no page
+# fetch, ever. The daemon answers only from the material you processed and
+# the model's own training knowledge, and is told to say plainly when
+# something isn't covered rather than guess.
+# ---------------------------------------------------------------------------
+qa:
+  web_search: true
+
 workers:
   # Sleep this long between consecutive background jobs (Whisper queue and
   # streaming summaries) to let the CPU/GPU cool down. 0 = back-to-back.

@@ -311,6 +311,29 @@ def _plan_messages(
     return [{"role": "user", "content": prompt}]
 
 
+# Appended to the synthesis prompt ONLY when `config.qa.web_search` is
+# False — never interpolated into qa.txt itself, so the web_search=True path
+# (the default, and the only path that existed before this setting did)
+# renders a byte-identical prompt to before. qa.txt's rule #3 ("your own
+# general knowledge — to explain, add context, or fill in what the material
+# does not cover") and its "never refuse with 'the material doesn't say'"
+# line are exactly right when a web search backs them up, but with search
+# disabled outright there is no web results block to catch a bad guess — so
+# this note narrows that permission back down for THIS answer: general
+# knowledge to explain/contextualize is still fine, but presenting an
+# unverifiable current/external specific as fact is not.
+_NO_WEB_SEARCH_RULE = (
+    "\n\nWeb search is disabled for this answer (the user turned it off). "
+    "If the material, the visual findings, and your own general knowledge "
+    "together do not cover part of the question — especially anything "
+    "current, external, or specific that only a live search could confirm "
+    "— say so plainly instead of guessing or presenting a guess as fact. "
+    "You may still use general knowledge to explain or add context, exactly "
+    "as instructed above; you must not invent the specific fact, number, "
+    "name, or 'as of today' detail the question is actually asking for."
+)
+
+
 def _answer_messages(
     *,
     output_language: str,
@@ -320,6 +343,7 @@ def _answer_messages(
     web_results: str,
     frame_findings: str,
     from_audio: bool,
+    web_search_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     timestamp_rules = (
         _TIMESTAMP_RULES_TRANSCRIPT if from_audio else _TIMESTAMP_RULES_DOCUMENT
@@ -333,6 +357,8 @@ def _answer_messages(
         frame_findings=frame_findings or "(no frames were examined)",
         timestamp_rules=timestamp_rules,
     )
+    if not web_search_enabled:
+        prompt = f"{prompt}{_NO_WEB_SEARCH_RULE}"
     return [{"role": "user", "content": prompt}]
 
 
@@ -836,9 +862,15 @@ async def stream_answer(
     if frame_refs:
         yield {"type": "frames", "items": frame_refs}
 
-    # Step 3: SEARCH unless the material clearly suffices on its own.
+    # Step 3: SEARCH unless the material clearly suffices on its own, AND
+    # web search is enabled (`config.qa.web_search`, default True). When
+    # disabled, this step never runs at all — no DuckDuckGo query, no page
+    # fetch — regardless of what PLAN decided; the synthesis prompt below
+    # (`_NO_WEB_SEARCH_RULE`) is what keeps the model honest about the gap
+    # instead of fabricating.
+    web_search_enabled = get_config().qa.web_search
     web_results = ""
-    if not sufficient:
+    if not sufficient and web_search_enabled:
         yield {"type": "stage", "stage": "searching", "detail": query}
         try:
             results = await _search.ddg_search_with_content(query)
@@ -856,6 +888,7 @@ async def stream_answer(
         web_results=web_results,
         frame_findings="\n\n".join(frame_findings),
         from_audio=from_audio,
+        web_search_enabled=web_search_enabled,
     )
     async for delta in llm_client.stream_with_messages(
         messages,

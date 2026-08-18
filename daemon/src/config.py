@@ -273,6 +273,25 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+class QaConfig(BaseModel):
+    """Follow-up Q&A behaviour (`llm/qa.py`'s plan -> look -> search ->
+    synthesis flow)."""
+
+    # When True (default), a Q&A turn that the PLAN step judges insufficient
+    # runs a DuckDuckGo text search (`workers/search.py`) built from the
+    # question, then fetches and cleans a handful of the resulting pages, to
+    # enrich the answer — a search-engine query derived from your question,
+    # plus requests to whatever pages DuckDuckGo returns, go out over the
+    # internet. The side panel shows this via a "searching" stage so it's
+    # never silent. Set to False to disable web search entirely for Q&A: no
+    # DuckDuckGo query, no page fetch, ever. The daemon then answers only
+    # from the processed material and the model's own training knowledge,
+    # and is instructed to say plainly when something isn't covered rather
+    # than guess (see `llm/qa.py`'s synthesis prompt) — for anyone who wants
+    # follow-up questions to stay as local as the rest of the pipeline.
+    web_search: bool = True
+
+
 class Config(BaseModel):
     llm: LLMConfig
     whisper: WhisperConfig
@@ -281,6 +300,7 @@ class Config(BaseModel):
     storage: StorageConfig
     workers: WorkersConfig = Field(default_factory=WorkersConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    qa: QaConfig = Field(default_factory=QaConfig)
 
 
 def _apply_env_overrides(data: dict[str, Any], prefix: str = "TLDR") -> dict[str, Any]:

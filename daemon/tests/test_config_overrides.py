@@ -124,6 +124,16 @@ def test_get_config_works_when_overrides_file_absent(isolated_config: Path) -> N
     assert cfg.output.language == "en"
 
 
+def test_qa_web_search_defaults_true_when_section_absent(isolated_config: Path) -> None:
+    """`_minimal_yaml()` (this file's template, like every existing user's
+    real `tldr.yaml` written before this setting existed) has no `qa:`
+    section at all — `QaConfig`'s `default_factory` on `Config.qa` must
+    still produce `web_search=True` so nobody's behavior silently changes."""
+    assert not config_mod.overrides_path().is_file()
+    cfg = config_mod.get_config()
+    assert cfg.qa.web_search is True
+
+
 def test_env_override_still_wins_over_local_overrides(
     isolated_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

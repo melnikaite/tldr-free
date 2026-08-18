@@ -244,6 +244,106 @@ async def test_insufficient_material_triggers_search(
 
 
 @pytest.mark.asyncio
+async def test_web_search_disabled_skips_search_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``qa.web_search=False`` must stop SEARCH from running at all — no DDG
+    call, no ``searching`` stage — even though PLAN says the material is
+    insufficient (the exact condition that triggers a search when the
+    setting is on, see ``test_insufficient_material_triggers_search``). The
+    answer must still stream, and the synthesis prompt must carry the
+    anti-fabrication rule instead of silently going quiet."""
+    from src import config as config_mod
+
+    cfg = config_mod.get_config()
+    monkeypatch.setattr(cfg.qa, "web_search", False)
+
+    called: list[str] = []
+
+    async def boom_ddg(query: str, **kwargs: object) -> list[dict[str, Any]]:
+        called.append(query)
+        raise AssertionError("ddg_search_with_content must not be called when web_search=False")
+
+    monkeypatch.setattr(qa_mod._search, "ddg_search_with_content", boom_ddg)
+
+    async def fake_complete(messages: list[dict], **kwargs: object) -> Any:
+        return _plan_completion(False, "some query")
+
+    streamed: list[list[dict]] = []
+
+    async def fake_stream(messages: list[dict], **kwargs: object) -> AsyncIterator[str]:
+        streamed.append(messages)
+        yield "final answer"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _FakeJob(title="T", raw_text="text", summary_md=None)
+    items = [
+        item
+        async for item in qa_mod.stream_answer(
+            job=job, question="how much VRAM", output_language="English", from_audio=True
+        )
+    ]
+
+    assert called == []
+    stages = [i for i in items if isinstance(i, dict)]
+    assert stages == []  # no "searching" stage emitted
+    assert "".join(s for s in items if isinstance(s, str)) == "final answer"
+    prompt = streamed[0][0]["content"]
+    assert "no web search was run" in prompt
+    assert "Web search is disabled for this answer" in prompt
+
+
+@pytest.mark.asyncio
+async def test_web_search_enabled_by_default_matches_prior_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh config (no explicit override) defaults ``qa.web_search`` to
+    True, so insufficient material still triggers a real search — same
+    behaviour as before this setting existed."""
+    from src import config as config_mod
+
+    cfg = config_mod.get_config()
+    assert cfg.qa.web_search is True
+
+    searched: list[str] = []
+
+    async def fake_ddg(query: str, **kwargs: object) -> list[dict[str, Any]]:
+        searched.append(query)
+        return [{"title": "T", "href": "h", "body": "b", "content": "c"}]
+
+    monkeypatch.setattr(qa_mod._search, "ddg_search_with_content", fake_ddg)
+
+    async def fake_complete(messages: list[dict], **kwargs: object) -> Any:
+        return _plan_completion(False, "q")
+
+    streamed: list[list[dict]] = []
+
+    async def fake_stream(messages: list[dict], **kwargs: object) -> AsyncIterator[str]:
+        streamed.append(messages)
+        yield "final answer"
+
+    monkeypatch.setattr(llm_client, "complete_with_messages", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_with_messages", fake_stream)
+
+    job = _FakeJob(title="T", raw_text="text", summary_md=None)
+    items = [
+        item
+        async for item in qa_mod.stream_answer(
+            job=job, question="q", output_language="English", from_audio=True
+        )
+    ]
+
+    stages = [i for i in items if isinstance(i, dict)]
+    assert len(stages) == 1
+    assert stages[0]["stage"] == "searching"
+    assert searched == ["q"]
+    prompt = streamed[0][0]["content"]
+    assert "Web search is disabled for this answer" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_plan_tool_error_defaults_to_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

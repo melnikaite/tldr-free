@@ -573,6 +573,62 @@ def test_patch_retention_days_leaves_template_untouched(
 
 
 # ---------------------------------------------------------------------------
+# qa.web_search — Q&A's on/off switch for the DuckDuckGo search step
+# ---------------------------------------------------------------------------
+
+
+def test_get_config_reports_default_web_search_true(client: TestClient) -> None:
+    """The fixture's `_minimal_yaml()` never sets a `qa:` section at all —
+    this is exactly the "existing user's tldr.yaml predates this setting"
+    case, and it must default to True silently (no behavior change for
+    anyone who hasn't touched this)."""
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    assert r.json()["qa"]["web_search"] is True
+
+
+def test_patch_web_search_false_round_trips_through_get(
+    client: TestClient, tmp_path: Path
+) -> None:
+    r = client.patch("/config", json={"qa": {"web_search": False}})
+    assert r.status_code == 200, r.text
+    assert r.json()["qa"]["web_search"] is False
+
+    assert client.get("/config").json()["qa"]["web_search"] is False
+
+    # Written to the overrides file, never the template.
+    overrides = yaml.safe_load((tmp_path / "tldr.local.yaml").read_text())
+    assert overrides["qa"]["web_search"] is False
+
+
+def test_patch_web_search_true_round_trips_through_get(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Explicitly setting it back to True (e.g. after having turned it off)
+    also round-trips — not just the implicit default."""
+    client.patch("/config", json={"qa": {"web_search": False}})
+    r = client.patch("/config", json={"qa": {"web_search": True}})
+    assert r.status_code == 200, r.text
+    assert r.json()["qa"]["web_search"] is True
+    assert client.get("/config").json()["qa"]["web_search"] is True
+
+
+def test_patch_web_search_leaves_template_untouched(
+    client: TestClient, tmp_path: Path
+) -> None:
+    template_before = (tmp_path / "tldr.yaml").read_text()
+    r = client.patch("/config", json={"qa": {"web_search": False}})
+    assert r.status_code == 200, r.text
+    assert (tmp_path / "tldr.yaml").read_text() == template_before
+
+
+def test_patch_web_search_malformed_type_returns_422(client: TestClient, tmp_path: Path) -> None:
+    r = client.patch("/config", json={"qa": {"web_search": "not-a-bool"}})
+    assert r.status_code == 422, r.text
+    assert not (tmp_path / "tldr.local.yaml").exists()
+
+
+# ---------------------------------------------------------------------------
 # POST /config/test — probes without saving, always 200
 # ---------------------------------------------------------------------------
 

@@ -102,6 +102,7 @@ from src.api.schemas import (
     ConfigTestWhisperOverrides,
     LLMConfigOut,
     OutputConfigOut,
+    QaConfigOut,
     StorageConfigOut,
     WhisperConfigOut,
 )
@@ -279,6 +280,7 @@ def _to_response(cfg: Config) -> ConfigResponse:
         ),
         output=OutputConfigOut(language=cfg.output.language),
         storage=StorageConfigOut(retention_days=cfg.storage.retention_days),
+        qa=QaConfigOut(web_search=cfg.qa.web_search),
         config_path=str(config_module.config_path()),
         overrides_path=str(config_module.overrides_path()),
         keychain_available=config_module.keychain_backend_available(),
@@ -406,6 +408,7 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     whisper_overrides = dict(overrides.get("whisper") or {})
     output_overrides = dict(overrides.get("output") or {})
     storage_overrides = dict(overrides.get("storage") or {})
+    qa_overrides = dict(overrides.get("qa") or {})
 
     # Set only when this PATCH actually (re)writes the API key for that
     # section — that's the one case worth a write-then-read-back check (see
@@ -477,12 +480,16 @@ async def patch_config_route(body: ConfigPatchRequest) -> ConfigPatchResponse:
     if body.storage is not None:
         storage_overrides.update(body.storage.model_dump(exclude_unset=True))
 
+    if body.qa is not None:
+        qa_overrides.update(body.qa.model_dump(exclude_unset=True))
+
     new_overrides: dict[str, Any] = dict(overrides)
     for section_name, section_val in (
         ("llm", llm_overrides),
         ("whisper", whisper_overrides),
         ("output", output_overrides),
         ("storage", storage_overrides),
+        ("qa", qa_overrides),
     ):
         if section_val:
             new_overrides[section_name] = section_val

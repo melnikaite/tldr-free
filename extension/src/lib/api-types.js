@@ -404,11 +404,20 @@
  */
 
 /**
+ * @typedef {object} QaConfigOut
+ * @property {boolean} web_search   - when true (default), a Q&A turn the plan step
+ *   judges insufficient runs a DuckDuckGo search + page fetch to enrich the answer;
+ *   when false, that step never runs at all and the model is instructed to say
+ *   plainly when the material/its own knowledge don't cover something.
+ */
+
+/**
  * @typedef {object} ConfigResponse
  * @property {LLMConfigOut} llm
  * @property {WhisperConfigOut} whisper
  * @property {OutputConfigOut} output
  * @property {StorageConfigOut} storage
+ * @property {QaConfigOut} qa
  * @property {string} config_path      - absolute path to tldr.yaml (read-only template)
  * @property {string} overrides_path   - absolute path to tldr.local.yaml (PATCH target)
  * @property {boolean} keychain_available - whether the OS keychain backend is actually
@@ -461,11 +470,17 @@
  */
 
 /**
+ * @typedef {object} QaConfigPatch
+ * @property {boolean} [web_search]
+ */
+
+/**
  * @typedef {object} ConfigPatchRequest
  * @property {LLMConfigPatch} [llm]
  * @property {WhisperConfigPatch} [whisper]
  * @property {OutputConfigPatch} [output]
  * @property {StorageConfigPatch} [storage]
+ * @property {QaConfigPatch} [qa]
  */
 
 /**

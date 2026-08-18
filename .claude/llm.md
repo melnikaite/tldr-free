@@ -117,6 +117,32 @@ often could only say the action wasn't determinable from blurry frames.
 Measured on `qwen3-vl-8b-instruct` — gemma is weaker at this (see the
 README's Quick start section).
 
+## SEARCH has an on/off switch: `config.qa.web_search`
+
+The plan → look → search → synthesis flow's SEARCH step (DuckDuckGo query
++ page fetch via `workers/search.py`) is gated by `config.qa.web_search`
+(`QaConfig`, default `True`) in addition to PLAN's `sufficient` verdict —
+`stream_answer` only calls `_search.ddg_search_with_content` when BOTH
+`not sufficient` AND `web_search` is true. With it `False`, the step never
+runs at all: no query built into a DDG call, no page fetched, regardless
+of what PLAN decided. PLAN itself still runs unconditionally either way —
+turning search off doesn't change PLAN's tool/prompt, it just makes the
+verdict a no-op for step 3. Exposed via `GET`/`PATCH /config` (`qa.web_search`,
+mirrored in the extension's `api-types.js`) and a checkbox on the options
+page; documented in `tldr.yaml.example`.
+
+Turning search off removes the one source `qa.txt`'s "never refuse with
+'the material doesn't say'" permission assumes is available to catch a bad
+guess. Rather than editing `qa.txt` itself (which would also touch the
+`web_search=True` path, where behavior must stay identical to before this
+setting existed), `_answer_messages` appends an extra
+`_NO_WEB_SEARCH_RULE` block to the prompt ONLY when `web_search` is
+`False` — same "append, don't interpolate" technique `_plan_messages`
+already uses for the LOOK step's candidates block. The appended rule keeps
+the "general knowledge to explain/contextualize" permission intact but
+tells the model plainly to say "the material doesn't cover this" instead
+of inventing a current/external specific it has no way to have looked up.
+
 ## Timecodes are formatted in ONE place
 
 `daemon/src/workers/timecodes.build_marked_text` is the single source of

@@ -549,11 +549,19 @@ class StorageConfigOut(BaseModel):
     retention_days: int
 
 
+class QaConfigOut(BaseModel):
+    """Q&A web-search setting as reported by ``GET /config`` /
+    ``PATCH /config``. See ``config.QaConfig`` for what ``web_search``
+    actually gates."""
+    web_search: bool
+
+
 class ConfigResponse(BaseModel):
     llm: LLMConfigOut
     whisper: WhisperConfigOut
     output: OutputConfigOut
     storage: StorageConfigOut
+    qa: QaConfigOut
     config_path: str        # absolute path to tldr.yaml (read-only template)
     overrides_path: str     # absolute path to tldr.local.yaml (PATCH target)
     # Whether the OS keychain backend is actually usable (a real backend,
@@ -611,11 +619,17 @@ class StorageConfigPatch(BaseModel):
     retention_days: int | None = Field(default=None, ge=0, le=_MAX_RETENTION_DAYS)
 
 
+class QaConfigPatch(BaseModel):
+    """Partial update for ``qa``."""
+    web_search: bool | None = None
+
+
 class ConfigPatchRequest(BaseModel):
     llm: LLMConfigPatch | None = None
     whisper: WhisperConfigPatch | None = None
     output: OutputConfigPatch | None = None
     storage: StorageConfigPatch | None = None
+    qa: QaConfigPatch | None = None
 
 
 class ConfigPatchResponse(ConfigResponse):

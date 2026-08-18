@@ -136,6 +136,10 @@ const outputLanguageInput = /** @type {HTMLInputElement} */ (
   document.getElementById("output-language")
 );
 
+const qaWebSearchCheckbox = /** @type {HTMLInputElement} */ (
+  document.getElementById("qa-web-search")
+);
+
 const storageRetentionDaysInput = /** @type {HTMLInputElement} */ (
   document.getElementById("storage-retention-days")
 );
@@ -283,6 +287,10 @@ function renderConfig(cfg) {
 
   outputLanguageInput.value = cfg.output?.language ?? "";
 
+  // Default true when the section is absent (matches the daemon's own
+  // default for an existing config with no `qa:` block at all).
+  qaWebSearchCheckbox.checked = cfg.qa?.web_search ?? true;
+
   renderStorageSection(cfg);
 }
 
@@ -407,6 +415,13 @@ function buildPatch() {
   const outputPatch = {};
   addStringDiff(outputPatch, "language", outputLanguageInput.value, lastConfig.output?.language);
   if (Object.keys(outputPatch).length) patch.output = outputPatch;
+
+  const qaPatch = {};
+  const qaWebSearchOld = lastConfig.qa?.web_search ?? true;
+  if (qaWebSearchCheckbox.checked !== qaWebSearchOld) {
+    qaPatch.web_search = qaWebSearchCheckbox.checked;
+  }
+  if (Object.keys(qaPatch).length) patch.qa = qaPatch;
 
   const storagePatch = {};
   if (storageNeverDeleteCheckbox.checked) {
