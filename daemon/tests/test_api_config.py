@@ -11,9 +11,12 @@ every test so nothing leaks into other test modules sharing the process.
 from __future__ import annotations
 
 import asyncio
+import re
 import stat
+import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -603,6 +606,55 @@ def test_config_test_never_persists_anything(client: TestClient, monkeypatch: py
     assert not (tmp_path / "tldr.local.yaml").exists()
 
 
+def _fake_completion(content: str, **extra: Any) -> Any:
+    """A minimal stand-in for an OpenAI ``ChatCompletion`` — just enough
+    shape for the code under test (`.choices[0].message.content`, plus
+    optional extra fields reachable both as plain attributes and via
+    ``.model_extra``, mirroring how the real SDK's pydantic models with
+    ``extra="allow"`` expose unknown fields either way — see
+    ``_reasoning_text`` in ``src/api/config.py``)."""
+    message = SimpleNamespace(content=content, model_extra=dict(extra), **extra)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _install_fake_openai(monkeypatch: pytest.MonkeyPatch, create: Any) -> list[dict[str, Any]]:
+    """Monkeypatch ``src.api.config.AsyncOpenAI`` to a fake client whose
+    ``chat.completions.create`` is ``create`` (an async callable taking
+    ``**kwargs``). Returns the list every call's kwargs gets appended to,
+    for assertions on what was actually sent (e.g. ``extra_body``)."""
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return await create(**kwargs)
+
+    class _FakeChat:
+        def __init__(self) -> None:
+            self.completions = _FakeCompletions()
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.chat = _FakeChat()
+
+    import src.api.config as config_api
+
+    monkeypatch.setattr(config_api, "AsyncOpenAI", _FakeAsyncOpenAI)
+    return calls
+
+
+def _prompt_content(kwargs: dict[str, Any]) -> str:
+    return str(kwargs["messages"][0]["content"])
+
+
+async def _default_ok_backend(**kwargs: Any) -> Any:
+    """A backend that answers "ok" to everything and never errors — the
+    huge context-probe request in particular just succeeds outright, so the
+    context step reports "at least this many tokens" with no numeric
+    suggestion. Good enough for tests that only care about the OTHER steps."""
+    return _fake_completion("ok")
+
+
 def test_config_test_401_reports_verbatim_detail_and_ok_false(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -616,14 +668,20 @@ def test_config_test_401_reports_verbatim_detail_and_ok_false(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is False
-    assert body["step"] == "models"
-    assert body["status_code"] == 401
-    assert "Incorrect API key provided" in body["detail"]
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["reachable"]["ok"] is True
+    assert steps["models"]["ok"] is False
+    assert "401" in steps["models"]["detail"]
+    assert "Incorrect API key provided" in steps["models"]["detail"]
+    assert steps["completion"]["ok"] is None
+    assert steps["thinking"]["ok"] is None
+    assert steps["context"]["ok"] is None
+    assert steps["translation"]["ok"] is None
     # The probed key must never come back in the response, in body OR detail.
     assert "sk-bogus" not in r.text
 
 
-def test_config_test_connection_error_reports_models_step(
+def test_config_test_connection_error_reports_reachable_step(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_models_probe(monkeypatch, raises=httpx.ConnectError("connection refused"))
@@ -631,39 +689,55 @@ def test_config_test_connection_error_reports_models_step(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is False
-    assert body["step"] == "models"
-    assert body["status_code"] is None
-    assert "connection refused" in body["detail"].lower()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["reachable"]["ok"] is False
+    assert "connection refused" in steps["reachable"]["detail"].lower()
+    for later in ("models", "completion", "thinking", "context", "translation"):
+        assert steps[later]["ok"] is None
 
 
-def test_config_test_success_runs_both_steps(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_test_success_runs_the_full_step_flow(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _patch_models_probe(
         monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "test-model"}]})
     )
 
-    class _FakeCompletions:
-        async def create(self, **kwargs: Any) -> Any:
-            return object()
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            # Return a plausible (non-echo, marker-preserving) translation
+            # so the translation-contract step verifies cleanly.
+            lines = content.rsplit("Input transcript:\n", 1)[-1].splitlines()
+            out = []
+            for line in lines:
+                m = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])(.*)$", line)
+                out.append(f"{m.group(1)} RU:{m.group(2)}" if m else line)
+            return _fake_completion("\n".join(out))
+        return _fake_completion("ok")
 
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeAsyncOpenAI:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.chat = _FakeChat()
-
-    import src.api.config as config_api
-
-    monkeypatch.setattr(config_api, "AsyncOpenAI", _FakeAsyncOpenAI)
+    _install_fake_openai(monkeypatch, _backend)
 
     r = client.post("/config/test", json={})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    assert body["step"] == "completion"
-    assert body["status_code"] == 200
     assert body["models"] == ["test-model"]
     assert body["latency_ms"] is not None
+
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["reachable"]["ok"] is True
+    assert steps["models"]["ok"] is True
+    assert steps["completion"]["ok"] is True
+    assert steps["thinking"]["ok"] is True
+    assert "No thinking" in steps["thinking"]["detail"]
+    assert steps["context"]["ok"] is True
+    assert "at least" in steps["context"]["detail"]
+    assert steps["translation"]["ok"] is True
+
+    # The huge probe succeeded outright — no numeric ceiling to report.
+    assert body["suggestions"]["context_length"] is None
+    assert body["suggestions"]["reasoning_effort"] is None
 
 
 def test_config_test_completion_adapts_dialect_instead_of_failing(
@@ -671,10 +745,10 @@ def test_config_test_completion_adapts_dialect_instead_of_failing(
 ) -> None:
     """A cloud gpt-5/o-series backend rejects `max_tokens` on the first
     completion attempt. The probe must go through the same dialect
-    adaptation as the real call path and report `ok: true` on the adapted
-    retry, not fail the whole test on the first 400 — that first 400 is
-    exactly the scenario (rejected/unsupported param on a cloud backend)
-    this endpoint exists to get right."""
+    adaptation as the real call path and report the completion step ok on
+    the adapted retry, not fail the whole test on the first 400 — that
+    first 400 is exactly the scenario (rejected/unsupported param on a
+    cloud backend) this endpoint exists to get right."""
     _patch_models_probe(
         monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "gpt-5"}]})
     )
@@ -687,27 +761,15 @@ def test_config_test_completion_adapts_dialect_instead_of_failing(
         message = f"Unsupported parameter: '{param}' is not supported with this model."
         return BadRequestError(message, response=response, body={"message": message, "param": param})
 
-    class _FakeCompletions:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
+    seen = {"raised": False}
 
-        async def create(self, **kwargs: Any) -> Any:
-            self.calls.append(kwargs)
-            if len(self.calls) == 1:
-                raise _bad_request("max_tokens")
-            return object()
+    async def _backend(**kwargs: Any) -> Any:
+        if not seen["raised"]:
+            seen["raised"] = True
+            raise _bad_request("max_tokens")
+        return _fake_completion("ok")
 
-    class _FakeChat:
-        def __init__(self) -> None:
-            self.completions = _FakeCompletions()
-
-    class _FakeAsyncOpenAI:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.chat = _FakeChat()
-
-    import src.api.config as config_api
-
-    monkeypatch.setattr(config_api, "AsyncOpenAI", _FakeAsyncOpenAI)
+    _install_fake_openai(monkeypatch, _backend)
 
     r = client.post(
         "/config/test",
@@ -715,8 +777,569 @@ def test_config_test_completion_adapts_dialect_instead_of_failing(
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["ok"] is True
-    assert body["step"] == "completion"
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["completion"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /config/test — thinking detection (step "thinking")
+# ---------------------------------------------------------------------------
+
+
+def test_config_test_thinking_detected_and_fixed_by_reasoning_effort_none(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty first reply with reasoning content present is exactly the
+    Gemma-4-on-LocalAI failure mode from `.claude/llm.md`. Once
+    reasoning_effort='none' is confirmed to fix it, that value must also be
+    suggested AND carried forward into every later call (context/
+    translation) — checked here via the recorded `extra_body`."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "gemma"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        extra_body = kwargs.get("extra_body") or {}
+        if extra_body.get("reasoning_effort") == "none":
+            return _fake_completion("ok")
+        # No fix applied yet: thinking consumed the whole tiny token
+        # budget, so content comes back empty with reasoning populated.
+        return _fake_completion("", reasoning="the user wants...")
+
+    calls = _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["thinking"]["ok"] is True
+    assert "reasoning_effort='none'" in steps["thinking"]["detail"]
+    assert body["suggestions"]["reasoning_effort"] == "none"
+
+    # Every call made AFTER the fix was found (the individual per-line
+    # translation retries, context probe) must carry the fixed value — not
+    # just the one retry that discovered it.
+    later_calls = calls[3:]  # 0=completion, 1=whole-group translate, 2=fixed retry
+    assert later_calls, "expected further calls after the thinking fix"
+    assert all(c.get("extra_body", {}).get("reasoning_effort") == "none" for c in later_calls)
+
+
+def test_config_test_thinking_not_detected_on_trivial_prompt_but_detected_on_translation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the reported false negative: Gemma 4's thinking is
+    ADAPTIVE — a trivial prompt genuinely doesn't trigger it, but a
+    rule-heavy real prompt does (measured live: 0 reasoning on "reply with
+    the single word ok", 1789 chars of `reasoning` plus truncated content
+    — 3 of 4 lines — on the real translation prompt with reasoning_effort
+    unset). A detector built on the trivial completion call would report
+    "no thinking" and be wrong. This fake reproduces exactly that split —
+    clean on the trivial prompt, polluted on the translation prompt — and
+    the "completion" step (which only ever sends the trivial prompt) must
+    stay clean/ok while "thinking" (which uses the translation call) must
+    still catch it."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "gemma"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        extra_body = kwargs.get("extra_body") or {}
+        if "You translate transcripts" not in content:
+            # The trivial "completion" probe: Gemma 4 doesn't think here.
+            return _fake_completion("ok")
+        if extra_body.get("reasoning_effort") == "none":
+            # Fixed retry: a full, clean, correctly-marked translation.
+            lines = content.rsplit("Input transcript:\n", 1)[-1].splitlines()
+            out = [
+                f"{m.group(1)} RU:{m.group(2)}"
+                for line in lines
+                if (m := re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])(.*)$", line))
+            ]
+            return _fake_completion("\n".join(out))
+        # Unfixed: adaptive thinking fires on the real, rule-heavy prompt —
+        # reasoning populated, content truncated (measured: 3 of 4 lines).
+        lines = content.rsplit("Input transcript:\n", 1)[-1].splitlines()[:3]
+        truncated = [
+            f"{m.group(1)} RU:{m.group(2)}"
+            for line in lines
+            if (m := re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])(.*)$", line))
+        ]
+        return _fake_completion("\n".join(truncated), reasoning="x" * 1789)
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    # The trivial completion call never saw any reasoning — it must stay ok.
+    assert steps["completion"]["ok"] is True
+    # But thinking must be caught via the translation call, not missed.
+    assert steps["thinking"]["ok"] is True
+    assert "reasoning_effort='none'" in steps["thinking"]["detail"]
+    assert body["suggestions"]["reasoning_effort"] == "none"
+    # And the fixed retry produced a full, verifiable translation.
+    assert steps["translation"]["ok"] is True
+
+
+def test_config_test_thinking_detected_but_not_fixed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reasoning_effort='none' doesn't help every backend — must be
+    reported honestly (ok=False) rather than suggested anyway."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "gemma"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        return _fake_completion("", reasoning="still thinking no matter what")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["thinking"]["ok"] is False
+    assert body["suggestions"]["reasoning_effort"] is None
+
+
+def test_config_test_no_thinking_detected_when_content_present(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "qwen"}]}))
+    _install_fake_openai(monkeypatch, _default_ok_backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["thinking"]["ok"] is True
+    assert "No thinking" in steps["thinking"]["detail"]
+    assert body["suggestions"]["reasoning_effort"] is None
+
+
+# ---------------------------------------------------------------------------
+# POST /config/test — real context length (step "context")
+# ---------------------------------------------------------------------------
+
+
+def test_config_test_context_parsed_from_error_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openai import BadRequestError
+
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    def _context_error() -> BadRequestError:
+        request = httpx.Request("POST", "http://example.test/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        message = "request (60009 tokens) exceeds the available context size (32768 tokens)"
+        return BadRequestError(message, response=response, body={"message": message})
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000:  # the huge context-probe prompt (~160k chars)
+            raise _context_error()
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is True
+    assert "32768" in steps["context"]["detail"]
+    assert body["suggestions"]["context_length"] == 32768
+    assert body["suggestions"]["single_pass_token_limit"] == int(32768 * 0.6)
+
+
+def test_config_test_context_bisection_fallback_when_unparseable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backend's error text doesn't mention any numbers at all — the
+    probe must fall back to bisecting between a known-good floor and the
+    known-bad huge size, bounded to a handful of calls, and land somewhere
+    sane relative to the real (fake) ceiling."""
+    from openai import BadRequestError
+
+    from src.llm.tokens import count_tokens
+
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    fake_ceiling = 9000
+
+    def _vague_error() -> BadRequestError:
+        request = httpx.Request("POST", "http://example.test/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        message = "context window exceeded"
+        return BadRequestError(message, response=response, body={"message": message})
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000 and count_tokens(content) > fake_ceiling:
+            raise _vague_error()
+        return _fake_completion("ok")
+
+    calls = _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is True
+    assert body["suggestions"]["context_length"] is not None
+    # Bisection converges from below — must never overshoot the real ceiling.
+    assert body["suggestions"]["context_length"] <= fake_ceiling
+    # Within the tolerance band, not wildly under-reporting either.
+    assert body["suggestions"]["context_length"] > fake_ceiling - 4000
+    # Bounded call count: at most 6 large-prompt context-probe attempts
+    # (translation's own calls, made afterward, are small prompts and don't
+    # count here — see `_CONTEXT_PROBE_MAX_ATTEMPTS`).
+    large_prompt_calls = [c for c in calls if len(_prompt_content(c)) > 5000]
+    assert len(large_prompt_calls) <= 6
+
+
+def test_config_test_context_huge_probe_succeeds_reports_at_least(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+    _install_fake_openai(monkeypatch, _default_ok_backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is True
+    assert body["suggestions"]["context_length"] is None
+
+
+def test_config_test_context_huge_probe_inconclusive_reports_unknown_not_a_guess(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the live run against gemma-4-e4b on LocalAI reported
+    'approximately 35250 tokens' when the model's actual configured context
+    was 131072 — the bisection loop was treating ANY failure (including a
+    plain timeout on a huge, slow-to-prefill prompt) as proof of hitting the
+    context wall. A timeout's message text carries no context/token-size
+    complaint at all (see `_looks_like_context_overflow`), so it is NOT
+    that proof. When even the FIRST (huge) probe can't get a message that
+    reads as a size rejection, we must report `ok=None` and explain why,
+    rather than fabricate a ceiling that later silently corrupts real
+    jobs."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000:  # the huge context-probe prompt
+            raise TimeoutError("llm stream stalled: no chunk for 30s")
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is None
+    assert "recognizable size complaint" in steps["context"]["detail"]
+    assert "no chunk for 30s" in steps["context"]["detail"]
+    assert body["suggestions"]["context_length"] is None
+    assert body["suggestions"]["single_pass_token_limit"] is None
+
+
+def test_config_test_context_overflow_recognized_via_message_even_as_http_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: measured live against qwen3-vl-8b-instruct on LocalAI —
+    the real backend's context-overflow error ('rpc error: code = Internal
+    desc = request (40008 tokens) exceeds the available context size
+    (32768 tokens), try increasing it') arrived wrapped in an HTTP 500, not
+    a 400. A status-code-only classifier threw this away as "inconclusive"
+    on the one case where the signal was perfect and previously worked.
+    Classification must key off the message TEXT (context/tokens + an
+    overflow word — see `_looks_like_context_overflow`), independent of
+    status code, and still extract the exact number when the message
+    states one."""
+    from openai import InternalServerError
+
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    def _real_context_error_as_500() -> InternalServerError:
+        request = httpx.Request("POST", "http://example.test/v1/chat/completions")
+        response = httpx.Response(500, request=request)
+        message = (
+            "Error code: 500 - {'error': {'code': 500, 'message': 'rpc error: code = "
+            "Internal desc = request (40008 tokens) exceeds the available context size "
+            "(32768 tokens), try increasing it'}}"
+        )
+        return InternalServerError(message, response=response, body={"message": message})
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000:
+            raise _real_context_error_as_500()
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is True
+    assert "32768" in steps["context"]["detail"]
+    assert body["suggestions"]["context_length"] == 32768
+    assert body["suggestions"]["single_pass_token_limit"] == int(32768 * 0.6)
+
+
+def test_config_test_context_inconclusive_with_empty_exception_message_reports_legibly(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`asyncio.wait_for`'s own `TimeoutError()` (our client-side timeout
+    firing before the backend responds at all) carries NO message —
+    `str(TimeoutError())` is `""` by construction, not a bug losing content
+    along the way. The reported detail must still read as a sentence, not
+    trail off into a blank after a colon."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000:
+            raise TimeoutError()  # bare — empty str(), exactly like asyncio.wait_for's own
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is None
+    detail = steps["context"]["detail"]
+    assert detail is not None
+    assert not detail.rstrip().endswith(":")
+    assert "no error detail available" in detail
+
+
+def test_config_test_context_bisection_stops_on_inconclusive_attempt_not_fabricate(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The huge probe gets a clean (but unparseable) rejection, so
+    bisection starts — but one of the narrowing attempts times out instead
+    of cleanly rejecting. That single inconclusive attempt must stop the
+    bisection rather than being folded in as "also over the limit": the
+    reported number must still be a genuine confirmed lower bound, never
+    past the real (fake) ceiling."""
+    from openai import BadRequestError
+
+    from src.llm.tokens import count_tokens
+
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    fake_ceiling = 9000
+
+    def _vague_error() -> BadRequestError:
+        request = httpx.Request("POST", "http://example.test/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        message = "context window exceeded"
+        return BadRequestError(message, response=response, body={"message": message})
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if len(content) > 5000:
+            tokens = count_tokens(content)
+            if tokens > fake_ceiling:
+                raise _vague_error()
+            # Anything below the real ceiling but still a large probe:
+            # simulate a slow backend timing out rather than answering.
+            raise TimeoutError("simulated slow backend")
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["context"]["ok"] is True
+    assert "inconclusive" in steps["context"]["detail"].lower()
+    ceiling_guess = body["suggestions"]["context_length"]
+    assert ceiling_guess is not None
+    # Never overshoots the real (fake) ceiling — a confirmed lower bound,
+    # not a number invented past the point where signal ran out.
+    assert ceiling_guess <= fake_ceiling
+
+
+def test_config_test_context_gets_its_own_dedicated_time_budget(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: on the live run that motivated this, the context probe
+    consumed the entire 90s overall budget and the translation step (which
+    used to run AFTER it) never got to execute at all. Context now runs
+    LAST and gets its own tighter, dedicated deadline computed fresh right
+    before it starts — verified here directly via the `deadline` handed to
+    `_probe_context_length`, rather than racing real wall-clock time in a
+    test."""
+    import src.api.config as config_api
+    from src.api.schemas import ConfigTestStepResult
+
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            return _fake_completion(_translate_lines(content, lambda marker, rest: f"{marker} RU:{rest}"))
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    captured: dict[str, float] = {}
+
+    async def _fake_probe_context_length(*, client: Any, model: Any, dialect: Any, deadline: float, api_key: Any) -> Any:
+        captured["deadline"] = deadline
+        return ConfigTestStepResult(step="context", ok=True, detail="stub"), None
+
+    monkeypatch.setattr(config_api, "_probe_context_length", _fake_probe_context_length)
+
+    before = time.monotonic()
+    r = client.post("/config/test", json={})
+    assert r.status_code == 200, r.text
+    assert "deadline" in captured
+    # The own-budget deadline must be MUCH tighter than the ~90s overall
+    # ceiling — comfortably bounded by the dedicated budget, not the full
+    # test timeout, regardless of how much of the overall budget remained.
+    assert captured["deadline"] - before <= config_api._CONTEXT_PROBE_OWN_BUDGET_SECONDS + 2
+    assert captured["deadline"] - before < config_api._TOTAL_TEST_TIMEOUT_SECONDS
+
+    # And translation must have completed and been reported — it runs
+    # before context in the new order, so it's never gated by context's
+    # own budget at all.
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["translation"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /config/test — translation contract (step "translation")
+# ---------------------------------------------------------------------------
+
+
+def _translate_lines(content: str, transform: Any) -> str:
+    lines = content.rsplit("Input transcript:\n", 1)[-1].splitlines()
+    out = []
+    for line in lines:
+        m = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])(.*)$", line)
+        out.append(transform(m.group(1), m.group(2)) if m else line)
+    return "\n".join(out)
+
+
+def test_config_test_translation_contract_passes_on_good_translation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            return _fake_completion(_translate_lines(content, lambda marker, rest: f"{marker} RU:{rest}"))
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["translation"]["ok"] is True
+    assert "first attempt" in steps["translation"]["detail"]
+
+
+def test_config_test_translation_contract_group_echo_caught_at_whole_group_level(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that echoes its whole-group input back unchanged (measured
+    live — see `.claude/llm.md`: qwen3-1.7b returned 139/139 lines
+    byte-identical and the OLD structural-only check accepted it) must NOT
+    verify at the whole-group call — that's exactly what `_group_is_echo`
+    exists to catch, reused here unmodified via `_align_translation`.
+
+    It recovers to `ok=True` once retried at single-line granularity — a
+    documented, ACCEPTED limitation of the reused production logic, not a
+    bug in this probe: `.claude/llm.md`'s "Transcript translation" section
+    calls this out by name ("a model that echoes UNCONDITIONALLY ... will,
+    once bisection reaches single-line granularity, have those lines
+    accepted"). This probe reuses the exact same check, so it reproduces
+    the exact same limitation — asserted here so it's a documented fact,
+    not a silent surprise."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            # Echo: return the input lines completely unchanged, whether
+            # called with the whole group or a single retried line.
+            return _fake_completion(content.rsplit("Input transcript:\n", 1)[-1])
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["translation"]["ok"] is True
+    assert "on retry" in steps["translation"]["detail"]
+
+
+def test_config_test_translation_contract_fails_on_unusable_output(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model whose output can't be verified even at single-line
+    granularity (no recognizable `[MM:SS]` marker at all, so
+    `_align_translation` can't match it against the input by value) must be
+    reported as a failed contract — the case a real translation would come
+    back mostly or entirely stuck in the source language."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            return _fake_completion("lorem ipsum dolor sit amet, no markers here at all")
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["translation"]["ok"] is False
+    assert "FAILED" in steps["translation"]["detail"]
+
+
+def test_config_test_translation_contract_reports_partial(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The combined call misaligns, but every line translates fine when
+    retried individually — production would recover via bisection, so this
+    must read as "works on retry", not a hard failure."""
+    _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "m"}]}))
+
+    async def _backend(**kwargs: Any) -> Any:
+        content = _prompt_content(kwargs)
+        if "You translate transcripts" in content:
+            lines = content.rsplit("Input transcript:\n", 1)[-1].splitlines()
+            if len(lines) > 1:
+                # Whole-group call: scramble the marker order so alignment
+                # (which matches markers forward-only, in order) breaks.
+                translated = [
+                    f"{m.group(1)} RU:{m.group(2)}"
+                    for line in lines
+                    if (m := re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])(.*)$", line))
+                ]
+                return _fake_completion("\n".join(reversed(translated)))
+            return _fake_completion(_translate_lines(content, lambda marker, rest: f"{marker} RU:{rest}"))
+        return _fake_completion("ok")
+
+    _install_fake_openai(monkeypatch, _backend)
+
+    r = client.post("/config/test", json={})
+    body = r.json()
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["translation"]["ok"] is True
+    assert "on retry" in steps["translation"]["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -896,27 +1519,14 @@ def test_config_test_default_target_still_tests_llm(
     """Regression: a body with no `target` at all must keep testing llm,
     exactly like before `target` was added to the contract."""
     _patch_models_probe(monkeypatch, response=_FakeHttpResponse(200, {"data": [{"id": "test-model"}]}))
-
-    class _FakeCompletions:
-        async def create(self, **kwargs: Any) -> Any:
-            return object()
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeAsyncOpenAI:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.chat = _FakeChat()
-
-    import src.api.config as config_api
-
-    monkeypatch.setattr(config_api, "AsyncOpenAI", _FakeAsyncOpenAI)
+    _install_fake_openai(monkeypatch, _default_ok_backend)
 
     r = client.post("/config/test", json={})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    assert body["step"] == "completion"
+    steps = {s["step"]: s for s in body["steps"]}
+    assert steps["completion"]["ok"] is True
 
 
 def test_config_test_whisper_401_reports_verbatim_detail(

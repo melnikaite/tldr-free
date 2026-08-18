@@ -70,7 +70,20 @@
       }
       #test-result, #whisper-test-result { margin-top: 0.5rem; }
       #test-result ul, #whisper-test-result ul { margin: 0.25rem 0 0; padding-left: 1.25rem; }
-      details summary { cursor: pointer; }
+      #test-result li.ok::before { content: "✓ "; }
+      #test-result li.err::before { content: "✗ "; }
+      details summary { cursor: pointer; font-weight: 600; margin-top: 1rem; }
+      #llm-advanced { margin-top: 0.5rem; }
+      #llm-advanced label, #llm-advanced input { margin-top: 0.5rem; }
+      #test-suggestions {
+        margin-top: 0.75rem;
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        background: #e8f0fe;
+        border: 1px solid #aecbfa;
+      }
+      #test-suggestions ul { margin: 0.25rem 0 0.5rem; padding-left: 1.25rem; }
+      #apply-suggestions-status { margin-left: 0.5rem; }
     </style>
   </head>
   <body>
@@ -94,18 +107,6 @@
         <input id="llm-model" type="text" placeholder="gemma-4-e4b-it-qat-q4_0" list="llm-model-list" />
         <datalist id="llm-model-list"></datalist>
 
-        <label for="llm-context-length">Context length (tokens)</label>
-        <input id="llm-context-length" type="number" min="1" step="1" />
-
-        <label for="llm-single-pass-limit">Single-pass token limit</label>
-        <input id="llm-single-pass-limit" type="number" min="1" step="1" />
-
-        <label for="llm-max-concurrent">Max concurrent calls</label>
-        <input id="llm-max-concurrent" type="number" min="1" step="1" />
-
-        <label for="llm-reasoning-effort">Reasoning effort</label>
-        <input id="llm-reasoning-effort" type="text" placeholder="e.g. low, none — leave empty for null" />
-
         <label for="llm-api-key">API key</label>
         <input id="llm-api-key" type="password" autocomplete="off" placeholder="no API key set" />
         <p id="llm-api-key-source" class="hint"></p>
@@ -119,8 +120,34 @@
         <p id="llm-api-key-storage-hint" class="hint" hidden></p>
         <p id="api-key-verify-result" class="hint"></p>
 
-        <button id="test-connection" type="button">Test connection</button>
+        <button id="test-connection" type="button">Test setup</button>
+        <p class="hint">
+          Figures out the settings below by actually probing the backend —
+          run this before saving if you just typed in a new address/key.
+        </p>
         <div id="test-result"></div>
+        <div id="test-suggestions" hidden>
+          <p class="hint">Suggested changes based on the test:</p>
+          <ul id="test-suggestions-list"></ul>
+          <button id="apply-suggestions" type="button">Apply</button>
+          <span id="apply-suggestions-status"></span>
+        </div>
+
+        <details id="llm-advanced">
+          <summary>Advanced</summary>
+
+          <label for="llm-context-length">Context length (tokens)</label>
+          <input id="llm-context-length" type="number" min="1" step="1" />
+
+          <label for="llm-single-pass-limit">Single-pass token limit</label>
+          <input id="llm-single-pass-limit" type="number" min="1" step="1" />
+
+          <label for="llm-reasoning-effort">Reasoning effort</label>
+          <input id="llm-reasoning-effort" type="text" placeholder="e.g. low, none — leave empty for null" />
+
+          <label for="llm-max-concurrent">Max concurrent calls</label>
+          <input id="llm-max-concurrent" type="number" min="1" step="1" />
+        </details>
       </section>
 
       <section>

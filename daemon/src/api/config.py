@@ -74,10 +74,13 @@ resized in place, so a changed ``max_concurrent_calls`` instead reports
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -91,8 +94,11 @@ from src.api.schemas import (
     ConfigPatchRequest,
     ConfigPatchResponse,
     ConfigResponse,
+    ConfigTestLLMOverrides,
     ConfigTestRequest,
     ConfigTestResponse,
+    ConfigTestStepResult,
+    ConfigTestSuggestions,
     ConfigTestWhisperOverrides,
     LLMConfigOut,
     OutputConfigOut,
@@ -101,6 +107,19 @@ from src.api.schemas import (
 )
 from src.config import Config, _ApiKeyConfigMixin, get_config
 from src.llm import client as llm_client
+from src.llm.languages import Language, normalize_lang
+from src.llm.tokens import make_filler_text
+
+# Reused verbatim, not reimplemented — see the module docstring above and
+# `.claude/llm.md`'s "Transcript translation" section: the whole point of
+# the `translation` test step is to run the SAME verification the real
+# translator applies, so a "test passed" report means what it says. Both
+# are underscore-prefixed internals of `workers.translator`, imported
+# across the module boundary deliberately (ruff's selected rule set has no
+# private-access check, and there's no public wrapper worth adding for two
+# functions used exactly as-is).
+from src.workers.translator import _align_translation
+from src.workers.translator import _load_prompt as _load_translate_prompt
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +137,81 @@ _TEST_TIMEOUT_SECONDS = 15.0
 # connection when it's actually a fine one. We only care that the call
 # completes without an error, not about the content.
 _TEST_COMPLETION_MAX_TOKENS = 16
+
+# ---------------------------------------------------------------------------
+# target="llm" step-by-step probe — tunables. See `.claude/llm.md` /
+# CLAUDE.md's "Adding features" note for the design rationale.
+# ---------------------------------------------------------------------------
+
+# Per-LLM-call timeout for the lightweight steps (completion/translation —
+# small prompts, a handful of output tokens).
+_LLM_STEP_TIMEOUT_SECONDS = 20.0
+# The context-length probe deliberately sends a large prompt (prefill of
+# tens of thousands of tokens) — that's inherently slower than the other
+# steps even on a fast backend, and slower still on a CPU-bound one.
+_CONTEXT_PROBE_TIMEOUT_SECONDS = 30.0
+# Hard ceiling on the WHOLE multi-step run — a slow/hanging backend must
+# not leave the "Test setup" button spinning forever.
+_TOTAL_TEST_TIMEOUT_SECONDS = 90.0
+# Context gets its OWN dedicated time allocation, separate from (and never
+# more than) whatever's left of the total above. Measured live: on a real
+# LocalAI backend serving gemma-4-e4b, the context probe alone consumed the
+# ENTIRE 90s budget (4 attempts, ~20s each) and starved the translation
+# step that ran after it in the old step order — the step that actually
+# answers "will my model work," left unattempted. Context now runs LAST
+# (see the step order below) specifically so it can never again preempt a
+# cheaper, more decisive step; this budget additionally stops it from
+# running away on its own for the full 90s even in isolation.
+_CONTEXT_PROBE_OWN_BUDGET_SECONDS = 60.0
+
+# Deliberately-oversized prompt for the context-length probe. Chosen large
+# enough to exceed every LOCAL default in config/tldr.yaml.example (32768-
+# 131072) and so catch the common misconfiguration (declared context bigger
+# than what's actually served), while staying far short of a multi-hundred-
+# thousand-token cloud context — pushing a prefill that size on every "Test
+# setup" click isn't worth it just to shave the last digits off a value that
+# was very likely fine already. If this succeeds outright, we report "at
+# least this many tokens" rather than hunting further.
+_CONTEXT_PROBE_HUGE_TOKENS = 40_000
+# Assumed-safe lower bound for the bisection fallback (see
+# `_probe_context_length`) — step 3 (completion) already proved a ~10-token
+# prompt works, so a few thousand tokens is a safe starting floor for any
+# real backend.
+_CONTEXT_PROBE_FLOOR_TOKENS = 2_000
+# Bisection stops once the good/bad window is this narrow — no point
+# chasing single-token precision out of a backend's own approximate report.
+_CONTEXT_PROBE_TOLERANCE_TOKENS = 2_000
+# Hard cap on LLM calls spent probing context (the huge probe counts as
+# one), independent of the time budget above.
+_CONTEXT_PROBE_MAX_ATTEMPTS = 6
+
+# `single_pass_token_limit` suggestion ratio — matches the "~60% of
+# context_length" comment attached to every backend example in
+# config/tldr.yaml.example / daemon/src/assets/tldr.yaml.example.
+_SINGLE_PASS_RATIO = 0.6
+
+# Matches "<number> tokens" anywhere in a provider's context-length error
+# text — e.g. "request (60009 tokens) exceeds the available context size
+# (32768 tokens)" or "maximum context length is 32768 tokens... requested
+# 60009 tokens". With 2+ matches, the SMALLER number is the real ceiling in
+# both phrasings above (the probe is deliberately sized to exceed it), so
+# no per-backend wording needs hardcoding.
+_CONTEXT_ERROR_TOKEN_RE = re.compile(r"(\d[\d,]*)\s*tokens?", re.IGNORECASE)
+
+# Fixed target language for the translation-contract probe (step 6) — not
+# user-configurable. This step verifies a MECHANISM (line-for-line
+# alignment via `workers.translator._align_translation`), not the user's
+# real translation preference, so any well-supported, distinctly-non-English
+# target works; Russian is the language this exact check was validated
+# against historically (see `.claude/llm.md`'s "Transcript translation").
+_TRANSLATION_PROBE_TARGET_LANG_CODE = "ru"
+_TRANSLATION_PROBE_SOURCE_LANG_CODE = "en"
+_TRANSLATION_PROBE_LINES = [
+    "[00:01] This tool summarizes web pages, videos, and PDFs on your own machine.",
+    "[00:05] It can also answer follow-up questions about anything it has processed.",
+    "[00:10] Every request stays local unless you point it at a cloud backend yourself.",
+    "[00:14] This line just checks that the translation contract still works end to end.",
+]
 
 # Separate keychain service per section so an llm key and a whisper key
 # (even against the same cloud provider) never collide in the OS keychain.
@@ -466,60 +560,610 @@ def _redact(text: str, secret: str | None) -> str:
     return text[:_MAX_DETAIL_CHARS]
 
 
-async def _test_llm(overrides: Any) -> ConfigTestResponse:
+# Fixed step order for target="llm" — every report lists all six, in this
+# order, even when later ones are `ok=None` (never attempted). Keeping the
+# order as one tuple (rather than repeating six literal strings at each
+# call site) is what makes `_fill_remaining_as_skipped` a single loop.
+_LLMTestStep = Literal["reachable", "models", "completion", "thinking", "context", "translation"]
+
+# Order steps actually run in (and the order `_fill_remaining_as_skipped`
+# fills in on an early exit). "thinking" and "translation" are computed
+# TOGETHER from one call (see `_probe_translation_and_thinking`) — thinking
+# detection needs a realistic, rule-heavy prompt to trigger Gemma 4's
+# adaptive thinking at all (a trivial "reply with one word" prompt measured
+# live as a false negative: 0 reasoning tokens on the trivial prompt, 1789
+# chars of `reasoning` and truncated content on the real translation
+# prompt), so it piggybacks on the translation probe's own call instead of
+# spending a separate one. "context" runs LAST, deliberately: it's the
+# slowest, least decisive step (see `_CONTEXT_PROBE_OWN_BUDGET_SECONDS`),
+# so exhausting its budget can never again starve the cheap, decisive
+# translation check the way it did before this ordering existed.
+_LLM_STEP_ORDER: tuple[_LLMTestStep, ...] = (
+    "reachable", "models", "completion", "thinking", "translation", "context",
+)
+
+
+def _fill_remaining_as_skipped(
+    steps: list[ConfigTestStepResult], reason: str
+) -> list[ConfigTestStepResult]:
+    """Append `ok=None` entries for every step in `_LLM_STEP_ORDER` not
+    already present in `steps` — so a report that stops early (an earlier
+    step failed, or the time budget ran out) still lists all six steps
+    rather than silently truncating the array."""
+    done = {s.step for s in steps}
+    for name in _LLM_STEP_ORDER:
+        if name not in done:
+            steps.append(ConfigTestStepResult(step=name, ok=None, detail=reason))
+    return steps
+
+
+def _reasoning_text(message: Any) -> str | None:
+    """Best-effort extraction of hidden chain-of-thought from a chat
+    completion message — the two field names actually seen in the wild
+    (see `.claude/llm.md` / tldr.yaml.example): LocalAI/llama.cpp report
+    `reasoning`, mlx-openai-server/mlx_vlm report `reasoning_content`.
+    Neither is part of the OpenAI SDK's declared schema, but its pydantic
+    models allow extra fields, so both plain attribute access and
+    `model_extra` see them — checked both ways to also work against a
+    plain test double that isn't a real SDK object at all."""
+    for attr in ("reasoning", "reasoning_content"):
+        val = getattr(message, attr, None)
+        if val:
+            return str(val)
+    extra = getattr(message, "model_extra", None)
+    if isinstance(extra, dict):
+        for key in ("reasoning", "reasoning_content"):
+            val = extra.get(key)
+            if val:
+                return str(val)
+    return None
+
+
+def _parse_context_from_error(text: str) -> int | None:
+    """Extract a backend's real context ceiling from its own error message.
+
+    Both observed phrasings mention the requested size and the ceiling as
+    "<N> tokens" — the requested size is always the LARGER of the two
+    (the probe is deliberately oversized), so the smaller of any 2+ matches
+    is the ceiling, with no per-backend wording to hardcode. Returns None
+    if the message doesn't contain at least two such numbers (the caller
+    falls back to bisection)."""
+    nums = [int(m.group(1).replace(",", "")) for m in _CONTEXT_ERROR_TOKEN_RE.finditer(text)]
+    if len(nums) < 2:
+        return None
+    return min(nums)
+
+
+async def _call_test_model(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    dialect: llm_client._Dialect,
+    content: str,
+    max_tokens: int,
+    timeout: float,
+) -> Any:
+    """One throwaway chat completion against `client`/`model`/`dialect`,
+    through the same dialect-adaptation logic as the real call path
+    (`llm_client.call_with_dialect_adaptation`) but bounded by `timeout` —
+    this endpoint is interactive and must never hang the UI on a stalled
+    backend. Raises whatever `call_with_dialect_adaptation` raises, plus
+    `TimeoutError` if the deadline is hit."""
+    return await asyncio.wait_for(
+        llm_client.call_with_dialect_adaptation(
+            messages=[{"role": "user", "content": content}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            stream=False,
+            client=client,
+            model=model,
+            dialect=dialect,
+        ),
+        timeout=timeout,
+    )
+
+
+# Outcome of one context-probe attempt:
+# - "ok"           — the call succeeded outright.
+# - "rejected"      — the error TEXT reads as a context/token-size
+#                     complaint (see `_looks_like_context_overflow`).
+#                     Treated as real evidence the size was too big —
+#                     regardless of HTTP status code (see below).
+# - "inconclusive"  — anything else: a timeout, a connection drop, a 5xx/4xx
+#                     whose message doesn't mention size at all. None of
+#                     these tell us the request was rejected FOR ITS SIZE —
+#                     a slow CPU-bound backend just taking a long time to
+#                     prefill a huge prompt looks identical to "hit the
+#                     wall" from here if you only check "did it raise." An
+#                     inconclusive result must never move `hi` down — it
+#                     just stops the probe from claiming more than it
+#                     actually knows.
+#
+# Classification is by MESSAGE CONTENT, not status code. Measured live: the
+# exact same underlying failure — LocalAI relaying "request (40008 tokens)
+# exceeds the available context size (32768 tokens)" from the backend it
+# proxies — arrived as an HTTP 500, not 400. An earlier version of this
+# classifier keyed off `status_code == 400` and threw away that message
+# (and its number) as "inconclusive" purely because of the wrapping status
+# code, on the one backend where the signal was perfect. Status code is
+# gateway/proxy-dependent; the message text is where the actual evidence
+# lives, so that's what's inspected now, whatever the status code says.
+_ContextProbeOutcome = Literal["ok", "rejected", "inconclusive"]
+
+# A context/token-size complaint mentions the SUBJECT (context/tokens) and
+# an OVERFLOW verb (exceeds/too many/maximum/limit) — both observed live
+# phrasings match ("request (N tokens) exceeds the available context size
+# (N tokens)", "maximum context length is N tokens... you requested N").
+# Deliberately independent of status code and of whether a number is
+# present at all: a message like "context window exceeded" (no numbers)
+# still IS a size rejection, just one `_parse_context_from_error` can't
+# extract an exact ceiling from — that's what the bisection fallback below
+# is for. Only a message with NEITHER half of this signature is treated as
+# unrelated to size (a timeout, a dropped connection, an unrelated 5xx).
+_CONTEXT_OVERFLOW_SUBJECT_RE = re.compile(r"\bcontext\b|\btokens?\b", re.IGNORECASE)
+_CONTEXT_OVERFLOW_VERB_RE = re.compile(
+    r"exceed\w*|too (?:many|long|large)|maximum|\blimit\b", re.IGNORECASE
+)
+
+
+def _looks_like_context_overflow(text: str) -> bool:
+    """True when `text` reads as a context/token-size complaint — see the
+    regexes above for what "reads as" means. This is the ONLY thing that
+    makes a failed probe attempt "rejected" rather than "inconclusive"."""
+    return bool(
+        _CONTEXT_OVERFLOW_SUBJECT_RE.search(text) and _CONTEXT_OVERFLOW_VERB_RE.search(text)
+    )
+
+
+def _describe_probe_failure(text: str, api_key: str | None) -> str:
+    """Redact + present a probe failure's error text, substituting a
+    legible fallback when `text` is empty rather than reporting a blank.
+    Genuinely empty is common here, not a bug to chase further:
+    `asyncio.wait_for`'s own `TimeoutError()` (our client-side timeout
+    firing before the backend responds at all) carries no message
+    whatsoever — `str(TimeoutError())` is `""` by construction."""
+    redacted = _redact(text, api_key) if text else ""
+    return redacted or "(no error detail available — likely a timeout or a dropped connection)"
+
+
+async def _probe_context_length(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    dialect: llm_client._Dialect,
+    deadline: float,
+    api_key: str | None,
+) -> tuple[ConfigTestStepResult, int | None]:
+    """Find the backend's REAL context ceiling by provoking it — the last
+    step to run (see `_LLM_STEP_ORDER`) and bounded by `deadline` (the
+    caller passes the tighter of the overall test deadline and this step's
+    own dedicated budget, so it can never again starve an earlier step).
+
+    Primary path: one deliberately oversized request
+    (`_CONTEXT_PROBE_HUGE_TOKENS`); if the backend cleanly REJECTS it (a 4xx
+    — see `_ContextProbeOutcome`), parse the ceiling straight out of its own
+    error text (`_parse_context_from_error`). Only when that parse fails do
+    we fall back to bisecting between a known-good floor and the known-bad
+    huge size — bounded by `_CONTEXT_PROBE_MAX_ATTEMPTS` and `deadline`.
+
+    If the huge probe doesn't fail at all, the backend's context is at
+    least that large and we stop there rather than pushing further (see
+    `_CONTEXT_PROBE_HUGE_TOKENS`'s docstring for why).
+
+    If the huge probe — or, mid-bisection, every remaining attempt — comes
+    back INCONCLUSIVE rather than a clean rejection, we do not fabricate a
+    number: better to report `ok=None` (or narrow only as far as confirmed
+    signals actually reach) than to hand back a value that quietly breaks
+    real jobs later, the way a wrong `context_length` already has.
+    """
+    attempts = 0
+
+    async def _attempt(token_count: int) -> tuple[_ContextProbeOutcome, str | None]:
+        nonlocal attempts
+        attempts += 1
+        prompt = make_filler_text(token_count)
+        try:
+            await _call_test_model(
+                client=client,
+                model=model,
+                dialect=dialect,
+                content=prompt,
+                max_tokens=_TEST_COMPLETION_MAX_TOKENS,
+                timeout=_CONTEXT_PROBE_TIMEOUT_SECONDS,
+            )
+            return "ok", None
+        except Exception as e:
+            # Content decides "rejected" vs "inconclusive", not the
+            # exception TYPE or status code — see `_looks_like_context_overflow`.
+            # `str(e)` can genuinely be empty (e.g. `asyncio.wait_for`'s own
+            # `TimeoutError()` on our client-side timeout carries no message
+            # at all) — that's still correctly "inconclusive" (no signature
+            # found in ""), just reported with a friendlier fallback string
+            # by the caller rather than a blank.
+            text = str(e)
+            if _looks_like_context_overflow(text):
+                return "rejected", text
+            return "inconclusive", text
+
+    outcome, err = await _attempt(_CONTEXT_PROBE_HUGE_TOKENS)
+    if outcome == "ok":
+        return (
+            ConfigTestStepResult(
+                step="context",
+                ok=True,
+                detail=(
+                    f"No error at {_CONTEXT_PROBE_HUGE_TOKENS} tokens — the backend's real "
+                    "context is at least that large. Not pushed further (see design notes); "
+                    "no change suggested."
+                ),
+            ),
+            None,
+        )
+    if outcome == "inconclusive":
+        assert err is not None  # "inconclusive" always sets err (possibly "") — see _attempt
+        return (
+            ConfigTestStepResult(
+                step="context",
+                ok=None,
+                detail=(
+                    f"Could not determine the real context: the {_CONTEXT_PROBE_HUGE_TOKENS}-"
+                    "token probe failed without a recognizable size complaint in the error "
+                    f"text: {_describe_probe_failure(err, api_key)}. Reporting unknown rather "
+                    "than guessing — this backend/model may just be slow with large prompts."
+                ),
+            ),
+            None,
+        )
+
+    assert err is not None  # only "rejected" reaches here, which always sets err
+    parsed = _parse_context_from_error(_redact(err, api_key))
+    if parsed is not None:
+        return (
+            ConfigTestStepResult(
+                step="context",
+                ok=True,
+                detail=f"Backend reports a real context of {parsed} tokens.",
+            ),
+            parsed,
+        )
+
+    # Fallback: bisect between a known-good floor and the known-bad huge
+    # size. `lo` only ever moves up on a CONFIRMED "ok", `hi` only ever
+    # moves down on a CONFIRMED "rejected" — an "inconclusive" attempt
+    # moves neither and stops the loop outright, so whatever `lo` ends up
+    # at is always a genuine lower bound, never a guess dressed up as one.
+    lo, hi = _CONTEXT_PROBE_FLOOR_TOKENS, _CONTEXT_PROBE_HUGE_TOKENS
+    stopped_early = False
+    while (
+        attempts < _CONTEXT_PROBE_MAX_ATTEMPTS
+        and hi - lo > _CONTEXT_PROBE_TOLERANCE_TOKENS
+        and time.monotonic() < deadline
+    ):
+        mid = (lo + hi) // 2
+        mid_outcome, _ = await _attempt(mid)
+        if mid_outcome == "ok":
+            lo = mid
+        elif mid_outcome == "rejected":
+            hi = mid
+        else:
+            stopped_early = True
+            break
+    caveat = (
+        " (stopped early — a later attempt was inconclusive rather than a clean rejection, "
+        "so this doesn't narrow any further)"
+        if stopped_early
+        else ""
+    )
+    return (
+        ConfigTestStepResult(
+            step="context",
+            ok=True,
+            detail=(
+                "The backend's error message didn't state a number, so we narrowed it by "
+                f"trial and error: approximately {lo} tokens (in {attempts} attempt(s)){caveat}."
+            ),
+        ),
+        lo,
+    )
+
+
+async def _probe_translation_and_thinking(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    dialect: llm_client._Dialect,
+    api_key: str | None,
+) -> tuple[ConfigTestStepResult, ConfigTestStepResult, llm_client._Dialect, str | None]:
+    """Runs the REAL translation prompt on a small fixed probe, and gets
+    BOTH the "thinking" and "translation" step results out of that single
+    call — deliberately not two separate calls.
+
+    Why thinking detection lives here instead of its own trivial call: a
+    trivial "reply with the single word ok" prompt is a FALSE NEGATIVE for
+    Gemma 4's adaptive thinking — measured live: 0 reasoning on the trivial
+    prompt, but 1789 chars of `reasoning` and truncated content (3 of 4
+    lines) on this exact translation prompt with `reasoning_effort` unset.
+    Gemma 4 only thinks when the prompt actually has rules/a contract to
+    reason about, so detecting on the SAME real, rule-heavy prompt this
+    step already sends is both more accurate and strictly cheaper than a
+    dedicated call.
+
+    Verifies with the SAME code the production translator uses
+    (`workers.translator._align_translation`, which itself embeds
+    `_group_is_echo` — see that module and `.claude/llm.md`), rather than
+    re-deriving what "a working translation" means here.
+
+    Returns ``(thinking_step, translation_step, effective_dialect,
+    suggested_reasoning_effort)``. ``effective_dialect`` is the dialect the
+    CONTEXT step should use afterward: unchanged unless thinking was
+    detected AND a `reasoning_effort="none"` retry confirmed it fixes the
+    model — otherwise the context probe would inherit the same
+    empty/polluted-content problem this step exists to catch.
+    """
+    lang = normalize_lang(_TRANSLATION_PROBE_TARGET_LANG_CODE)
+    prompt_template = _load_translate_prompt()
+
+    async def _translate(lines: list[str], call_dialect: llm_client._Dialect) -> tuple[list[str], Any]:
+        prompt = prompt_template.format(
+            target_language_name=lang.english_name, transcript="\n".join(lines),
+        )
+        response = await _call_test_model(
+            client=client,
+            model=model,
+            dialect=call_dialect,
+            content=prompt,
+            max_tokens=400,
+            timeout=_LLM_STEP_TIMEOUT_SECONDS,
+        )
+        message = response.choices[0].message
+        content = message.content or ""
+        return content.split("\n"), message
+
+    try:
+        whole_output, message = await _translate(_TRANSLATION_PROBE_LINES, dialect)
+    except Exception as e:
+        detail = f"Translation call failed: {_redact(str(e), api_key)}"
+        return (
+            ConfigTestStepResult(
+                step="thinking", ok=None, detail="not attempted: translation call failed",
+            ),
+            ConfigTestStepResult(step="translation", ok=False, detail=detail),
+            dialect,
+            None,
+        )
+
+    content_empty = not (getattr(message, "content", None) or "").strip()
+    reasoning_val = _reasoning_text(message)
+    effective_dialect = dialect
+    suggested_effort: str | None = None
+
+    if reasoning_val or content_empty:
+        fix_dialect = dataclasses_replace(dialect, reasoning_effort="none")
+        try:
+            fixed_output, fixed_message = await _translate(_TRANSLATION_PROBE_LINES, fix_dialect)
+            fixed_content_empty = not (getattr(fixed_message, "content", None) or "").strip()
+            fixed_reasoning = _reasoning_text(fixed_message)
+            if not fixed_reasoning and not fixed_content_empty:
+                thinking_step = ConfigTestStepResult(
+                    step="thinking",
+                    ok=True,
+                    detail=(
+                        "Thinking detected on the real translation prompt (reasoning content "
+                        "and/or a truncated/empty response) — reasoning_effort='none' fixes it. "
+                        "Suggested."
+                    ),
+                )
+                suggested_effort = "none"
+                effective_dialect = fix_dialect
+                whole_output = fixed_output
+            else:
+                thinking_step = ConfigTestStepResult(
+                    step="thinking",
+                    ok=False,
+                    detail=(
+                        "Thinking detected on the real translation prompt, and "
+                        "reasoning_effort='none' did not fix it — this backend/model may need "
+                        "a different value, or doesn't support the field at all."
+                    ),
+                )
+        except Exception as e:
+            thinking_step = ConfigTestStepResult(
+                step="thinking",
+                ok=False,
+                detail=(
+                    "Thinking detected on the real translation prompt; the "
+                    f"reasoning_effort='none' retry failed: {_redact(str(e), api_key)}"
+                ),
+            )
+    else:
+        thinking_step = ConfigTestStepResult(
+            step="thinking", ok=True, detail="No thinking/reasoning detected.",
+        )
+
+    translation_step = await _verify_translation_output(
+        whole_output,
+        lang=lang,
+        client=client,
+        model=model,
+        dialect=effective_dialect,
+    )
+    return thinking_step, translation_step, effective_dialect, suggested_effort
+
+
+async def _verify_translation_output(
+    whole_output: list[str],
+    *,
+    lang: Language,
+    client: AsyncOpenAI,
+    model: str,
+    dialect: llm_client._Dialect,
+) -> ConfigTestStepResult:
+    """Verify (and, on mismatch, retry line-by-line to distinguish
+    "recoverable" from "broken") a translation of `_TRANSLATION_PROBE_LINES`
+    already produced by the caller — split out from
+    `_probe_translation_and_thinking` purely so that function's job (get a
+    translation AND detect thinking from one call) stays separate from
+    this one's (verify a translation is a translation).
+    """
+    if (
+        _align_translation(
+            _TRANSLATION_PROBE_LINES,
+            whole_output,
+            source_lang=_TRANSLATION_PROBE_SOURCE_LANG_CODE,
+            target_lang=lang.code,
+        )
+        is not None
+    ):
+        return ConfigTestStepResult(
+            step="translation",
+            ok=True,
+            detail=(
+                f"Translation contract verified — all {len(_TRANSLATION_PROBE_LINES)} lines "
+                "aligned correctly on the first attempt."
+            ),
+        )
+
+    prompt_template = _load_translate_prompt()
+
+    async def _translate_one(line: str) -> list[str]:
+        prompt = prompt_template.format(
+            target_language_name=lang.english_name, transcript=line,
+        )
+        response = await _call_test_model(
+            client=client,
+            model=model,
+            dialect=dialect,
+            content=prompt,
+            max_tokens=400,
+            timeout=_LLM_STEP_TIMEOUT_SECONDS,
+        )
+        content = response.choices[0].message.content or ""
+        return content.split("\n")
+
+    # Whole-group call didn't verify — mirror the production recovery path
+    # (workers.translator._translate_group) at single-line granularity,
+    # without reimplementing its full bisection: enough to tell "some
+    # lines recoverable" (partial) apart from "nothing aligns" (broken).
+    resolved = 0
+    for line in _TRANSLATION_PROBE_LINES:
+        try:
+            single_output = await _translate_one(line)
+        except Exception:
+            continue
+        if (
+            _align_translation(
+                [line],
+                single_output,
+                source_lang=_TRANSLATION_PROBE_SOURCE_LANG_CODE,
+                target_lang=lang.code,
+            )
+            is not None
+        ):
+            resolved += 1
+
+    total = len(_TRANSLATION_PROBE_LINES)
+    if resolved == total:
+        return ConfigTestStepResult(
+            step="translation",
+            ok=True,
+            detail=(
+                "Translation contract verified on retry — the combined call misaligned, but "
+                "every line aligns individually. Production translations against this "
+                "backend/model would recover via retry/bisection, not lose text — expect "
+                "occasional extra retries, not incorrect output."
+            ),
+        )
+    if resolved > 0:
+        return ConfigTestStepResult(
+            step="translation",
+            ok=False,
+            detail=(
+                f"Translation contract PARTIAL — only {resolved}/{total} lines verified even "
+                "individually. A real translation against this backend/model would likely come "
+                "back status=partial, with some lines left in the source language."
+            ),
+        )
+    return ConfigTestStepResult(
+        step="translation",
+        ok=False,
+        detail=(
+            "Translation contract FAILED — the model's output could not be verified as a real "
+            "translation (lost line alignment, a repetition loop, or it echoed the input back "
+            "instead of translating). A real translation against this backend/model would "
+            "likely fail or leave most of the transcript untranslated."
+        ),
+    )
+
+
+async def _test_llm(overrides: ConfigTestLLMOverrides | None) -> ConfigTestResponse:
+    """Six-step probe of a CANDIDATE (possibly unsaved) llm config — see
+    `.claude/llm.md`'s "target=\"llm\" step-by-step probe" section for the
+    full design. The report is always returned in full: an early failure
+    doesn't shorten `steps`, it just marks the rest `ok=None` via
+    `_fill_remaining_as_skipped`.
+    """
+    deadline = time.monotonic() + _TOTAL_TEST_TIMEOUT_SECONDS
+    start_all = time.monotonic()
     cfg = get_config().llm
     base_url = (overrides.base_url if overrides else None) or cfg.base_url
     model = (overrides.model if overrides else None) or cfg.model
 
+    steps: list[ConfigTestStepResult] = []
+
     if overrides and overrides.api_key:
-        api_key = overrides.api_key
+        api_key: str | None = overrides.api_key
     else:
         try:
             api_key = cfg.effective_api_key
         except Exception as e:
-            return ConfigTestResponse(
-                ok=False,
-                step=None,
-                status_code=None,
-                detail=_redact(str(e), None),
-                models=[],
-                latency_ms=None,
+            steps.append(
+                ConfigTestStepResult(step="reachable", ok=False, detail=_redact(str(e), None))
             )
+            _fill_remaining_as_skipped(steps, "not attempted: could not resolve an API key")
+            return ConfigTestResponse(ok=False, models=[], latency_ms=None, steps=steps)
 
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-    # --- Step 1: GET {base_url}/models ------------------------------------
+    # --- Steps 1+2: reachability + model list ------------------------------
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=_TEST_TIMEOUT_SECONDS) as client:
             r = await client.get(f"{base_url}/models", headers=headers)
     except Exception as e:
-        return ConfigTestResponse(
-            ok=False,
-            step="models",
-            status_code=None,
-            detail=_redact(str(e), api_key),
-            models=[],
-            latency_ms=int((time.monotonic() - start) * 1000),
+        latency_ms = int((time.monotonic() - start) * 1000)
+        steps.append(
+            ConfigTestStepResult(step="reachable", ok=False, detail=_redact(str(e), api_key))
         )
+        _fill_remaining_as_skipped(steps, "not attempted: backend unreachable")
+        return ConfigTestResponse(ok=False, models=[], latency_ms=latency_ms, steps=steps)
+
     latency_ms = int((time.monotonic() - start) * 1000)
+    steps.append(
+        ConfigTestStepResult(
+            step="reachable", ok=True, detail=f"HTTP {r.status_code} in {latency_ms} ms.",
+        )
+    )
 
     if r.status_code != 200:
-        return ConfigTestResponse(
-            ok=False,
-            step="models",
-            status_code=r.status_code,
-            detail=_redact(r.text, api_key),
-            models=[],
-            latency_ms=latency_ms,
+        steps.append(
+            ConfigTestStepResult(
+                step="models",
+                ok=False,
+                detail=f"HTTP {r.status_code}: {_redact(r.text, api_key)}",
+            )
         )
+        _fill_remaining_as_skipped(steps, "not attempted: model list request failed")
+        return ConfigTestResponse(ok=False, models=[], latency_ms=latency_ms, steps=steps)
 
     try:
         models = [m["id"] for m in r.json().get("data", []) if "id" in m]
     except Exception:
         models = []
+    steps.append(
+        ConfigTestStepResult(step="models", ok=True, detail=f"{len(models)} model(s) available.")
+    )
 
-    # --- Step 2: minimal chat completion against the target model --------
+    # --- Step 3: minimal chat completion against the target model ---------
     # Goes through the same dialect-adaptation logic as the real call path
     # (`llm_client.call_with_dialect_adaptation`), over a throwaway
     # client/model/dialect rather than the cached prod ones — otherwise a
@@ -527,44 +1171,99 @@ async def _test_llm(overrides: Any) -> ConfigTestResponse:
     # 400 (e.g. `max_tokens` unsupported) even though the real pipeline
     # would have adapted and worked fine. See llm/client.py for why there is
     # only one place that knows how to interpret these 400s.
-    test_client = AsyncOpenAI(base_url=base_url, api_key=api_key or "dummy")
-    start2 = time.monotonic()
+    test_client = AsyncOpenAI(
+        base_url=base_url, api_key=api_key or "dummy", max_retries=0,
+        timeout=_CONTEXT_PROBE_TIMEOUT_SECONDS,
+    )
+    dialect = llm_client._new_dialect()
     try:
-        await llm_client.call_with_dialect_adaptation(
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=_TEST_COMPLETION_MAX_TOKENS,
-            temperature=0.0,
-            stream=False,
+        # The response itself is discarded — this step only proves the
+        # model answers SOMETHING at all. Thinking detection deliberately
+        # does NOT use this trivial call (see `_probe_translation_and_thinking`).
+        await _call_test_model(
             client=test_client,
             model=model,
-            dialect=llm_client._new_dialect(),
+            dialect=dialect,
+            content="Reply with the single word: ok",
+            max_tokens=_TEST_COMPLETION_MAX_TOKENS,
+            timeout=_LLM_STEP_TIMEOUT_SECONDS,
         )
     except APIStatusError as e:
-        return ConfigTestResponse(
-            ok=False,
-            step="completion",
-            status_code=e.status_code,
-            detail=_redact(str(e), api_key),
-            models=models,
-            latency_ms=latency_ms + int((time.monotonic() - start2) * 1000),
+        steps.append(
+            ConfigTestStepResult(
+                step="completion",
+                ok=False,
+                detail=f"HTTP {e.status_code}: {_redact(str(e), api_key)}",
+            )
         )
+        _fill_remaining_as_skipped(steps, "not attempted: test completion failed")
+        return ConfigTestResponse(ok=False, models=models, latency_ms=latency_ms, steps=steps)
     except Exception as e:
-        return ConfigTestResponse(
-            ok=False,
-            step="completion",
-            status_code=None,
-            detail=_redact(str(e), api_key),
-            models=models,
-            latency_ms=latency_ms + int((time.monotonic() - start2) * 1000),
+        steps.append(
+            ConfigTestStepResult(step="completion", ok=False, detail=_redact(str(e), api_key))
         )
+        _fill_remaining_as_skipped(steps, "not attempted: test completion failed")
+        return ConfigTestResponse(ok=False, models=models, latency_ms=latency_ms, steps=steps)
 
+    steps.append(
+        ConfigTestStepResult(step="completion", ok=True, detail="Model responded to a test call.")
+    )
+
+    suggestions = ConfigTestSuggestions()
+
+    # --- Steps 4+5: thinking + translation contract, from ONE real call ----
+    # Order matters: this runs BEFORE context — see `_LLM_STEP_ORDER`'s
+    # docstring and `_CONTEXT_PROBE_OWN_BUDGET_SECONDS` for why the cheap,
+    # decisive step must never again be starved by the slow, diagnostic one.
+    # The trivial step-3 completion above is deliberately never inspected
+    # for thinking — see `_probe_translation_and_thinking`'s docstring for
+    # why that was a measured false negative on Gemma 4.
+    if time.monotonic() >= deadline:
+        _fill_remaining_as_skipped(steps, "not attempted: overall test time budget exceeded")
+        return ConfigTestResponse(
+            ok=True, models=models, latency_ms=latency_ms, steps=steps, suggestions=suggestions,
+        )
+    thinking_step, translation_step, dialect, suggested_effort = (
+        await _probe_translation_and_thinking(
+            client=test_client, model=model, dialect=dialect, api_key=api_key,
+        )
+    )
+    steps.append(thinking_step)
+    steps.append(translation_step)
+    if suggested_effort is not None:
+        suggestions.reasoning_effort = suggested_effort
+
+    # --- Step 6: real context length ----------------------------------------
+    # Runs LAST and on its OWN dedicated budget (never more than what's left
+    # of the overall deadline either) precisely so it can never again eat
+    # into the time the decisive step above needs — see both budgets'
+    # docstrings for the live incident that motivated this ordering.
+    if time.monotonic() >= deadline:
+        _fill_remaining_as_skipped(steps, "not attempted: overall test time budget exceeded")
+    else:
+        context_deadline = min(deadline, time.monotonic() + _CONTEXT_PROBE_OWN_BUDGET_SECONDS)
+        context_step, context_value = await _probe_context_length(
+            client=test_client,
+            model=model,
+            dialect=dialect,
+            deadline=context_deadline,
+            api_key=api_key,
+        )
+        steps.append(context_step)
+        if context_value is not None:
+            suggestions.context_length = context_value
+            suggestions.single_pass_token_limit = int(context_value * _SINGLE_PASS_RATIO)
+
+    total_latency_ms = int((time.monotonic() - start_all) * 1000)
+    connectivity_ok = all(
+        s.ok for s in steps if s.step in ("reachable", "models", "completion")
+    )
     return ConfigTestResponse(
-        ok=True,
-        step="completion",
-        status_code=200,
-        detail=None,
+        ok=connectivity_ok,
         models=models,
-        latency_ms=latency_ms + int((time.monotonic() - start2) * 1000),
+        latency_ms=total_latency_ms,
+        steps=steps,
+        suggestions=suggestions,
     )
 
 

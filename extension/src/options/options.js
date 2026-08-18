@@ -66,6 +66,16 @@ const llmApiKeyStorageKeychainOptionEl = /** @type {HTMLOptionElement} */ (
 
 const testBtn = /** @type {HTMLButtonElement} */ (document.getElementById("test-connection"));
 const testResultEl = /** @type {HTMLElement} */ (document.getElementById("test-result"));
+const testSuggestionsEl = /** @type {HTMLElement} */ (document.getElementById("test-suggestions"));
+const testSuggestionsListEl = /** @type {HTMLElement} */ (
+  document.getElementById("test-suggestions-list")
+);
+const applySuggestionsBtn = /** @type {HTMLButtonElement} */ (
+  document.getElementById("apply-suggestions")
+);
+const applySuggestionsStatusEl = /** @type {HTMLElement} */ (
+  document.getElementById("apply-suggestions-status")
+);
 
 const whisperBaseUrlInput = /** @type {HTMLInputElement} */ (
   document.getElementById("whisper-base-url")
@@ -151,6 +161,13 @@ const API_KEY_SECTIONS = {
 let lastConfig = null;
 /** api_key_storage value implied by the last loaded config's api_key_source, per section. */
 const initialApiKeyStorage = { llm: "file", whisper: "file" };
+/**
+ * `suggestions` from the last POST /config/test (target="llm") response —
+ * the baseline `#apply-suggestions` builds its PATCH from. Null whenever no
+ * suggestion is pending (no test run yet, or the run found nothing to
+ * suggest).
+ */
+let lastTestSuggestions = null;
 
 /**
  * Turn an Error thrown by daemon-client's `request()` (shape:
@@ -388,16 +405,69 @@ function buildPatch() {
   return patch;
 }
 
+/** Human-readable label per POST /config/test (target="llm") step name. */
+const TEST_STEP_LABELS = {
+  reachable: "Backend reachable",
+  models: "Model list",
+  completion: "Model responds",
+  thinking: "Thinking / reasoning",
+  context: "Real context length",
+  translation: "Translation contract",
+};
+
 /**
- * Render a POST /config/test result into the given container element
- * (#test-result for llm, #whisper-test-result for whisper).
+ * Render a `target: "llm"` POST /config/test result — one line per step
+ * (see TEST_STEP_LABELS), always all six in order, `ok: null` steps shown
+ * as "not attempted" with the reason so an early failure is legible instead
+ * of just a truncated list.
  *
  * @param {HTMLElement} container
  * @param {object} result
  */
-function renderTestResult(container, result) {
-  container.textContent = "";
+function renderStepReport(container, result) {
+  const summary = document.createElement("div");
+  summary.className = result.ok ? "ok" : "err";
+  const parts = [result.ok ? "Backend OK" : "Backend check failed"];
+  if (typeof result.latency_ms === "number") parts.push(`${result.latency_ms} ms total`);
+  summary.textContent = parts.join(" — ");
+  container.appendChild(summary);
 
+  const list = document.createElement("ul");
+  for (const step of result.steps ?? []) {
+    const li = document.createElement("li");
+    li.className = step.ok === true ? "ok" : step.ok === false ? "err" : "";
+    const label = TEST_STEP_LABELS[step.step] ?? step.step;
+    const status = step.ok === true ? "OK" : step.ok === false ? "Failed" : "Not attempted";
+    li.textContent = step.detail ? `${label}: ${status} — ${step.detail}` : `${label}: ${status}`;
+    list.appendChild(li);
+  }
+  container.appendChild(list);
+
+  if (Array.isArray(result.models) && result.models.length) {
+    const details = document.createElement("details");
+    const summaryEl = document.createElement("summary");
+    summaryEl.textContent = `${result.models.length} model${result.models.length === 1 ? "" : "s"} available`;
+    details.appendChild(summaryEl);
+    const modelList = document.createElement("ul");
+    for (const m of result.models) {
+      const modelLi = document.createElement("li");
+      modelLi.textContent = String(m);
+      modelList.appendChild(modelLi);
+    }
+    details.appendChild(modelList);
+    container.appendChild(details);
+  }
+}
+
+/**
+ * Render a legacy flat POST /config/test result — still what
+ * `target: "whisper"` returns (reachability only, no per-step breakdown;
+ * see ConfigTestResponse's docstring for why the two shapes share one type).
+ *
+ * @param {HTMLElement} container
+ * @param {object} result
+ */
+function renderFlatTestResult(container, result) {
   const summary = document.createElement("div");
   summary.className = result.ok ? "ok" : "err";
   const parts = [result.ok ? "OK" : "Failed", `step: ${result.step}`];
@@ -429,6 +499,59 @@ function renderTestResult(container, result) {
     details.appendChild(list);
     container.appendChild(details);
   }
+}
+
+/**
+ * Render a POST /config/test result into the given container element
+ * (#test-result for llm, #whisper-test-result for whisper) — dispatches to
+ * the step-by-step report when `steps` is present (target="llm"), the
+ * legacy flat summary otherwise (target="whisper").
+ *
+ * @param {HTMLElement} container
+ * @param {object} result
+ */
+function renderTestResult(container, result) {
+  container.textContent = "";
+  if (Array.isArray(result.steps) && result.steps.length) {
+    renderStepReport(container, result);
+  } else {
+    renderFlatTestResult(container, result);
+  }
+}
+
+/** Human-readable label per suggestion field, for the "Apply" checklist. */
+const SUGGESTION_LABELS = {
+  reasoning_effort: "Reasoning effort",
+  context_length: "Context length",
+  single_pass_token_limit: "Single-pass token limit",
+};
+
+/**
+ * Show (or hide) the `#test-suggestions` panel from a test result's
+ * `suggestions` object. Populates `lastTestSuggestions` so the "Apply"
+ * button has something to PATCH — applying is always a separate, explicit
+ * click, never automatic.
+ *
+ * @param {Record<string, unknown> | null | undefined} suggestions
+ */
+function renderSuggestions(suggestions) {
+  const entries = Object.entries(suggestions ?? {}).filter(([, v]) => v !== null && v !== undefined);
+  if (!entries.length) {
+    lastTestSuggestions = null;
+    testSuggestionsEl.hidden = true;
+    testSuggestionsListEl.replaceChildren();
+    return;
+  }
+  lastTestSuggestions = Object.fromEntries(entries);
+  testSuggestionsListEl.replaceChildren();
+  for (const [key, value] of entries) {
+    const li = document.createElement("li");
+    li.textContent = `${SUGGESTION_LABELS[key] ?? key}: ${value}`;
+    testSuggestionsListEl.appendChild(li);
+  }
+  applySuggestionsStatusEl.textContent = "";
+  applySuggestionsStatusEl.className = "";
+  testSuggestionsEl.hidden = false;
 }
 
 /**
@@ -504,6 +627,7 @@ async function loadSettings() {
 
 testBtn.addEventListener("click", async () => {
   testResultEl.textContent = "Testing…";
+  renderSuggestions(null);
   testBtn.disabled = true;
   try {
     const llmOverrides = buildTestOverrides("llm");
@@ -513,6 +637,7 @@ testBtn.addEventListener("click", async () => {
 
     const result = await daemon.testConfig(body);
     renderTestResult(testResultEl, result);
+    renderSuggestions(result.suggestions);
   } catch (err) {
     testResultEl.textContent = "";
     const pre = document.createElement("pre");
@@ -521,6 +646,35 @@ testBtn.addEventListener("click", async () => {
     testResultEl.appendChild(pre);
   } finally {
     testBtn.disabled = false;
+  }
+});
+
+applySuggestionsBtn.addEventListener("click", async () => {
+  if (!lastTestSuggestions || !Object.keys(lastTestSuggestions).length) return;
+  applySuggestionsStatusEl.textContent = "Applying…";
+  applySuggestionsStatusEl.className = "";
+  applySuggestionsBtn.disabled = true;
+  try {
+    // A dedicated PATCH, not buildPatch(): this applies exactly the fields
+    // the test suggested, independent of whatever else the user may have
+    // typed into the form but not saved yet.
+    const result = await daemon.updateConfig({ llm: { ...lastTestSuggestions } });
+    lastConfig = result;
+    renderConfig(result);
+    applySuggestionsStatusEl.textContent = "Applied and saved.";
+    applySuggestionsStatusEl.className = "ok";
+    if (result.restart_required) {
+      restartNoticeEl.textContent =
+        "Some changes only take effect after the daemon restarts. Run: " +
+        "tldr-daemon service uninstall && tldr-daemon service install";
+      restartNoticeEl.hidden = false;
+      restartNoticeEl.className = "notice";
+    }
+  } catch (err) {
+    applySuggestionsStatusEl.textContent = `Apply failed: ${formatRequestError(err)}`;
+    applySuggestionsStatusEl.className = "err";
+  } finally {
+    applySuggestionsBtn.disabled = false;
   }
 });
 

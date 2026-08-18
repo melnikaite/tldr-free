@@ -670,16 +670,58 @@ class ConfigTestRequest(BaseModel):
     whisper: ConfigTestWhisperOverrides | None = None
 
 
+class ConfigTestStepResult(BaseModel):
+    """One step of a ``target="llm"`` ``POST /config/test`` run.
+
+    ``ok=None`` means the step was never attempted — an earlier step it
+    depends on failed (or the endpoint's overall time budget ran out) —
+    NOT that it was skipped silently: the full step list is always
+    returned (see ``ConfigTestResponse``), so the caller can show the user
+    exactly how far the probe got. ``detail`` is a human-readable sentence,
+    not a stack trace — provider error text is still relayed verbatim
+    (truncated, key-redacted) inside it where relevant.
+    """
+    step: Literal["reachable", "models", "completion", "thinking", "context", "translation"]
+    ok: bool | None
+    detail: str | None = None
+
+
+class ConfigTestSuggestions(BaseModel):
+    """Aggregated proposals from a ``target="llm"`` test run. ``None`` on any
+    field means "no suggestion" — either the step that would produce it
+    never ran, or it ran and found nothing worth changing. Applying a
+    suggestion is a separate, explicit ``PATCH /config`` the user triggers;
+    this endpoint never writes anything itself."""
+    reasoning_effort: str | None = None
+    context_length: int | None = None
+    single_pass_token_limit: int | None = None
+
+
 class ConfigTestResponse(BaseModel):
     """Always HTTP 200 — this endpoint reports probe failures in the body
     rather than raising, since a 401/timeout/etc. IS the useful answer.
 
-    ``step`` marks which probe ran last: "models" (``GET {base_url}/models``)
-    or "completion" (a minimal chat completion against ``model``) — the
-    Whisper probe (``target="whisper"``) only ever reports "models", since a
-    transcription probe would need an audio file. ``detail`` carries the
-    provider's error message verbatim (truncated), which is the whole point
-    of this endpoint — never redacted except for the API key itself.
+    Two shapes share this model:
+
+    - ``target="whisper"``: the legacy flat shape — ``step`` ("models" is
+      the only value ever reported, a transcription probe would need an
+      audio file), ``status_code``, ``detail`` describe the single
+      reachability probe. ``steps``/``suggestions`` are left empty/default.
+    - ``target="llm"`` (default): the step-by-step probe described in
+      ``.claude/llm.md`` — ``steps`` carries one ``ConfigTestStepResult``
+      per stage (reachable → models → completion → thinking → context →
+      translation, always in that order, always all six present even when
+      later ones are ``ok=None``) and ``suggestions`` aggregates whatever
+      the run learned. Top-level ``ok`` reflects only the three
+      connectivity/model steps (reachable/models/completion) — thinking/
+      context/translation are diagnostic, not pass/fail gates for the
+      backend being usable at all. ``models``/``latency_ms`` stay populated
+      (model list, total wall time) for both shapes.
+
+    ``detail`` (top-level, legacy) carries the provider's error message
+    verbatim (truncated), which is the whole point of this endpoint — never
+    redacted except for the API key itself. Same redaction applies inside
+    every ``ConfigTestStepResult.detail``.
     """
     ok: bool
     step: Literal["models", "completion"] | None = None
@@ -687,3 +729,5 @@ class ConfigTestResponse(BaseModel):
     detail: str | None = None
     models: list[str] = []
     latency_ms: int | None = None
+    steps: list[ConfigTestStepResult] = []
+    suggestions: ConfigTestSuggestions = Field(default_factory=ConfigTestSuggestions)

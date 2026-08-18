@@ -340,6 +340,127 @@ backend. It also feeds `qa._select_context`, which uses
 `context_length - 4000` to decide whether to hand QA the full transcript
 instead of the summary.
 
+## `POST /config/test` (target="llm"): backend settings are probed, not hand-set
+
+`context_length`, `single_pass_token_limit`, and `reasoning_effort` used to
+be pure guesswork for the person editing `tldr.yaml`/the options page — get
+`context_length` wrong and the failure above is what you get; leave
+`reasoning_effort` unset on a thinking backend and the summary/translation
+silently degrades instead of erroring (measured: the same model translating
+139/139 lines with `reasoning_effort: "none"` vs 25/139 without it). The
+options page now has a "Test setup" button (`daemon/src/api/config.py`'s
+`_test_llm`) that determines all three by actually exercising the CANDIDATE
+backend (the fields the user just typed, not necessarily saved yet — see
+`ConfigTestLLMOverrides`), never by declaration:
+
+1. **reachable** / **models** — `GET {base_url}/models` split into two
+   steps: got an HTTP response at all vs. the model list itself (200).
+2. **completion** — a real chat completion against the target model,
+   through `llm_client.call_with_dialect_adaptation` exactly like the real
+   call path (same 400-adaptation logic), just against a throwaway
+   client/model/dialect instead of the cached prod ones. Trivial prompt
+   ("reply with the single word ok") — this step exists only to prove the
+   model answers at all, nothing more; see why thinking detection
+   deliberately does NOT reuse this call, next.
+3. **thinking** + **translation**, from ONE real call
+   (`_probe_translation_and_thinking`) — thinking detection does NOT get
+   its own trivial-prompt call. It used to, and that was a measured false
+   negative: Gemma 4's thinking is ADAPTIVE, triggered by a prompt with
+   actual rules to reason about, not by "reply with one word." Live
+   measurement on the same model: 0 reasoning chars on the trivial prompt,
+   1789 chars of `reasoning` plus truncated content (3 of 4 lines) on the
+   REAL translation prompt with `reasoning_effort` unset — a detector
+   watching only the trivial call would report "no thinking" and be wrong
+   on exactly the model this whole feature was built for. So thinking
+   detection instead inspects the response of the translation probe below
+   (non-empty `reasoning`/`reasoning_content`, or empty `content`), which
+   already sends a rule-heavy, contract-shaped prompt. Detected → retried
+   once with `reasoning_effort: "none"`; suggested, and carried forward as
+   the dialect for every later call (translation retries, context), ONLY
+   if that retry actually comes back with real content — never
+   speculatively. The translation half verifies a fixed 4-line probe
+   through the REAL `prompts/transcript_translate.txt` prompt, checked with
+   the production translator's own `workers.translator._align_translation`
+   (which embeds `_group_is_echo`) — reused unmodified, not re-derived, so
+   "the test passed" means what it says. See "Transcript translation"
+   below for what that verification actually checks, including its one
+   documented gap (echo at single-line bisection granularity — the probe
+   inherits it rather than pretending to be stricter than production).
+4. **context** — runs LAST, deliberately, on its OWN dedicated time budget
+   (`_CONTEXT_PROBE_OWN_BUDGET_SECONDS`) separate from the overall
+   deadline. This ordering is a fix, not the original design: on a live
+   run against gemma-4-e4b on LocalAI, the context probe (then step 2 of
+   3, before translation) consumed the ENTIRE 90s overall budget — 4
+   attempts at ~20s each — and the translation step that ran after it
+   never executed, leaving the one decisive "will my model actually work"
+   answer unattempted while the slow, diagnostic step took everything.
+   Context can now blow its own budget without touching anything else.
+   One deliberately oversized request (`_CONTEXT_PROBE_HUGE_TOKENS`, built
+   via `llm.tokens.make_filler_text`); on a rejection, the real ceiling is
+   parsed straight out of the backend's own error text (both observed
+   phrasings put the ceiling as the SMALLER of two "<N> tokens" mentions).
+   Falls back to bisection, bounded to `_CONTEXT_PROBE_MAX_ATTEMPTS` (6)
+   calls and its own budget, only when parsing fails. `single_pass_token_limit`
+   is suggested as ~60% of whatever `context_length` comes out to — the
+   same ratio every backend example in tldr.yaml.example already documents
+   in a comment.
+
+   **A failure is not automatically "over context" — and neither is the
+   HTTP status code that carries it.** The same live run reported
+   "approximately 35250 tokens" for a model whose LocalAI `context_size`
+   was actually 131072 — the bisection was treating ANY failed attempt
+   (including a plain timeout on a huge, slow-to-prefill request) as proof
+   of hitting the wall. It isn't: a slow CPU-bound backend just taking a
+   long time looks identical to "rejected" if you only check "did it
+   raise." Each probe attempt now classifies by MESSAGE CONTENT
+   (`_looks_like_context_overflow` — mentions `context`/`tokens` together
+   with an overflow word: exceeds/too many/maximum/limit) into `"ok"` /
+   `"rejected"` / `"inconclusive"` (nothing recognizable — a timeout, a
+   dropped connection, an unrelated 5xx). Only `"rejected"` ever narrows
+   the bisection window; `"inconclusive"` stops it outright.
+
+   Content, not status code, because status code turned out to be
+   gateway-dependent: a first fix keyed "rejected" off `status_code == 400`
+   specifically — and broke the ONE backend (qwen3-vl-8b-instruct on
+   LocalAI) where the signal had been perfect before. LocalAI relayed the
+   exact same kind of error — `rpc error: code = Internal desc = request
+   (40008 tokens) exceeds the available context size (32768 tokens)` — as
+   an HTTP **500**, not 400. The number was sitting right there in the
+   text; the status-code classifier threw it away as "inconclusive" purely
+   because of the wrapping code. Message content is where the real
+   evidence lives; status code is not a reliable proxy for it.
+
+   If even the initial huge probe is inconclusive, the whole step reports
+   `ok: null` with an explanation instead of a number — the project has
+   already paid for a wrong-but-declared `context_length` silently
+   corrupting a real job (see the section above); a fabricated
+   *discovered* one would be the same mistake with better PR. That
+   explanation must itself be legible: `asyncio.wait_for`'s own client-side
+   `TimeoutError()` carries NO message at all (`str(TimeoutError())` is
+   `""` by construction, not a bug losing content along the way) —
+   `_describe_probe_failure` substitutes a readable fallback sentence
+   rather than reporting a blank after a colon.
+
+Every step's report is returned even when an earlier one failed — later
+steps read `ok: null` ("not attempted"), not a truncated list — so a
+partial failure is legible instead of silently swallowed. The whole probe
+never writes to config; the options page's "Apply" button does that
+afterward, via an ordinary `PATCH /config`.
+
+**Per-call `reasoning_effort` override, added for step 3 above:**
+`llm.client.call_with_dialect_adaptation` already accepted a throwaway
+`client`/`model`/`dialect` for exactly this kind of one-off probe (see its
+docstring) — everything except `reasoning_effort`, which `_extra_body` used
+to read straight from `get_config().llm.reasoning_effort` on every call.
+That field now lives on `_Dialect` itself (populated from config by
+`_new_dialect()`, exactly as before, for every REAL call path); a caller
+that builds its own `_Dialect` — only the config-test probe does — can pin
+a candidate value for one call without writing anything to saved config
+first, and without touching the semaphore (still gated by the same rule
+as any other cached-client bypass: only acceptable for a probe against a
+possibly-different, not-yet-saved backend, never as a shortcut for real
+work).
+
 ## Transcript translation
 
 `workers/translator.py` translates a job's transcript into a target

@@ -34,6 +34,17 @@ after, so they don't help once a job is already waiting on the semaphore.
 
 QA passes ``respect_pause=False`` because the user is actively waiting
 on the answer; pausing the workers should not freeze a chat reply.
+
+Per-call overrides for ``POST /config/test``: ``call_with_dialect_adaptation``
+already accepts an explicit ``client``/``model``/``dialect`` to run against a
+candidate (possibly unsaved) backend without touching the cached prod
+client or the semaphore (see its docstring). ``_Dialect.reasoning_effort``
+extends the same mechanism to that one remaining call-shape dimension —
+a caller-built ``_Dialect`` can pin a candidate ``reasoning_effort`` value
+(e.g. probing whether ``"none"`` stops a model from thinking) without it
+coming from ``config.llm.reasoning_effort``. No other call path needed
+this: the cached prod dialect's value is still sourced from config exactly
+as before.
 """
 
 from __future__ import annotations
@@ -99,6 +110,20 @@ class _Dialect:
     token_param: str = "max_tokens"
     send_temperature: bool = True
     send_reasoning_effort: bool = True
+    # The reasoning_effort VALUE to send (subject to send_reasoning_effort
+    # above). Lives on the dialect — rather than being read fresh from
+    # config on every call — specifically so ``POST /config/test`` can pass
+    # a throwaway ``_Dialect`` carrying a CANDIDATE value (e.g. "none",
+    # while trying to find one that stops a model from thinking) without
+    # writing anything to saved config first. This is the narrow, documented
+    # per-call override ``.claude/llm.md`` asks for: the four blessed
+    # entry points (`complete`/`stream_complete`/`complete_with_messages`/
+    # `stream_with_messages`) always build their dialect via ``_dialect()``
+    # (the process-cached one, itself built from config by ``_new_dialect()``
+    # below), so production behaviour is unchanged — only a caller passing
+    # its OWN ``_Dialect`` instance (as the config-test probe does) can ever
+    # see a different value here.
+    reasoning_effort: str | None = None
 
 
 def _new_dialect() -> _Dialect:
@@ -108,7 +133,7 @@ def _new_dialect() -> _Dialect:
     call — e.g. ``POST /config/test`` probing a candidate backend that may
     not be the currently-configured/cached one."""
     cfg = get_config().llm
-    dialect = _Dialect()
+    dialect = _Dialect(reasoning_effort=cfg.reasoning_effort)
     if cfg.token_param != "auto":
         dialect.token_param = cfg.token_param
     if cfg.send_temperature is not None:
@@ -142,8 +167,13 @@ def _extra_body(dialect: _Dialect) -> dict[str, str] | None:
     tokens and emits no ``delta.content``. Set ``llm.reasoning_effort: "none"``
     in config/tldr.yaml to activate. Suppressed once the dialect has learned
     (via a 400) that the backend rejects the field.
+
+    Reads the value from ``dialect.reasoning_effort`` (not straight from
+    config) so a caller-supplied dialect can pin a candidate value for one
+    call — see the field's docstring on ``_Dialect``. The cached prod
+    dialect's value still ultimately comes from config, via ``_new_dialect``.
     """
-    effort = get_config().llm.reasoning_effort
+    effort = dialect.reasoning_effort
     if effort is not None and dialect.send_reasoning_effort:
         return {"reasoning_effort": effort}
     return None

@@ -523,22 +523,63 @@
  */
 
 /**
+ * One step of a `target: "llm"` POST /config/test run, always in the fixed
+ * order reachable → models → completion → thinking → context → translation
+ * — all six always present, even when later ones are `ok: null` because an
+ * earlier step failed (or the overall time budget ran out). `detail` is a
+ * human-readable sentence, not a stack trace, though provider error text is
+ * still relayed verbatim (truncated, key-redacted) inside it where relevant.
+ *
+ * @typedef {object} ConfigTestStepResult
+ * @property {"reachable" | "models" | "completion" | "thinking" | "context" | "translation"} step
+ * @property {boolean | null} ok
+ * @property {string | null} [detail]
+ */
+
+/**
+ * Aggregated proposals from a `target: "llm"` test run. `null` on any field
+ * means "no suggestion" — either the step that would produce it never ran,
+ * or ran and found nothing worth changing. Applying a suggestion is a
+ * separate, explicit PATCH /config the caller triggers; POST /config/test
+ * never writes anything itself.
+ *
+ * @typedef {object} ConfigTestSuggestions
+ * @property {string | null} [reasoning_effort]
+ * @property {number | null} [context_length]
+ * @property {number | null} [single_pass_token_limit]
+ */
+
+/**
  * Always HTTP 200 — probe failures are reported in the body (never thrown)
  * since a 401/timeout/etc. IS the useful answer this endpoint exists to
- * give. `step` marks which probe ran last: "models" (GET {base_url}/models)
- * or "completion" (a minimal chat completion) — the whisper probe
- * (`target: "whisper"`) only ever reports "models", since a transcription
- * probe would need an audio file. `detail` is the provider's error message
+ * give. Two shapes share this type:
+ *
+ * - `target: "whisper"`: the legacy flat shape — `step` ("models" is the
+ *   only value ever reported, a transcription probe would need an audio
+ *   file), `status_code`, `detail` describe the single reachability probe.
+ *   `steps`/`suggestions` stay empty/default.
+ * - `target: "llm"` (default): the step-by-step probe — `steps` carries one
+ *   ConfigTestStepResult per stage (see its typedef) and `suggestions`
+ *   aggregates whatever the run learned. Top-level `ok` reflects only the
+ *   three connectivity/model steps (reachable/models/completion) —
+ *   thinking/context/translation are diagnostic, not pass/fail gates for
+ *   the backend being usable at all.
+ *
+ * `models`/`latency_ms` stay populated (model list, total wall time) for
+ * both shapes. `detail` (top-level, legacy) is the provider's error message
  * verbatim (truncated to 2000 chars), with the API key itself scrubbed out
- * if it happened to be echoed back.
+ * if it happened to be echoed back — same redaction inside every
+ * ConfigTestStepResult.detail.
  *
  * @typedef {object} ConfigTestResponse
  * @property {boolean} ok
- * @property {"models" | "completion" | null} step
- * @property {number | null} status_code
- * @property {string | null} detail
+ * @property {"models" | "completion" | null} [step]
+ * @property {number | null} [status_code]
+ * @property {string | null} [detail]
  * @property {string[]} models
  * @property {number | null} latency_ms
+ * @property {ConfigTestStepResult[]} [steps]
+ * @property {ConfigTestSuggestions} [suggestions]
  */
 
 // Marker export so editors recognise this as an ES module.
