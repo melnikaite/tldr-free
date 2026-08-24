@@ -237,6 +237,13 @@ class JobDetails(JobSummary):
     # live SSE `stage("queued", detail=...)` event would have shown a
     # subscriber at the moment it happened.
     queued_reason: DeferredReason | None = None
+    # 1-based position in the Whisper queue's FIFO, sourced live from
+    # ``workers.queue.get_queue().position(job.id)`` — NOT persisted on the
+    # row. Distinct from queued_reason above: queued_reason explains WHY a
+    # job deferred to Whisper, this says WHERE it currently sits in line.
+    # ``None`` when the job isn't currently waiting there — not a Whisper
+    # job, already picked up by a pool worker, or done/failed.
+    whisper_queue_position: int | None = None
 
 
 class JobListResponse(BaseModel):
@@ -508,6 +515,11 @@ class HealthResponse(BaseModel):
     # network-level "unreachable". None when the probe succeeded or the
     # failure was a connection-level error.
     llm_backend_error: str | None = None
+    # True iff config.whisper.base_url AND config.whisper.model are both
+    # non-empty (after .strip()) — a pure config-presence check, no network
+    # probe (unlike llm_backend_reachable above; /health already probes the
+    # LLM backend and must stay fast).
+    whisper_configured: bool
     version: str
 
 

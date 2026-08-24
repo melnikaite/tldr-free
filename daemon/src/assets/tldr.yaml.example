@@ -85,6 +85,21 @@ whisper:
   base_url: http://host.docker.internal:18000/v1
   api_key: dummy
   model: whisper                                   # served_model_name in ~/.mlx-server/config.yaml
+  # Worker-pool size for the deferred Whisper queue — how many jobs may be
+  # actively going through download -> transcribe -> summarize at once. This
+  # is what lets a short job's chunks interleave with a long job's instead of
+  # queueing behind all of it.
+  max_concurrent_jobs: 2
+  # Global cap on simultaneous Whisper HTTP requests across every job.
+  # MEASURED: against a real backend (LocalAI, whisper-large, single GPU), 1
+  # concurrent request took 8.0s wall, 2 concurrent took 16.5s, 3 concurrent
+  # took 22.9s — the backend serialises requests FIFO internally, so
+  # concurrency here buys ZERO extra throughput. This is a FAIRNESS knob, not
+  # a speed knob — keep it small (2-3), never raise it expecting faster
+  # transcription. 1 gives NO fairness benefit either (only one request ever
+  # in flight, so whoever holds it keeps it until their own chunk finishes);
+  # 2 is the minimum that lets a second job's request actually slip in.
+  max_concurrent_requests: 2
 
 # ---------------------------------------------------------------------------
 # Backend: LM Studio (LLM) + mlx-openai-server (Whisper)

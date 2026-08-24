@@ -55,6 +55,7 @@ from src.workers import deixis, frames, pipeline, timecodes, youtube
 from src.workers.broker import get_stream_buffer
 from src.workers.deixis import DeixisCategory
 from src.workers.errors import FrameExtractionError
+from src.workers.queue import get_queue
 
 log = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ def _to_details(job: Any) -> JobDetails:
         transcript_translations=translations,
         alt_media_candidates=alt_candidates,
         queued_reason=getattr(job, "queued_reason", None),
+        whisper_queue_position=get_queue().position(job.id),
     )
 
 

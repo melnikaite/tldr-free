@@ -48,6 +48,11 @@ async def health() -> HealthResponse:
 
     queue_size, queue_running = get_queue().snapshot()
 
+    # Pure config-presence check — no network probe, /health must stay fast.
+    whisper_configured = bool(
+        config.whisper.base_url.strip() and config.whisper.model.strip()
+    )
+
     return HealthResponse(
         status="ok" if backend_reachable else "degraded",
         queue_size=queue_size,
@@ -55,5 +60,6 @@ async def health() -> HealthResponse:
         llm_backend_reachable=backend_reachable,
         llm_backend_models=backend_models,
         llm_backend_error=backend_error,
+        whisper_configured=whisper_configured,
         version=DAEMON_VERSION,
     )

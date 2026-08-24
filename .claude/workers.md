@@ -1,5 +1,45 @@
 # Workers, concurrency, restart-safety
 
+## The Whisper queue is a worker pool, not a single consumer
+
+`runner.whisper_worker` used to be started once. It now runs as a small
+pool — `whisper.max_concurrent_jobs` (default 2) instances of the exact
+same coroutine, all pulling from the same `WhisperQueue` concurrently
+(spawned in `main.lifespan`, cancelled + gathered together on shutdown).
+This exists purely for fairness: a 7-hour stream split into a dozen
+30-minute chunks used to monopolize the one worker, so an 18-minute video
+queued behind it waited hours (head-of-line blocking). With a pool of 2, a
+second worker can pick the short job up immediately instead of queueing
+behind the whole long sequence.
+
+A pool alone isn't enough — a job could still occupy every Whisper HTTP
+slot with its own back-to-back chunk requests and re-monopolize the
+backend. So `workers/transcribe.py` separately gates every `_post_audio`
+call through two `asyncio.Semaphore`s: a **global** one sized by
+`whisper.max_concurrent_requests` (default 2), and a **per-job** one fixed
+at 1, created fresh per call to `transcribe_audio()` and threaded through
+the chunk loop and the coverage-recheck loop. **Measured against the real
+backend** (LocalAI, whisper-large, single GPU): 1 concurrent request took
+8.0s wall, 2 concurrent took 16.5s, 3 concurrent took 22.9s — it serialises
+requests FIFO internally, so raising either knob buys zero extra
+throughput. Both exist purely so a second job's chunk can slip into that
+FIFO instead of waiting for the first job's entire sequence — see the
+config comments on `WhisperConfig.max_concurrent_jobs` /
+`max_concurrent_requests` and `transcribe._global_whisper_lock`'s
+docstring. Never raise either expecting faster transcription.
+
+`WhisperQueue.position(job_id)` surfaces a job's real 1-based wait position
+in the FIFO (`None` the instant a pool worker dequeues it) — mirrored to
+the API as `JobDetails.whisper_queue_position`, distinct from
+`queued_reason` (which explains WHY a job deferred to Whisper, not where
+it sits in line).
+
+Soft-pause (below) extends cleanly to N workers: each pool instance
+independently checks `wait_if_paused()` before its own `queue.get()`, so
+pause still means "no NEW dequeue on any worker" while "up to N
+already-running tasks finish normally" — the same contract as before, just
+with N in flight instead of 1.
+
 ## POST /jobs is async, always
 
 Returns 202 with `{id, kind, status}` immediately and spawns a background

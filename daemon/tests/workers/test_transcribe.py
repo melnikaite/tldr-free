@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -68,7 +69,7 @@ async def test_chunked_merges_with_offsets(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result = await transcribe._transcribe_chunked(
-        audio, total_duration=1200.0, max_bytes=1024
+        audio, total_duration=1200.0, max_bytes=1024, per_job_lock=asyncio.Semaphore(1)
     )
     # Second chunk's timestamps are shifted by its 600 s offset.
     assert result.segments == [
@@ -97,7 +98,7 @@ async def test_chunked_falls_back_when_no_duration(
     )
 
     result = await transcribe._transcribe_chunked(
-        audio, total_duration=None, max_bytes=1024
+        audio, total_duration=None, max_bytes=1024, per_job_lock=asyncio.Semaphore(1)
     )
     assert result.segments == [{"start": 0.0, "end": 1.0, "text": "whole"}]
 
@@ -292,7 +293,7 @@ async def test_chunk_degenerate_retry_is_not_confirmed_silent(
 
     with caplog.at_level("INFO", logger="src.workers.transcribe"):
         result = await transcribe._transcribe_chunked(
-            audio, total_duration=40.0, max_bytes=1024
+            audio, total_duration=40.0, max_bytes=1024, per_job_lock=asyncio.Semaphore(1)
         )
 
     # One recheck settles this exact window — never asked twice within the
@@ -357,7 +358,7 @@ async def test_chunk_retry_recovers_full_coverage(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result = await transcribe._transcribe_chunked(
-        audio, total_duration=40.0, max_bytes=1024
+        audio, total_duration=40.0, max_bytes=1024, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert len(retry_cut_calls) == 1  # recovered on the first attempt
@@ -570,7 +571,7 @@ async def test_ensure_coverage_clips_retry_output_no_duplicate_seam(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert len(cut_calls) == 1
@@ -630,7 +631,7 @@ async def test_ensure_coverage_result_is_monotonic_by_start(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result_segments, _missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     starts = [s["start"] for s in result_segments]
@@ -678,7 +679,7 @@ async def test_ensure_coverage_tail_gap_clips_retry_overrun_past_duration(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert len(cut_calls) == 1
@@ -763,7 +764,7 @@ async def test_prefix_distrust_window_prevents_duplicate_dialogue(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert len(cut_calls) == 1
@@ -918,7 +919,7 @@ async def test_ensure_coverage_bracket_annotation_window_not_missing(
 
     segments = [{"start": 0.0, "end": 10.0, "text": "intro speech"}]
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=40.0
+        segments, source_path=audio, window_duration=40.0, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert missing == 0.0
@@ -957,7 +958,7 @@ async def test_ensure_coverage_dialogue_window_spliced_in(
 
     segments = [{"start": 0.0, "end": 10.0, "text": "intro speech"}]
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=40.0
+        segments, source_path=audio, window_duration=40.0, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert missing == 0.0
@@ -1000,7 +1001,7 @@ async def test_ensure_coverage_degenerate_repeat_is_not_confirmed_silent(
     segments = [{"start": 0.0, "end": 10.0, "text": "intro speech"}]
     with caplog.at_level("INFO", logger="src.workers.transcribe"):
         result_segments, missing = await transcribe._ensure_coverage(
-            segments, source_path=audio, window_duration=40.0
+            segments, source_path=audio, window_duration=40.0, per_job_lock=asyncio.Semaphore(1)
         )
 
     # The core regression check.
@@ -1057,7 +1058,7 @@ async def test_ensure_coverage_degenerate_repeat_keeps_partial_recovery(
 
     segments = [{"start": 0.0, "end": 10.0, "text": "intro speech"}]
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=40.0
+        segments, source_path=audio, window_duration=40.0, per_job_lock=asyncio.Semaphore(1)
     )
 
     texts = [s["text"] for s in result_segments]
@@ -1118,7 +1119,7 @@ async def test_ensure_coverage_recheck_budget_is_bounded(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     _result_segments, _missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert len(cut_calls) == 2
@@ -1168,7 +1169,7 @@ async def test_ensure_coverage_splits_long_window_into_slices(
 
     segments = [{"start": 0.0, "end": 10.0, "text": "intro speech"}]
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=600.0
+        segments, source_path=audio, window_duration=600.0, per_job_lock=asyncio.Semaphore(1)
     )
 
     # 590s of suspicious audio (10-600) split into ceil(590/90) = 7 slices.
@@ -1264,7 +1265,7 @@ async def test_prefix_distrust_window_does_not_lose_content(
     monkeypatch.setattr(transcribe, "_post_audio", fake_post)
 
     result_segments, missing = await transcribe._ensure_coverage(
-        segments, source_path=audio, window_duration=window_duration
+        segments, source_path=audio, window_duration=window_duration, per_job_lock=asyncio.Semaphore(1)
     )
 
     assert missing == 0.0

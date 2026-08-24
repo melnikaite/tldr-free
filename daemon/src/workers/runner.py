@@ -1,7 +1,11 @@
 """Background coroutine that consumes the deferred-Whisper queue.
 
-Started from ``main.lifespan`` as ``asyncio.create_task(whisper_worker(queue, repo))``.
-Single worker, sequential processing. Each item:
+Started from ``main.lifespan`` as a small pool of instances (sized by
+``whisper.max_concurrent_jobs``, see ``main.py``), each running this exact
+coroutine concurrently — this module's own logic needs no change for that;
+it just runs N times instead of once. Whisper HTTP calls themselves are
+separately gated (global + per-job semaphores in ``transcribe.py``) so pool
+size and network concurrency are independent knobs. Each item:
     1. yt-dlp audio download → broker stage("downloading")
     2. mlx /v1/audio/transcriptions (verbose_json, one HTTP call)
        → broker stage("transcribing") once; the call returns when the

@@ -2,13 +2,23 @@
 
 Behavior:
 - Single ``asyncio.Queue`` holding ``WhisperTask`` items.
-- The runner coroutine in ``runner.py`` consumes the queue serially.
+- A small pool of worker coroutines in ``runner.py`` (sized by
+  ``whisper.max_concurrent_jobs``) consumes the queue concurrently — no
+  longer a single serial consumer. This is what lets a short job's chunks
+  interleave with a long job's instead of queueing behind all of it. Actual
+  Whisper HTTP calls are separately gated (global + per-job semaphores in
+  ``transcribe.py``) so the worker-pool size and the network concurrency are
+  two independent knobs — see ``.claude/workers.md``.
 - A module-level singleton (``get_queue()``) lets ``api/jobs.py`` and
   ``api/health.py`` see the same queue without dependency injection.
 - On daemon startup ``re_enqueue_pending`` scans
   ``repo.find_pending_for_restart()`` and pushes back any rows left in
   ``queued`` / ``running`` from a previous run.
 - ``snapshot()`` returns ``(queue_size, running_count)`` for ``/health``.
+- ``position(job_id)`` returns a job's 1-based position in the FIFO while
+  it's still waiting to be picked up by a pool worker, ``None`` once
+  dequeued (or if it was never in the queue) — surfaced via
+  ``JobDetails.whisper_queue_position``.
 
 The queue itself is not durable — durability comes from the SQLite Job
 rows. We rebuild the in-memory queue on startup from those rows.
@@ -56,13 +66,30 @@ class WhisperQueue:
 
     def __init__(self) -> None:
         self._q: asyncio.Queue[WhisperTask] = asyncio.Queue()
-        self._running: int = 0  # 0 or 1 for v1 (single-worker)
+        self._running: int = 0  # real counter now — up to whisper.max_concurrent_jobs
+        # FIFO of job_ids still sitting in the queue, mirroring self._q's own
+        # order. Maintained alongside put()/get() rather than derived from
+        # self._q (asyncio.Queue exposes no way to peek its contents) so
+        # position() can answer "where in line is this job" without draining
+        # anything.
+        self._pending_ids: list[str] = []
 
     async def put(self, task: WhisperTask) -> None:
         await self._q.put(task)
+        self._pending_ids.append(task.job_id)
 
     async def get(self) -> WhisperTask:
-        return await self._q.get()
+        task = await self._q.get()
+        # Remove by VALUE, not by index 0: with multiple worker coroutines
+        # all awaiting get() concurrently, the coroutine that wakes up isn't
+        # guaranteed to be the one "at the front" of our own list by the time
+        # it runs. asyncio.Queue.get() guarantees whoever wakes up got
+        # exactly the item that was put() for them, in FIFO order, so
+        # removing that exact job_id is always correct and race-free — no
+        # other job with the same id can be enqueued concurrently (job ids
+        # are unique).
+        self._pending_ids.remove(task.job_id)
+        return task
 
     def task_done(self) -> None:
         self._q.task_done()
@@ -72,7 +99,21 @@ class WhisperQueue:
         return (self._q.qsize(), self._running)
 
     def mark_running(self, on: bool) -> None:
-        self._running = 1 if on else 0
+        """Increment/decrement the running counter. No longer a 0/1 flag —
+        with a worker pool (``whisper.max_concurrent_jobs``), multiple tasks
+        can be running at once. Clamped at 0 as a defensive floor."""
+        self._running = max(0, self._running + (1 if on else -1))
+
+    def position(self, job_id: str) -> int | None:
+        """1-based position of ``job_id`` in the FIFO while it's still
+        waiting, or ``None`` once a worker has dequeued it (or if it was
+        never queued). "Waiting" means "still sitting behind the worker-pool
+        limit" — the instant ``get()`` removes it, this returns ``None``,
+        even if the worker hasn't reached Whisper yet."""
+        try:
+            return self._pending_ids.index(job_id) + 1
+        except ValueError:
+            return None
 
 
 # ---------------------------------------------------------------------------

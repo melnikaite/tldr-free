@@ -38,6 +38,24 @@ whole audio so downstream ``build_marked_text`` and summary still work
 callers persist it as ``None`` and the UI falls back to the "Original"
 label.
 
+Fairness gating: worker-pool size vs. request concurrency
+-----------------------------------------------------------
+
+``runner.py``'s whisper worker now runs as a small pool
+(``whisper.max_concurrent_jobs``), so multiple jobs' calls into this module
+can be in flight at once. Two separate ``asyncio.Semaphore``s bound that:
+``_global_whisper_lock()`` (sized by ``whisper.max_concurrent_requests``)
+caps simultaneous Whisper HTTP requests across every job, and a fresh
+``asyncio.Semaphore(1)`` created once per call to ``transcribe_audio()``
+caps a single job's OWN concurrent requests at 1 — its chunk loop and
+coverage-recheck loop are strictly sequential, so this is never actually
+contended, but it's held explicitly rather than relied on as an accident of
+that sequencing. Every ``_post_audio`` call site goes through
+``_call_whisper``, which acquires both, per-job lock first. The global cap
+is a FAIRNESS knob, not a throughput one — see ``_global_whisper_lock``'s
+own docstring and ``WhisperConfig.max_concurrent_requests`` for the
+measured backend behaviour that makes this true.
+
 Coverage check: a "done" job whose transcript silently stops short
 -------------------------------------------------------------------
 
@@ -191,6 +209,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +219,46 @@ from src.config import get_config
 from src.workers.timecodes import collapse_repeated_segments
 
 log = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _global_whisper_lock() -> asyncio.Semaphore:
+    """Global cap on simultaneous Whisper HTTP calls across every job.
+
+    See ``WhisperConfig.max_concurrent_requests`` — this is a fairness knob,
+    not a throughput knob. Measured against a real backend (LocalAI,
+    whisper-large, single GPU): 1 concurrent request took 8.0s wall, 2
+    concurrent took 16.5s, 3 concurrent took 22.9s — the backend serialises
+    requests FIFO internally, so concurrency here buys zero extra
+    throughput. The only reason to allow more than 1 slot is fairness:
+    letting a second job's chunk slip into the backend's FIFO instead of
+    waiting for the first job's entire multi-chunk sequence to finish. See
+    the config comment and ``.claude/workers.md`` for the full writeup.
+
+    ``@lru_cache`` (mirroring ``llm.client._llm_lock``'s exact pattern) so
+    the semaphore is created lazily and binds to the running event loop,
+    rather than at import time.
+    """
+    n = max(1, get_config().whisper.max_concurrent_requests)
+    return asyncio.Semaphore(n)
+
+
+async def _call_whisper(per_job_lock: asyncio.Semaphore, audio_path: Path) -> dict[str, Any]:
+    """Gate one ``_post_audio`` call through both semaphores: the per-job
+    lock first (never contended in practice — see below), then the global
+    fairness lock (this is the one that may actually wait on other jobs).
+
+    The per-job lock is acquired first and is effectively free: a single
+    job's own chunk loop (``_transcribe_chunked``) and its coverage-recheck
+    loop (``_ensure_coverage``) are strictly sequential awaits with no
+    ``gather``/``create_task`` between them, so at most one coroutine per
+    job ever calls this at a time. It still has to be explicit and held,
+    not just relied on as an accident of the current sequential code —
+    that's what guards against a future change (e.g. someone parallelizing
+    chunk processing for speed) silently breaking the fairness guarantee.
+    """
+    async with per_job_lock, _global_whisper_lock():
+        return await _post_audio(audio_path)
 
 
 @dataclass
@@ -374,16 +433,30 @@ async def transcribe_audio(
     retried if short — see the module docstring's "Coverage check"
     section and ``_ensure_coverage``. ``missing_seconds`` on the result
     surfaces whatever shortfall survived retries, summed across chunks.
+
+    Every Whisper HTTP call made on behalf of THIS job — the initial
+    request(s) and any coverage recheck — goes through one
+    ``asyncio.Semaphore(1)`` created here, fresh per call to this function
+    (i.e. per job's whole transcription unit of work), guaranteeing at most
+    one in-flight Whisper request per job regardless of how many jobs are
+    running concurrently in the worker pool. See ``_call_whisper`` and
+    ``_global_whisper_lock`` for the rest of the gating.
     """
+    per_job_lock = asyncio.Semaphore(1)
     cfg = get_config().whisper
     max_bytes = max(1, cfg.max_upload_mb) * 1024 * 1024
     size = audio_path.stat().st_size
 
     if size <= max_bytes:
-        result = await _transcribe_whole(audio_path, total_duration=total_duration)
+        result = await _transcribe_whole(
+            audio_path, total_duration=total_duration, per_job_lock=per_job_lock
+        )
     else:
         result = await _transcribe_chunked(
-            audio_path, total_duration=total_duration, max_bytes=max_bytes
+            audio_path,
+            total_duration=total_duration,
+            max_bytes=max_bytes,
+            per_job_lock=per_job_lock,
         )
 
     final_segments, _discarded = collapse_repeated_segments(result.segments)
@@ -396,12 +469,12 @@ async def transcribe_audio(
 
 
 async def _transcribe_whole(
-    audio_path: Path, *, total_duration: float | None
+    audio_path: Path, *, total_duration: float | None, per_job_lock: asyncio.Semaphore
 ) -> TranscribeResult:
     """Transcribe ``audio_path`` in one request, checking + retrying coverage
     when ``total_duration`` is known. Shared by the single-request path and
     both of ``_transcribe_chunked``'s "can't actually chunk" fallbacks."""
-    payload = await _post_audio(audio_path)
+    payload = await _call_whisper(per_job_lock, audio_path)
     result = _parse_payload(payload, total_duration=total_duration)
     if total_duration is None or total_duration <= 0:
         # Nothing to compare against — can't tell a short transcript from a
@@ -409,7 +482,10 @@ async def _transcribe_whole(
         # feature existed.
         return result
     segments, missing = await _ensure_coverage(
-        result.segments, source_path=audio_path, window_duration=total_duration,
+        result.segments,
+        source_path=audio_path,
+        window_duration=total_duration,
+        per_job_lock=per_job_lock,
     )
     return TranscribeResult(
         segments=segments,
@@ -424,6 +500,7 @@ async def _transcribe_chunked(
     *,
     total_duration: float | None,
     max_bytes: int,
+    per_job_lock: asyncio.Semaphore,
 ) -> TranscribeResult:
     """Split oversized audio with ffmpeg, transcribe parts, merge segments."""
     duration = total_duration if total_duration and total_duration > 0 else None
@@ -434,7 +511,9 @@ async def _transcribe_chunked(
         # the backend's own error surface if it really is too big. No known
         # duration also means no coverage check is possible here either.
         log.warning("transcribe: unknown duration, cannot chunk; trying single upload")
-        return await _transcribe_whole(audio_path, total_duration=total_duration)
+        return await _transcribe_whole(
+            audio_path, total_duration=total_duration, per_job_lock=per_job_lock
+        )
 
     size = audio_path.stat().st_size
     # Target 90% of the cap for VBR headroom; at least 2 chunks since we're here.
@@ -453,14 +532,20 @@ async def _transcribe_chunked(
     )
     if not chunks:
         log.warning("transcribe: ffmpeg split produced nothing; trying single upload")
-        return await _transcribe_whole(audio_path, total_duration=duration)
+        return await _transcribe_whole(
+            audio_path, total_duration=duration, per_job_lock=per_job_lock
+        )
 
     all_segments: list[dict[str, Any]] = []
     language: str | None = None
     missing_total = 0.0
     try:
         for idx, (chunk_path, offset) in enumerate(chunks):
-            payload = await _post_audio(chunk_path)
+            # Sequential await, one chunk at a time — no gather/create_task
+            # here — is what makes the per-job semaphore never contended in
+            # practice (see _call_whisper's docstring); it's still acquired
+            # explicitly on every call rather than relied on implicitly.
+            payload = await _call_whisper(per_job_lock, chunk_path)
             part = _parse_payload(payload, total_duration=chunk_seconds)
             # The last chunk may be shorter than chunk_seconds if the file
             # doesn't divide evenly (ffmpeg's -t just stops at EOF) — use
@@ -471,6 +556,7 @@ async def _transcribe_chunked(
                 part.segments,
                 source_path=chunk_path,
                 window_duration=expected_local_duration,
+                per_job_lock=per_job_lock,
             )
             if missing > 0:
                 missing_total += missing
@@ -845,6 +931,7 @@ async def _ensure_coverage(
     *,
     source_path: Path,
     window_duration: float,
+    per_job_lock: asyncio.Semaphore,
 ) -> tuple[list[dict[str, Any]], float]:
     """Check ``segments`` (a LOCAL timeline starting at 0) against
     ``window_duration`` seconds of ``source_path``: re-transcribe every
@@ -991,7 +1078,11 @@ async def _ensure_coverage(
             continue
 
         try:
-            payload = await _post_audio(cut_path)
+            # Sequential await inside a while-loop, one recheck slice at a
+            # time — see _call_whisper's docstring for why this keeps the
+            # per-job semaphore uncontended in practice while still holding
+            # it explicitly on every call.
+            payload = await _call_whisper(per_job_lock, cut_path)
         finally:
             cut_path.unlink(missing_ok=True)
             with contextlib.suppress(OSError):

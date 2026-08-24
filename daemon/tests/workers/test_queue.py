@@ -72,6 +72,64 @@ async def test_snapshot_reflects_size_and_running_state() -> None:
     assert q.snapshot()[1] == 0
 
 
+def test_mark_running_is_a_real_counter_not_a_bool() -> None:
+    # Regression test for the 0/1-bool -> counter change: with a
+    # worker pool (whisper.max_concurrent_jobs), multiple tasks can be
+    # running at once, so mark_running(True) twice then mark_running(False)
+    # once must leave the running count at 1, not 0.
+    q = WhisperQueue()
+    q.mark_running(True)
+    q.mark_running(True)
+    q.mark_running(False)
+    assert q.snapshot()[1] == 1
+
+
+def test_mark_running_never_goes_negative() -> None:
+    q = WhisperQueue()
+    q.mark_running(False)
+    assert q.snapshot()[1] == 0
+
+
+# ---------------------------------------------------------------------------
+# position() — FIFO wait position surfaced to the API
+# ---------------------------------------------------------------------------
+
+
+def test_position_on_empty_queue_is_none() -> None:
+    q = WhisperQueue()
+    assert q.position("nonexistent") is None
+
+
+@pytest.mark.asyncio
+async def test_position_reflects_fifo_order() -> None:
+    q = WhisperQueue()
+    await q.put(WhisperTask(job_id="a", url="https://youtu.be/a"))
+    await q.put(WhisperTask(job_id="b", url="https://youtu.be/b"))
+    await q.put(WhisperTask(job_id="c", url="https://youtu.be/c"))
+    assert q.position("a") == 1
+    assert q.position("b") == 2
+    assert q.position("c") == 3
+    assert q.position("nope") is None
+
+
+@pytest.mark.asyncio
+async def test_position_none_once_dequeued_and_others_shift_up() -> None:
+    q = WhisperQueue()
+    await q.put(WhisperTask(job_id="a", url="https://youtu.be/a"))
+    await q.put(WhisperTask(job_id="b", url="https://youtu.be/b"))
+    await q.put(WhisperTask(job_id="c", url="https://youtu.be/c"))
+
+    got = await q.get()
+    assert got.job_id == "a"
+
+    # "waiting" means "still sitting behind the worker-pool limit" — the
+    # instant get() removes it, position() must report None, even before
+    # task_done()/mark_running are ever called.
+    assert q.position("a") is None
+    assert q.position("b") == 1
+    assert q.position("c") == 2
+
+
 # ---------------------------------------------------------------------------
 # re-enqueue from repo.find_pending_for_restart
 # ---------------------------------------------------------------------------

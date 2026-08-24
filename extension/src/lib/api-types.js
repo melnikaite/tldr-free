@@ -125,7 +125,8 @@
  *   transcript_language: string | null,
  *   transcript_translations: TranscriptTranslationSummary[],
  *   alt_media_candidates: MediaCandidate[],
- *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null
+ *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
+ *   whisper_queue_position?: number | null
  * }} JobDetails
  *
  * ``queued_reason`` mirrors daemon ``Job.queued_reason``. Only meaningful
@@ -133,6 +134,13 @@
  * deferred this job to the Whisper queue. Lets a cold ``GET /jobs/{id}``
  * show the same explanation a live "stage" SSE event would have (see
  * ``error-hints.js``'s ``describeQueuedDetail``).
+ *
+ * ``whisper_queue_position`` is sourced live from the daemon's Whisper
+ * queue FIFO (``workers.queue.get_queue().position(job.id)``) — distinct
+ * from ``queued_reason``, which explains WHY a job deferred to Whisper,
+ * not where it currently sits in line. ``null``/absent when the job isn't
+ * currently waiting there (not a Whisper job, already picked up by a pool
+ * worker, or done/failed).
  */
 
 /**
@@ -364,6 +372,7 @@
  * @property {boolean} llm_backend_reachable
  * @property {string[]} llm_backend_models
  * @property {string | null} [llm_backend_error]
+ * @property {boolean} whisper_configured - true iff whisper.base_url and whisper.model are both set (no network probe)
  * @property {string} version
  */
 

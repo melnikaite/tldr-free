@@ -62,10 +62,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         log.exception("workers: translation re-enqueue on startup failed")
 
-    worker_task: asyncio.Task[None] = asyncio.create_task(
-        whisper_worker(queue, repo),
-        name="whisper-worker",
-    )
+    # A small pool, not a single coroutine — whisper.max_concurrent_jobs
+    # worker instances all pull from the same queue concurrently. This is
+    # what lets a short job's chunks interleave with a long job's instead of
+    # queueing behind all of it (head-of-line blocking). Each instance is
+    # otherwise identical to the old single worker; the Whisper HTTP calls
+    # they make are separately throttled (global + per-job semaphores in
+    # transcribe.py) so raising the pool size doesn't imply more concurrent
+    # backend load — see WhisperConfig.max_concurrent_requests.
+    n_whisper_workers = max(1, get_config().whisper.max_concurrent_jobs)
+    worker_tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(whisper_worker(queue, repo), name=f"whisper-worker-{i}")
+        for i in range(n_whisper_workers)
+    ]
 
     # Periodic retention sweep (deletes jobs older than config.storage.retention_days).
     retention_task: asyncio.Task[None] = asyncio.create_task(
@@ -77,9 +86,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         log.info("TLDR daemon shutting down")
-        worker_task.cancel()
+        for t in worker_tasks:
+            t.cancel()
         retention_task.cancel()
-        await asyncio.gather(worker_task, retention_task, return_exceptions=True)
+        await asyncio.gather(*worker_tasks, retention_task, return_exceptions=True)
         dispose_engine()
 
 

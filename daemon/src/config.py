@@ -177,6 +177,26 @@ class WhisperConfig(_ApiKeyConfigMixin):
     # limit; also safe for OpenAI's 25 MB cap. Raise it if your backend allows
     # bigger bodies (fewer requests = slightly faster, fewer seams).
     max_upload_mb: int = 15
+    # Worker-pool size for the deferred Whisper queue — how many WhisperTasks
+    # may be actively going through download -> transcribe -> summarize at
+    # once. This is what lets a short job's chunks interleave with a long
+    # job's instead of queueing behind all of it (head-of-line blocking).
+    # Default 2, not higher — see max_concurrent_requests below for why a
+    # bigger pool wouldn't help throughput either.
+    max_concurrent_jobs: int = 2
+    # Global cap on simultaneous Whisper HTTP requests across every job.
+    # MEASURED FACT: against a real backend (LocalAI, whisper-large, single
+    # GPU), 1 concurrent request took 8.0s wall, 2 concurrent took 16.5s, 3
+    # concurrent took 22.9s — the backend serialises requests FIFO
+    # internally, so concurrency here buys ZERO extra throughput. This is a
+    # FAIRNESS knob, not a speed knob: keep it small (2-3), never raise it
+    # expecting faster transcription. A value of 1 gives literally NO
+    # fairness benefit either — with only one request ever in flight,
+    # whoever holds it keeps it until their own chunk finishes, so a second
+    # job's chunk still can't slip in ahead of the first job's whole
+    # multi-chunk sequence. 2 is the minimum that actually lets a second
+    # job's request interleave with the first's.
+    max_concurrent_requests: int = 2
 
 
 # ISO 639-1 → English language name. Small enough to inline; covers the

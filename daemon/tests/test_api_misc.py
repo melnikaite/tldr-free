@@ -166,6 +166,10 @@ def test_health_ok_when_backend_reachable(
     assert "version" in body
     assert body["queue_size"] == 0
     assert body["queue_running"] == 0
+    # Pure config-presence check (no network probe) — the test config's
+    # whisper.base_url/model are both set, so this is True regardless of
+    # the LLM backend probe outcome above.
+    assert body["whisper_configured"] is True
 
 
 def test_health_degraded_on_non_200(
