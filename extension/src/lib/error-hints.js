@@ -3,13 +3,14 @@
 //
 //   - classifyError(rawMessage, health) — job.error / a stringified
 //     fetch-thrown error, for the sidepanel's "error" render state.
-//   - describeQueuedDetail(detail) — a "queued"-stage `detail` string, for
-//     the sidepanel's "streaming" render state (the job is PARKED, not
-//     dead — see that function's docstring for why this can never be
-//     folded into classifyError). Fed either from a live "stage" event or
-//     from `JobDetails.queued_reason` on a cold `GET /jobs/{id}` load —
-//     both carry the same DeferredReason string, so one function handles
-//     both.
+//   - describeQueuedDetail({detail, whisperConfigured, whisperQueuePosition})
+//     — a "queued"-stage `detail` string plus enough live context to say
+//     something TRUE about it, for the sidepanel's "streaming" render state
+//     (the job is PARKED, not dead — see that function's docstring for why
+//     this can never be folded into classifyError). Fed either from a live
+//     "stage" event or from `JobDetails.queued_reason` on a cold
+//     `GET /jobs/{id}` load — both carry the same DeferredReason string, so
+//     one function handles both.
 //
 // See extension.md's error-hint section (if you add an invariant here,
 // mirror it there).
@@ -125,6 +126,33 @@ const OPEN_OPTIONS_CHECK_BACKEND = {
 const OPEN_OPTIONS_CONFIGURE_WHISPER = {
   label: "Open Options and configure a Whisper backend",
   kind: "open-options",
+};
+
+// ---------------------------------------------------------------------------
+// describeQueuedDetail's three DeferredReason codes all funnel through the
+// SAME "defer to Whisper" code path in daemon/src/workers/pipeline.py — the
+// only difference between them is WHY the YouTube-captions fast path failed,
+// never what happens next (the job is enqueued to the Whisper queue either
+// way). So each code only needs a short, honest "why the fast path failed"
+// fragment; the "what happens next" text is shared and depends entirely on
+// live state (whisperConfigured / whisperQueuePosition), not on which of
+// the three codes fired.
+// ---------------------------------------------------------------------------
+const DEFERRED_REASON_WHY = {
+  transcript_unavailable: "YouTube doesn't expose captions for this video.",
+  transcript_blocked:
+    "YouTube rate-limited or blocked the caption request after retrying.",
+  network_error:
+    "A network error interrupted the connection to YouTube while fetching captions.",
+};
+
+// Only used for the "Whisper genuinely isn't configured" branch, which is
+// the one case honestly labelled "Parked" (see describeQueuedDetail) —
+// titles kept close to the original per-reason wording.
+const DEFERRED_REASON_PARKED_TITLE = {
+  transcript_unavailable: "Parked: no transcript available",
+  transcript_blocked: "Parked: YouTube blocked the transcript request",
+  network_error: "Parked: a network error interrupted the transcript fetch",
 };
 
 /**
@@ -261,41 +289,92 @@ export function classifyError(rawMessage, health) {
 // never paint this into the red "Error." status block.
 //
 /**
- * @param {string | null | undefined} detail a "queued"-stage event's
- *   `detail` field (only meaningful when `stage === "queued"`)
+ * @typedef {object} QueuedDetailContext
+ * @property {string | null | undefined} detail a "queued"-stage event's
+ *   `detail` field / `JobDetails.queued_reason` (only meaningful when
+ *   `stage === "queued"`)
+ * @property {boolean | null | undefined} whisperConfigured
+ *   `HealthResponse.whisper_configured` — true/false when a `GET /health`
+ *   answered, `null`/`undefined` when it couldn't be reached (probe failed
+ *   or wasn't attempted). Never guess a value here — see the "unknown"
+ *   branch below.
+ * @property {number | null | undefined} whisperQueuePosition
+ *   `JobDetails.whisper_queue_position` — a 1-based FIFO position while the
+ *   job is still waiting for a pool worker to pick it up, `null` once it's
+ *   been picked up (or if it was never queued), `undefined` when this
+ *   wasn't fetched/known at render time.
+ */
+
+/**
+ * Explain a job PARKED in `stage === "queued"` with a `detail` matching one
+ * of `api.schemas.DeferredReason`'s three codes. All three codes fire from
+ * the exact same "defer to Whisper" branch in
+ * `daemon/src/workers/pipeline.py` — they differ only in why the YouTube
+ * captions fast path failed, never in what happens next (the job is always
+ * sitting in, or has already left, the real Whisper queue). So the actual
+ * situation — and therefore the honest thing to say — depends on live state
+ * the daemon exposes separately, not on which of the three codes fired:
+ *
+ *   - `whisperConfigured === true` and `whisperQueuePosition` is a number:
+ *     genuinely waiting in line behind other Whisper jobs.
+ *   - `whisperConfigured === true` and `whisperQueuePosition` is `null`:
+ *     a pool worker already picked this job up; transcription is starting,
+ *     not "queued" any more in any meaningful sense.
+ *   - `whisperConfigured === false`: the only case where "parked
+ *     indefinitely, please configure Whisper" is actually true.
+ *   - `whisperConfigured` unknown (probe failed): say only what's certain
+ *     (the job was handed off to Whisper) — no "configure Whisper" action,
+ *     since that might already be done, and no "waiting in line" claim,
+ *     since the position is equally unknown.
+ *
+ * @param {QueuedDetailContext} [ctx]
  * @returns {ErrorHint | null} same shape as classifyError's return value
  *   so the sidepanel can reuse one renderer for both, but conceptually a
- *   "why is this parked" explanation, never an error
+ *   "why is this parked" explanation, never an error. `null` when `detail`
+ *   doesn't match a known `DeferredReason` — never guess a diagnosis for an
+ *   unrecognized string.
  */
-export function describeQueuedDetail(detail) {
-  switch (detail) {
-    case "transcript_unavailable":
-      return {
-        title: "Parked: no transcript available",
-        explanation:
-          "YouTube doesn't expose captions for this video. This job will " +
-          "stay parked here forever unless a Whisper backend is configured " +
-          "to transcribe the audio instead.",
-        action: OPEN_OPTIONS_CONFIGURE_WHISPER,
-      };
-    case "transcript_blocked":
-      return {
-        title: "Parked: YouTube blocked the transcript request",
-        explanation:
-          "YouTube rate-limited or blocked the caption request after " +
-          "retrying. It may work if you try again later, or updating " +
-          "yt-dlp may help if this keeps happening.",
-        action: null,
-      };
-    case "network_error":
-      return {
-        title: "Parked: a network error interrupted the transcript fetch",
-        explanation:
-          "The connection to YouTube failed while fetching captions. " +
-          "Check your network connection and try again.",
-        action: null,
-      };
-    default:
-      return null;
+export function describeQueuedDetail(ctx) {
+  const { detail, whisperConfigured, whisperQueuePosition } = ctx || {};
+  const why = DEFERRED_REASON_WHY[detail];
+  if (!why) return null;
+
+  if (whisperConfigured === false) {
+    return {
+      title: DEFERRED_REASON_PARKED_TITLE[detail],
+      explanation:
+        `${why} This job will stay parked here until a Whisper backend ` +
+        "is configured to transcribe the audio instead.",
+      action: OPEN_OPTIONS_CONFIGURE_WHISPER,
+    };
   }
+
+  if (whisperConfigured === true) {
+    if (typeof whisperQueuePosition === "number") {
+      return {
+        title: "Waiting for transcription",
+        explanation:
+          `${why} Whisper will transcribe the audio instead — this job ` +
+          `is #${whisperQueuePosition} in the transcription queue.`,
+        action: null,
+      };
+    }
+    return {
+      title: "Transcription starting",
+      explanation:
+        `${why} Whisper has picked up this job and is starting the ` +
+        "transcription now.",
+      action: null,
+    };
+  }
+
+  // whisperConfigured is null/undefined — the /health probe that would say
+  // failed or wasn't attempted. Say only what's certain: never claim
+  // "configured" or "not configured" without evidence (see this module's
+  // no-guessed-diagnosis rule).
+  return {
+    title: "Waiting for transcription",
+    explanation: `${why} This job has been handed off for Whisper transcription.`,
+    action: null,
+  };
 }

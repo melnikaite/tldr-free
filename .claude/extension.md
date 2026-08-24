@@ -257,16 +257,48 @@ different UI and mean different things:
   unreachable/unauthorized, context overflow, model not found, stream
   stall. Rendered inside the red `.status-block.error` box — this is
   always a genuinely failed/dead job.
-- **`describeQueuedDetail(detail)`** — for the `"streaming"` render
-  state's `#queued-hint` div (`app.js`'s `_renderQueuedHint()`, called
-  both from cold load and from the live "stage" event handler in
-  `_attachStreamSubscription`). Explains a job PARKED in `stage ===
-  "queued"` with a `detail` matching one of `api.schemas.DeferredReason`'s
-  three codes (`daemon/src/api/schemas.py:69`: `transcript_unavailable`,
-  `transcript_blocked`, `network_error` — the transcript fast path
-  deferred to Whisper, or the retry loop feeding it gave up). Rendered
+- **`describeQueuedDetail({detail, whisperConfigured, whisperQueuePosition})`**
+  — for the `"streaming"` render state's `#queued-hint` div (`app.js`'s
+  `_renderQueuedHint()`, called both from cold load and from the live
+  "stage" event handler in `_attachStreamSubscription`). Explains a job
+  PARKED in `stage === "queued"` with a `detail` matching one of
+  `api.schemas.DeferredReason`'s three codes (`daemon/src/api/schemas.py:69`:
+  `transcript_unavailable`, `transcript_blocked`, `network_error`). Rendered
   in a neutral `.queued-hint` box, never the error styling: the job is
   waiting, not dead.
+
+  All three `DeferredReason` codes fall through the SAME "defer to
+  Whisper" branch in `workers/pipeline.py` — they only explain why the
+  YouTube-captions fast path failed, never what happens next. So what's
+  actually true depends on live state, not on which code fired:
+  `HealthResponse.whisper_configured` (is a Whisper backend even set up?)
+  and `JobDetails.whisper_queue_position` (1-based FIFO position while
+  waiting, `null` once a pool worker picks the job up). Only when
+  `whisperConfigured === false` is "parked here until you configure
+  Whisper" true — the other branches say "waiting in line" (position
+  known), "transcription starting" (position `null`, still picked up), or
+  a deliberately noncommittal "handed off for Whisper transcription" when
+  `/health` itself couldn't be reached (never guess `whisperConfigured`
+  either way). `_renderQueuedHint` fetches both fields itself — via a
+  single `GET /health` + `GET /jobs/{id}` pair triggered once per "queued"
+  transition, guarded by a monotonic token against out-of-order resolution
+  — since neither field travels on the live "stage" SSE event
+  (`workers/broker.py`'s `stage_event` only ever carries `{stage,
+  detail}`), and the daemon never re-fires "queued" for the same job as
+  its position in the FIFO changes. This is a one-shot fetch tied to a
+  state transition, not a new polling loop.
+
+  The one gap a "queued"-triggered fetch alone can't close: a job's own
+  position can keep moving (other jobs ahead of it draining) with no new
+  "stage" event ever firing for THIS job. `refreshActiveJob()` (the
+  existing `visibilitychange` staleness refresh — see "When the side panel
+  may go stale" below) already re-fetches the active `JobDetails` whenever
+  the panel regains visibility; it now also calls `_renderQueuedHint`
+  directly when the refreshed job is still `"queued"`, bypassing
+  `renderState`'s `_stateKey` idempotency (which would otherwise no-op a
+  same-job "streaming" re-render and leave the position stale). Still no
+  new polling — it rides the same lifecycle hook that already existed for
+  a different staleness reason.
 
 Both fetch a raw signal, classify it, and render via
 `textContent`/`createElement` (never `innerHTML` — the raw message,

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Dev-only verification render, NOT a store asset (see docs/store-assets/
+     for those). Renders the REAL queued-hint markup — same classes, same
+     stylesheet, same DOM-building logic sidepanel/app.js's
+     _renderQueuedHint() uses — driven by the REAL, exported
+     describeQueuedDetail() from lib/error-hints.js, at the panel's real
+     400px width, so what's on screen here is what the extension would
+     actually paint for the given state (?state=waiting|starting|unconfigured
+     query param).
+
+     app.js itself can't be imported directly here: it's the sidepanel's
+     main module and expects the real sidepanel.html DOM (querying elements
+     at module load time), so this harness re-creates only the small,
+     already-DOM-only rendering glue (pushOrUpdatePhase/renderTimeline/the
+     queued-hint paint block) inline, exactly as it reads in app.js — the
+     actual copy/logic under test (describeQueuedDetail) is imported for
+     real, never re-typed. -->
+<link rel="stylesheet" href="../../extension/src/sidepanel/style.css">
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { width: 400px; }
+  #summary { padding: 12px 14px; }
+</style>
+</head>
+<body>
+  <div id="summary">
+    <h2 class="job-title"><a href="#" target="_blank" rel="noopener">Three-Hour Deep Dive: How Compilers Actually Work</a></h2>
+    <ul class="timeline" id="phase-timeline"></ul>
+    <div class="queued-hint" id="queued-hint" hidden></div>
+    <div class="markdown-body" id="summary-stream"></div>
+  </div>
+  <script type="module">
+    import { describeQueuedDetail } from "../../extension/src/lib/error-hints.js";
+
+    // --- Copied verbatim from sidepanel/app.js (phase timeline helpers) ---
+    function phaseLabel(stage) {
+      switch (stage) {
+        case "extracting":        return "Fetching subtitles";
+        case "fetching_captions": return "Fetching captions via yt-dlp";
+        case "queued":            return "Queued for transcription";
+        default:                  return stage;
+      }
+    }
+    function renderTimeline(container, phases) {
+      container.innerHTML = "";
+      for (const p of phases) {
+        const li = document.createElement("li");
+        li.className = `phase phase--${p.status}`;
+        const icon = document.createElement("span");
+        icon.className = "phase-icon";
+        if (p.status === "done") icon.textContent = "✓";
+        else icon.innerHTML = `<span class="thinking-dots"><span></span><span></span><span></span></span>`;
+        li.appendChild(icon);
+        const label = document.createElement("span");
+        label.className = "phase-label";
+        label.textContent = phaseLabel(p.stage);
+        li.appendChild(label);
+        if (p.detail) {
+          const det = document.createElement("span");
+          det.className = "phase-detail";
+          det.textContent = p.detail;
+          li.appendChild(det);
+        }
+        container.appendChild(li);
+      }
+    }
+
+    // --- Copied verbatim from sidepanel/app.js's _renderQueuedHint() paint tail ---
+    function paintQueuedHint(el, info) {
+      el.textContent = "";
+      if (!info) { el.hidden = true; return; }
+      el.hidden = false;
+      const titleP = document.createElement("p");
+      titleP.className = "queued-hint-title";
+      const strong = document.createElement("strong");
+      strong.textContent = info.title;
+      titleP.appendChild(strong);
+      el.appendChild(titleP);
+      const explanationP = document.createElement("p");
+      explanationP.className = "muted small";
+      explanationP.textContent = info.explanation;
+      el.appendChild(explanationP);
+      if (info.action?.kind === "open-options") {
+        const actionBtn = document.createElement("button");
+        actionBtn.type = "button";
+        actionBtn.className = "queued-hint-action";
+        actionBtn.textContent = info.action.label;
+        el.appendChild(actionBtn);
+      }
+    }
+
+    // --- Three real states, driven by the real describeQueuedDetail() ---
+    const STATES = {
+      waiting: {
+        detail: "transcript_unavailable",
+        whisperConfigured: true,
+        whisperQueuePosition: 3,
+      },
+      starting: {
+        detail: "transcript_unavailable",
+        whisperConfigured: true,
+        whisperQueuePosition: null,
+      },
+      unconfigured: {
+        detail: "transcript_unavailable",
+        whisperConfigured: false,
+        whisperQueuePosition: null,
+      },
+    };
+
+    const state = new URLSearchParams(location.search).get("state") || "waiting";
+    const ctx = STATES[state];
+
+    const timelineEl = document.getElementById("phase-timeline");
+    renderTimeline(timelineEl, [{ stage: "queued", detail: ctx.detail, status: "active" }]);
+
+    const hintEl = document.getElementById("queued-hint");
+    paintQueuedHint(hintEl, describeQueuedDetail(ctx));
+  </script>
+</body>
+</html>

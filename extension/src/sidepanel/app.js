@@ -671,6 +671,19 @@ function isCacheStale(j) {
  * calling this when the job really is still streaming costs one HTTP
  * round-trip and zero DOM mutations.
  *
+ * That `renderState` idempotency (see `_stateKey`'s `streaming:${job.id}`,
+ * unaffected by anything else about the job) means `renderFromJob` below
+ * is a no-op whenever we're already showing this job's streaming view —
+ * deliberately, so a background refresh never resets the live timeline or
+ * drops the SSE subscription. But it also means a queued job's
+ * `whisper_queue_position` would never repaint after this refresh: nothing
+ * publishes an event when OTHER jobs ahead of this one drain from the
+ * Whisper queue (see error-hints.js's `describeQueuedDetail` docstring),
+ * so the only chance to notice a moved-up position is a refresh like this
+ * one. Re-run `_renderQueuedHint` directly — it talks straight to the
+ * `#queued-hint` div, bypassing `renderState`'s idempotency gate — instead
+ * of adding a new polling loop.
+ *
  * @returns {Promise<boolean>}
  */
 async function refreshActiveJob() {
@@ -680,6 +693,9 @@ async function refreshActiveJob() {
     const fresh = await daemon.getJob(active.id, { signal: AbortSignal.timeout(8000) });
     setActiveJob(fresh);
     renderFromJob(fresh);
+    if (fresh.progress_stage === "queued") {
+      _renderQueuedHint(fresh.id, fresh.progress_stage, fresh.queued_reason);
+    }
     return true;
   } catch (err) {
     console.warn("[TLDR] refresh active job failed", err);
@@ -1323,7 +1339,7 @@ function _attachStreamSubscription(job) {
   // Cold-load detail: job.queued_reason (only ever set while
   // status === "queued") reuses the exact same describeQueuedDetail path
   // a live "stage" event drives below — see _renderQueuedHint's docstring.
-  _renderQueuedHint(initialStage, initialDetail);
+  _renderQueuedHint(job.id, initialStage, initialDetail);
 
   if (acc) {
     timelineEl.classList.add("timeline--collapsed");
@@ -1349,7 +1365,7 @@ function _attachStreamSubscription(job) {
       setStage(ev.stage, ev.detail);
       pushOrUpdatePhase(phases, ev.stage, ev.detail || undefined);
       renderTimeline(timelineEl, phases);
-      _renderQueuedHint(ev.stage, ev.detail);
+      _renderQueuedHint(job.id, ev.stage, ev.detail);
     } else if (ev.type === "delta") {
       if (firstDelta) {
         markAllDone(phases);
@@ -1510,6 +1526,11 @@ function setStage(stage, detail) {
   stageBadgeEl.textContent = detail ? `${stage} · ${detail}` : stage;
 }
 
+// Monotonic token guarding _renderQueuedHint's async tail (see below): a
+// newer call (new stage event, job switch, re-render) always wins over an
+// older one that's still awaiting its fetches when it resolves.
+let _queuedHintToken = 0;
+
 /**
  * Fills/hides the `#queued-hint` div (see the "streaming" render case)
  * with a human explanation of why a job is PARKED in the "queued" stage
@@ -1519,19 +1540,62 @@ function setStage(stage, detail) {
  * `JobDetails.queued_reason` — both funnel through this same function so
  * there's exactly one place that renders the explanation text.
  *
+ * `describeQueuedDetail` needs more than the bare `detail` string to say
+ * something true (see its docstring): whether Whisper is configured at all
+ * (`HealthResponse.whisper_configured`) and where this job sits in the
+ * Whisper FIFO (`JobDetails.whisper_queue_position`). Neither travels with
+ * the live "stage" SSE event itself (`workers/broker.py`'s `stage_event`
+ * only ever carries `{stage, detail}`), and the queue position can move
+ * while the panel is open (jobs ahead finish or get picked up) with no
+ * event announcing that — the daemon never re-fires "queued" for the same
+ * job. So this fetches both, once, whenever a "queued" detail needs
+ * rendering (cold load AND live event both funnel through here, so both
+ * render off the same live snapshot instead of the live path guessing).
+ * This is a one-shot fetch tied to a state transition, not a poll — see
+ * runbook.md/CLAUDE.md's no-new-polling guidance for why that distinction
+ * matters here.
+ *
  * Deliberately NOT the red `.status-block.error` styling — the job is
  * waiting, not dead. Built with textContent/createElement: this renders
- * from the daemon's own event stream, i.e. untrusted input.
+ * from the daemon's own event stream (and GET /health / GET /jobs/{id}
+ * responses), i.e. untrusted input.
  *
+ * @param {string} jobId
  * @param {string | null | undefined} stage
  * @param {string | null | undefined} detail
  */
-function _renderQueuedHint(stage, detail) {
+async function _renderQueuedHint(jobId, stage, detail) {
   const el = /** @type {HTMLElement | null} */ (document.getElementById("queued-hint"));
   if (!el) return;
+
+  const myToken = ++_queuedHintToken;
+
+  if (stage !== "queued" || !detail) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+
+  // Best-effort, best-current-snapshot: either fetch failing just narrows
+  // which describeQueuedDetail branch can fire (see its "unknown" branch),
+  // never blocks rendering something honest.
+  const [health, freshJob] = await Promise.all([
+    daemon.health({ signal: AbortSignal.timeout(5000) }).catch(() => null),
+    daemon.getJob(jobId, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+  ]);
+
+  // A newer call (job switched, stage moved on, panel re-rendered) already
+  // took over — don't paint a stale hint over whatever it decided.
+  if (myToken !== _queuedHintToken) return;
+  if (document.getElementById("queued-hint") !== el) return;
+
   el.textContent = "";
 
-  const info = stage === "queued" ? describeQueuedDetail(detail) : null;
+  const info = describeQueuedDetail({
+    detail,
+    whisperConfigured: health?.whisper_configured,
+    whisperQueuePosition: freshJob?.whisper_queue_position,
+  });
   if (!info) {
     el.hidden = true;
     return;
