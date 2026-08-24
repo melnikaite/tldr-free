@@ -40,7 +40,11 @@ from tenacity import (
     wait_chain,
     wait_fixed,
 )
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import (
+    Transcript,
+    TranscriptList,
+    YouTubeTranscriptApi,
+)
 from youtube_transcript_api._errors import (
     AgeRestricted,
     CouldNotRetrieveTranscript,
@@ -160,14 +164,76 @@ def _classify_transcript_exception(exc: BaseException) -> Exception:
 # ---------------------------------------------------------------------------
 
 
+def _guess_original_language(transcript_list: TranscriptList) -> str | None:
+    """Best-effort guess at the video's own spoken language.
+
+    Unlike yt-dlp's ``automatic_captions`` (which expands one ASR track into
+    ~150 on-demand machine translations), youtube-transcript-api's
+    ``TranscriptList`` never does that — it only exposes tracks that
+    genuinely exist. YouTube generates exactly one auto-caption (ASR) track
+    per video, in whatever language the audio actually is. So when there is
+    exactly one generated transcript, its language IS the video's own
+    language. With zero or more than one (e.g. multi-dub uploads) there's no
+    such signal, so callers should fall through to the rest of the priority
+    chain instead of guessing.
+    """
+    generated = [t for t in transcript_list if t.is_generated]
+    if len(generated) == 1:
+        return generated[0].language_code
+    return None
+
+
+def _select_youtube_api_transcript(
+    transcript_list: TranscriptList,
+    *,
+    preferences: list[str],
+    output_language: str | None,
+) -> Transcript:
+    """Pick a transcript deliberately instead of hard-coding a language.
+
+    Priority order:
+      1. the video's own/original language (``_guess_original_language``)
+      2. ``youtube.subtitle_lang_preferences``, in order
+      3. ``output.language``
+      4. any manually-created track
+      5. any auto-generated track
+
+    Steps 1-3 use ``TranscriptList.find_transcript``, which itself checks
+    manually-created before generated for each candidate language. Steps 4-5
+    fall through to plain iteration, which yields manual tracks before
+    generated ones (see ``TranscriptList.__iter__``). Raises
+    ``NoTranscriptFound`` — already classified as permanent — only when the
+    video has no transcripts at all.
+    """
+    original_lang = _guess_original_language(transcript_list)
+    candidates = [lang for lang in [original_lang, *preferences, output_language] if lang]
+    if candidates:
+        with contextlib.suppress(NoTranscriptFound):
+            return transcript_list.find_transcript(candidates)
+    for transcript in transcript_list:
+        return transcript
+    raise NoTranscriptFound(transcript_list.video_id, candidates or ["en"], transcript_list)
+
+
 def _fetch_transcript_sync(
     *,
     video_id: str,
     http_session: requests.Session | None,
+    preferences: list[str],
+    output_language: str | None,
 ) -> list[dict[str, Any]]:
-    """One synchronous fetch via youtube-transcript-api 1.x."""
+    """One synchronous fetch via youtube-transcript-api 1.x.
+
+    Uses ``list()`` + a deliberate language choice (``_select_youtube_api_transcript``)
+    rather than the library's ``fetch()`` shortcut, which defaults to
+    English-only and silently fails for every other language.
+    """
     api = YouTubeTranscriptApi(http_client=http_session)
-    fetched = api.fetch(video_id)
+    transcript_list = api.list(video_id)
+    transcript = _select_youtube_api_transcript(
+        transcript_list, preferences=preferences, output_language=output_language,
+    )
+    fetched = transcript.fetch()
     # ``fetched`` iterates as FetchedTranscriptSnippet(text, start, duration).
     out: list[dict[str, Any]] = []
     for snippet in fetched:
@@ -187,6 +253,8 @@ async def fetch_transcript_with_retry(
     cookies: list[Cookie],
     max_attempts: int,
     backoff_seconds: list[int],
+    preferences: list[str],
+    output_language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch the transcript with classification + tenacity retry on transient errors.
 
@@ -195,6 +263,11 @@ async def fetch_transcript_with_retry(
     ``backoff_seconds`` (extended with the last value if needed). After the
     final attempt fails, ``ExhaustedRetriesError`` is raised carrying the
     last error's ``code``.
+
+    ``preferences`` (``youtube.subtitle_lang_preferences``) and
+    ``output_language`` (``output.language``) drive the deliberate language
+    choice in ``_fetch_transcript_sync`` — this never hard-codes English, so
+    the fast path also works for non-English videos.
     """
     if max_attempts < 1:
         max_attempts = 1
@@ -209,7 +282,10 @@ async def fetch_transcript_with_retry(
     def _attempt() -> list[dict[str, Any]]:
         try:
             return _fetch_transcript_sync(
-                video_id=video_id, http_session=http_session
+                video_id=video_id,
+                http_session=http_session,
+                preferences=preferences,
+                output_language=output_language,
             )
         except _PERMANENT_EXC as exc:
             # Permanent — translate and bubble up so tenacity does NOT retry.
@@ -452,21 +528,33 @@ def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
 
 
 def _pick_subtitle_lang(
-    available: dict[str, Any], original_lang: str | None, preferences: list[str]
+    available: dict[str, Any],
+    manual: dict[str, Any],
+    original_lang: str | None,
+    preferences: list[str],
+    output_language: str | None = None,
 ) -> str | None:
     """Choose the best caption language from what's available.
 
     Priority order:
       1. original-language track (whatever language the video is in)
-      2. user-configured preferences in order
-      3. first language alphabetically (deterministic last resort)
+      2. user-configured preferences (``youtube.subtitle_lang_preferences``), in order
+      3. the configured output/summary language (``output.language``)
+      4. any manually-created track (a human made it, so it's real)
+      5. give up (``None``) — with YouTube's automatic-caption machine
+         translations often covering 100+ languages, an arbitrary pick
+         (e.g. alphabetically-first) is as likely to land on a translation
+         nobody asked for as on anything useful. Returning ``None`` here lets
+         the caller retry or defer to Whisper instead.
     """
     if not available:
         return None
-    for lang in [original_lang, *preferences]:
+    for lang in [original_lang, *preferences, output_language]:
         if lang and lang in available:
             return lang
-    return sorted(available.keys())[0] if available else None
+    if manual:
+        return sorted(manual.keys())[0]
+    return None
 
 
 def _parse_subtitle_json3(path: Path) -> list[dict[str, Any]]:
@@ -500,12 +588,24 @@ def _parse_subtitle_json3(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+# Pseudo-tracks yt-dlp surfaces alongside real subtitles that are NOT
+# captions and must never be chosen: ``live_chat`` is the chat-replay
+# stream, served as line-delimited JSON — feeding it to
+# ``_parse_subtitle_json3`` raises "Expecting value: line 1 column 1"
+# (json3 expects a single JSON object, not JSONL). yt-dlp only ever puts it
+# in ``subtitles`` (never ``automatic_captions``), but a single junk manual
+# entry outranks every real auto-caption language once ``manual`` is merged
+# on top of ``auto`` — so it must be filtered before the merge, not after.
+_NON_CAPTION_SUBTITLE_KEYS = frozenset({"live_chat"})
+
+
 def _download_subtitles_sync(
     *,
     url: str,
     cookies: list[Cookie],
     dir: Path,
     lang_preferences: list[str],
+    output_language: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Probe available caption tracks, pick a language, download json3, parse.
 
@@ -529,13 +629,19 @@ def _download_subtitles_sync(
         with YoutubeDL(probe_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
 
-        manual = info.get("subtitles") or {}
-        auto = info.get("automatic_captions") or {}
+        manual = {
+            k: v for k, v in (info.get("subtitles") or {}).items()
+            if k not in _NON_CAPTION_SUBTITLE_KEYS
+        }
+        auto = {
+            k: v for k, v in (info.get("automatic_captions") or {}).items()
+            if k not in _NON_CAPTION_SUBTITLE_KEYS
+        }
         # Prefer manually-uploaded captions over auto-generated ones when both exist.
         available: dict[str, Any] = {**auto, **manual}
         original = info.get("language") or info.get("original_language")
 
-        chosen = _pick_subtitle_lang(available, original, lang_preferences)
+        chosen = _pick_subtitle_lang(available, manual, original, lang_preferences, output_language)
         if chosen is None:
             log.info("yt-dlp subtitles: no caption track for %s", url)
             return None
@@ -592,19 +698,64 @@ async def download_subtitles(
     cookies: list[Cookie],
     dir: Path,
     lang_preferences: list[str],
+    output_language: str | None = None,
+    max_attempts: int = 1,
+    backoff_seconds: list[int] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Async wrapper around the blocking yt-dlp subtitles fetch.
+    """Retry-wrapped async caption fetch — probe, download json3, parse.
 
-    Returns parsed segments (with timestamps preserved) or None if no caption
-    track is available. Raises on transport / yt-dlp errors.
+    An empty/missing caption track, a missing downloaded file, and a parse
+    failure are all treated as retryable: YouTube intermittently
+    throttles/bot-checks logged-in sessions (the same video that fails now
+    routinely succeeds moments later, cookies unchanged), so a single miss
+    is not proof the video lacks captions.
+
+    The first attempt uses ``cookies`` as given; every subsequent attempt
+    drops them, since a cookie-less request has been observed to succeed on
+    exactly the videos a cookied one failed on. Between attempts, waits are
+    taken from ``backoff_seconds`` (extended with the last value if needed).
+
+    Returns parsed segments, or ``None`` once every attempt is exhausted.
     """
-    return await asyncio.to_thread(
-        _download_subtitles_sync,
-        url=url,
-        cookies=cookies,
-        dir=dir,
-        lang_preferences=lang_preferences,
-    )
+    attempts = max(max_attempts, 1)
+    waits = list(backoff_seconds or [])
+
+    last_segments: list[dict[str, Any]] | None = None
+    for attempt in range(1, attempts + 1):
+        attempt_cookies = cookies if attempt == 1 else []
+        try:
+            last_segments = await asyncio.to_thread(
+                _download_subtitles_sync,
+                url=url,
+                cookies=attempt_cookies,
+                dir=dir,
+                lang_preferences=lang_preferences,
+                output_language=output_language,
+            )
+        except Exception:
+            log.exception(
+                "yt-dlp subtitles attempt %d/%d failed for %s (cookies=%s)",
+                attempt, attempts, url, bool(attempt_cookies),
+            )
+            last_segments = None
+
+        if last_segments:
+            if attempt > 1:
+                log.info(
+                    "yt-dlp subtitles: succeeded on attempt %d/%d for %s",
+                    attempt, attempts, url,
+                )
+            return last_segments
+
+        log.info(
+            "yt-dlp subtitles attempt %d/%d: no usable captions for %s (cookies=%s)",
+            attempt, attempts, url, bool(attempt_cookies),
+        )
+        if attempt < attempts:
+            wait = waits[min(attempt - 1, len(waits) - 1)] if waits else 1
+            await asyncio.sleep(wait)
+
+    return None
 
 
 # ---------------------------------------------------------------------------

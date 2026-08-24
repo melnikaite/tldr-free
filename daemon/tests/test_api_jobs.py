@@ -67,14 +67,19 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from src.workers import youtube as yt_worker
     from src.workers.errors import PermanentTranscriptError
 
-    async def _fake_fetch(*, video_id, cookies, max_attempts, backoff_seconds):  # noqa: ANN001
+    async def _fake_fetch(  # noqa: ANN001
+        *, video_id, cookies, max_attempts, backoff_seconds, preferences, output_language=None,
+    ):
         raise PermanentTranscriptError("test mode: no transcript")
 
     monkeypatch.setattr(yt_worker, "fetch_transcript_with_retry", _fake_fetch)
 
     # 3b) yt-dlp subtitle fallback returns nothing in tests, so the pipeline
     # falls all the way through to the whisper queue branch.
-    async def _fake_subs(*, url, cookies, dir, lang_preferences):  # noqa: ANN001
+    async def _fake_subs(  # noqa: ANN001
+        *, url, cookies, dir, lang_preferences, output_language=None,
+        max_attempts=1, backoff_seconds=None,
+    ):
         return None
 
     monkeypatch.setattr(yt_worker, "download_subtitles", _fake_subs)

@@ -6,11 +6,15 @@ fetch_transcript_with_retry with a monkeypatched YouTubeTranscriptApi.
 
 from __future__ import annotations
 
+import itertools
 import json
+import string
 from pathlib import Path
+from typing import Any
 
 import pytest
 import requests
+from youtube_transcript_api import Transcript, TranscriptList
 from youtube_transcript_api._errors import (
     AgeRestricted,
     CouldNotRetrieveTranscript,
@@ -21,6 +25,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
+from src.api.schemas import Cookie
 from src.workers import youtube
 from src.workers.errors import (
     ExhaustedRetriesError,
@@ -150,30 +155,72 @@ def test_classify_unknown_exception_is_transient() -> None:
 
 
 def test_pick_subtitle_lang_empty_returns_none() -> None:
-    assert youtube._pick_subtitle_lang({}, "en", ["en", "fr"]) is None
+    assert youtube._pick_subtitle_lang({}, {}, "en", ["en", "fr"]) is None
 
 
 def test_pick_subtitle_lang_prefers_original() -> None:
     available = {"en": [], "fr": [], "de": []}
     # Original language wins even when it sits later in preferences.
-    assert youtube._pick_subtitle_lang(available, "de", ["en", "fr"]) == "de"
+    assert youtube._pick_subtitle_lang(available, {}, "de", ["en", "fr"]) == "de"
 
 
 def test_pick_subtitle_lang_falls_back_to_preferences_in_order() -> None:
     available = {"fr": [], "de": []}
     # Original not available → first matching preference wins.
-    assert youtube._pick_subtitle_lang(available, "en", ["es", "fr", "de"]) == "fr"
+    assert youtube._pick_subtitle_lang(available, {}, "en", ["es", "fr", "de"]) == "fr"
 
 
 def test_pick_subtitle_lang_skips_none_original() -> None:
     available = {"fr": [], "de": []}
-    assert youtube._pick_subtitle_lang(available, None, ["de"]) == "de"
+    assert youtube._pick_subtitle_lang(available, {}, None, ["de"]) == "de"
 
 
-def test_pick_subtitle_lang_alphabetical_last_resort() -> None:
-    available = {"zh": [], "ar": [], "de": []}
-    # Neither original nor any preference matches → alphabetically first key.
-    assert youtube._pick_subtitle_lang(available, "en", ["es", "fr"]) == "ar"
+def test_pick_subtitle_lang_falls_back_to_output_language() -> None:
+    available = {"fr": [], "ru": []}
+    # Neither original nor any preference matches, but output.language does.
+    assert (
+        youtube._pick_subtitle_lang(available, {}, "en", ["es", "de"], output_language="ru")
+        == "ru"
+    )
+
+
+def test_pick_subtitle_lang_falls_back_to_manual_track() -> None:
+    available = {"zh": [], "ar": [], "de": [], "fr": []}
+    manual = {"fr": []}
+    # Nothing else matches, but "fr" is a real, manually-created track.
+    assert (
+        youtube._pick_subtitle_lang(available, manual, "en", ["es"], output_language="ru")
+        == "fr"
+    )
+
+
+def test_pick_subtitle_lang_never_picks_arbitrary_machine_translation() -> None:
+    """157 machine-translated auto-caption languages, no manual track, and
+    no match on original/preferences/output_language: the old code picked
+    ``sorted(available)[0]`` here (alphabetically "aa", Afar) — silently
+    summarising a random translation is worse than giving up. The fix must
+    return None so the caller retries or defers to Whisper instead."""
+    # 157 synthetic two-letter codes, matching the real-world count from the
+    # probe (see task evidence: ESjRLuqF-do had 157 automatic_captions
+    # languages). "aa" (Afar) sorts first alphabetically — exactly what the
+    # old code picked.
+    codes: list[str] = []
+    for a, b in itertools.product(string.ascii_lowercase, repeat=2):
+        code = a + b
+        if code in ("en", "ru"):  # must not accidentally satisfy the preferences below
+            continue
+        codes.append(code)
+        if len(codes) == 157:
+            break
+    available = {code: [] for code in codes}
+    assert "aa" in available
+    assert "en" not in available and "ru" not in available
+    assert len(available) == 157
+    result = youtube._pick_subtitle_lang(
+        available, {}, original_lang=None, preferences=["en", "ru"], output_language="ru",
+    )
+    assert result is None
+    assert result != sorted(available.keys())[0]
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +297,52 @@ class _FakeSnippet:
         self.duration = duration
 
 
+def _make_transcript(
+    *, language_code: str, is_generated: bool, result: list[dict] | BaseException,
+) -> Transcript:
+    """Build a real ``Transcript`` whose ``.fetch()`` is stubbed.
+
+    Using the real class (rather than a hand-rolled fake) means
+    ``TranscriptList.find_transcript`` / ``__iter__`` — which
+    ``_select_youtube_api_transcript`` relies on — run for real in tests,
+    not just against a re-implementation of their behaviour.
+    """
+    transcript = Transcript(
+        None,  # type: ignore[arg-type]  # http_client — unused; fetch is stubbed below
+        "video",
+        "https://example.invalid/captions",
+        language_code,
+        language_code,
+        is_generated,
+        [],
+    )
+
+    def _fetch(preserve_formatting: bool = False) -> Any:  # noqa: ARG001
+        if isinstance(result, BaseException):
+            raise result
+        return _FakeFetched(result)
+
+    transcript.fetch = _fetch  # type: ignore[method-assign]
+    return transcript
+
+
+def _make_transcript_list(
+    *,
+    video_id: str = "video",
+    manual: dict[str, Transcript] | None = None,
+    generated: dict[str, Transcript] | None = None,
+) -> TranscriptList:
+    return TranscriptList(video_id, manual or {}, generated or {}, [])
+
+
 def _make_fake_api(side_effect):  # type: ignore[no-untyped-def]
-    """Return a class that mimics YouTubeTranscriptApi but uses side_effect on fetch."""
+    """Return a class that mimics YouTubeTranscriptApi but uses side_effect on list()."""
 
     class FakeAPI:
         def __init__(self, *args, **kwargs):  # noqa: ANN001
             pass
 
-        def fetch(self, video_id, languages=("en",), preserve_formatting=False):  # noqa: ANN001
+        def list(self, video_id):  # noqa: ANN001
             if callable(side_effect):
                 return side_effect(video_id)
             raise side_effect
@@ -285,6 +370,7 @@ async def test_permanent_transcript_disabled_raises_permanent(monkeypatch) -> No
             cookies=[],
             max_attempts=3,
             backoff_seconds=[0, 0, 0],
+            preferences=["en"],
         )
 
 
@@ -304,6 +390,7 @@ async def test_permanent_no_transcript_found_raises_permanent(monkeypatch) -> No
             cookies=[],
             max_attempts=3,
             backoff_seconds=[0, 0, 0],
+            preferences=["en"],
         )
 
 
@@ -318,6 +405,7 @@ async def test_permanent_video_unavailable_raises_permanent(monkeypatch) -> None
             cookies=[],
             max_attempts=3,
             backoff_seconds=[0, 0, 0],
+            preferences=["en"],
         )
 
 
@@ -332,6 +420,7 @@ async def test_permanent_age_restricted_raises_permanent(monkeypatch) -> None:  
             cookies=[],
             max_attempts=3,
             backoff_seconds=[0, 0, 0],
+            preferences=["en"],
         )
 
 
@@ -346,6 +435,7 @@ async def test_transient_ip_blocked_raises_exhausted_after_retries(monkeypatch) 
             cookies=[],
             max_attempts=2,
             backoff_seconds=[0, 0],
+            preferences=["en"],
         )
     # Code should propagate from the wrapped TransientTranscriptError.
     assert exc_info.value.code == "transcript_blocked"
@@ -362,6 +452,7 @@ async def test_transient_request_blocked_raises_exhausted(monkeypatch) -> None: 
             cookies=[],
             max_attempts=2,
             backoff_seconds=[0, 0],
+            preferences=["en"],
         )
 
 
@@ -373,7 +464,9 @@ async def test_successful_fetch_returns_segments(monkeypatch) -> None:  # noqa: 
     ]
 
     def _ok(video_id: str):  # type: ignore[no-untyped-def]
-        return _FakeFetched(snippets)
+        return _make_transcript_list(
+            generated={"en": _make_transcript(language_code="en", is_generated=True, result=snippets)},
+        )
 
     fake_api = _make_fake_api(_ok)
     monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
@@ -383,6 +476,7 @@ async def test_successful_fetch_returns_segments(monkeypatch) -> None:  # noqa: 
         cookies=[],
         max_attempts=3,
         backoff_seconds=[0, 0, 0],
+        preferences=["en"],
     )
     assert out == [
         {"text": "hello", "start": 0.0, "duration": 5.0},
@@ -399,7 +493,14 @@ async def test_retry_then_success(monkeypatch) -> None:  # noqa: ANN001
         state["calls"] += 1
         if state["calls"] == 1:
             raise _build_yt_api_exception(IpBlocked)
-        return _FakeFetched([{"text": "ok", "start": 0.0, "duration": 1.0}])
+        return _make_transcript_list(
+            generated={
+                "en": _make_transcript(
+                    language_code="en", is_generated=True,
+                    result=[{"text": "ok", "start": 0.0, "duration": 1.0}],
+                ),
+            },
+        )
 
     fake_api = _make_fake_api(_flaky)
     monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
@@ -409,6 +510,258 @@ async def test_retry_then_success(monkeypatch) -> None:  # noqa: ANN001
         cookies=[],
         max_attempts=3,
         backoff_seconds=[0, 0, 0],
+        preferences=["en"],
     )
     assert state["calls"] == 2
     assert out == [{"text": "ok", "start": 0.0, "duration": 1.0}]
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — the fast path must not hard-code English (youtube-transcript-api)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fast_path_fetches_russian_only_video(monkeypatch) -> None:  # noqa: ANN001
+    """A video with only a Russian auto-caption track (no English at all)
+    must still be fetched by the fast path — this was the actual failure
+    mode: youtube-transcript-api's ``fetch()`` defaults to ``languages=("en",)``
+    when no languages are passed, so a Russian-only video raised
+    "No transcripts were found for any of the requested language codes:
+    ('en',)" every time, even though .list() shows the video has Russian
+    captions available."""
+    ru_snippets = [{"text": "привет", "start": 0.0, "duration": 2.0}]
+
+    def _ru_only(video_id: str):  # type: ignore[no-untyped-def]
+        return _make_transcript_list(
+            generated={"ru": _make_transcript(language_code="ru", is_generated=True, result=ru_snippets)},
+        )
+
+    fake_api = _make_fake_api(_ru_only)
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+
+    out = await youtube.fetch_transcript_with_retry(
+        video_id="ru-video",
+        cookies=[],
+        max_attempts=1,
+        backoff_seconds=[0],
+        preferences=["en", "ru"],  # default youtube.subtitle_lang_preferences
+        output_language="en",  # output.language does not match either — must not matter
+    )
+    assert out == [{"text": "привет", "start": 0.0, "duration": 2.0}]
+
+
+def test_select_youtube_api_transcript_no_candidates_falls_back_to_only_track() -> None:
+    """No original-language signal (multiple/zero generated tracks), no
+    preference/output_language match — but there IS exactly one manually
+    created track, so it must be used rather than raising."""
+    transcript_list = _make_transcript_list(
+        manual={"de": _make_transcript(language_code="de", is_generated=False, result=[])},
+    )
+    picked = youtube._select_youtube_api_transcript(
+        transcript_list, preferences=["en", "ru"], output_language="fr",
+    )
+    assert picked.language_code == "de"
+
+
+def test_select_youtube_api_transcript_raises_when_truly_empty() -> None:
+    transcript_list = _make_transcript_list()
+    with pytest.raises(NoTranscriptFound):
+        youtube._select_youtube_api_transcript(
+            transcript_list, preferences=["en", "ru"], output_language=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — live_chat must never be treated as a subtitle track
+# ---------------------------------------------------------------------------
+
+
+def _write_json3_file(path: Path, events: list[dict]) -> None:
+    path.write_text(json.dumps({"events": events}), encoding="utf-8")
+
+
+class _FakeYoutubeDL:
+    """Stand-in for yt_dlp.YoutubeDL covering the probe + download passes
+    ``_download_subtitles_sync`` performs.
+
+    ``probe_info`` is returned verbatim for the probe pass (no
+    ``subtitleslangs`` in opts). For the download pass, writes a json3 file
+    for the requested language at the conventional ``<id>.<lang>.json3``
+    path and returns an info dict pointing at it, so the parse step exercises
+    a real file on disk exactly like the real yt-dlp flow does.
+    """
+
+    def __init__(self, opts: dict[str, Any]) -> None:
+        self.opts = opts
+
+    def __enter__(self) -> _FakeYoutubeDL:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def extract_info(self, url: str, download: bool):  # noqa: ANN001, ARG002
+        if "subtitleslangs" not in self.opts:
+            return dict(_FakeYoutubeDL.probe_info)
+        chosen = self.opts["subtitleslangs"][0]
+        out_dir = Path(self.opts["outtmpl"]).parent
+        video_id = "video1"
+        sub_path = out_dir / f"{video_id}.{chosen}.json3"
+        _write_json3_file(sub_path, _FakeYoutubeDL.events_by_lang[chosen])
+        return {
+            "id": video_id,
+            "requested_subtitles": {chosen: {"filepath": str(sub_path)}},
+        }
+
+    # Set per-test via monkeypatch before instantiation.
+    probe_info: dict[str, Any] = {}
+    events_by_lang: dict[str, list[dict]] = {}
+
+
+def _patch_fake_ydl(monkeypatch, probe_info: dict[str, Any], events_by_lang: dict[str, list[dict]]) -> None:  # noqa: ANN001
+    _FakeYoutubeDL.probe_info = probe_info
+    _FakeYoutubeDL.events_by_lang = events_by_lang
+    monkeypatch.setattr("yt_dlp.YoutubeDL", _FakeYoutubeDL)
+    # ffmpeg/deno opt-builders shell out to resolve host binaries; keep them
+    # inert so tests don't depend on what's installed on the host.
+    monkeypatch.setattr(youtube, "_ffmpeg_opt", lambda: {})
+    monkeypatch.setattr(youtube, "_jsruntime_opt", lambda: {})
+
+
+def test_download_subtitles_sync_skips_live_chat_and_picks_real_auto(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """live_chat is manual-only and would outrank 157 real auto languages
+    once manual is merged on top of auto — it must be filtered before that
+    merge, and parsing it (line-delimited JSON, not json3) must never be
+    attempted."""
+    probe_info = {
+        "language": "ru",
+        "subtitles": {"live_chat": [{"ext": "json", "url": "https://example.invalid/chat"}]},
+        "automatic_captions": {
+            "ru": [{"ext": "json3", "url": "https://example.invalid/ru"}],
+            "en": [{"ext": "json3", "url": "https://example.invalid/en"}],
+        },
+    }
+    events_by_lang = {
+        "ru": [{"tStartMs": 0, "dDurationMs": 1000, "segs": [{"utf8": "привет"}]}],
+    }
+    _patch_fake_ydl(monkeypatch, probe_info, events_by_lang)
+
+    out = youtube._download_subtitles_sync(
+        url="https://www.youtube.com/watch?v=video1",
+        cookies=[],
+        dir=tmp_path,
+        lang_preferences=["en", "ru"],
+    )
+    assert out == [{"start": 0.0, "duration": 1.0, "text": "привет"}]
+
+
+def test_download_subtitles_sync_no_real_tracks_returns_none(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """live_chat as the ONLY entry (no real captions at all) must yield
+    "no caption track", not an attempt to parse the chat replay."""
+    probe_info = {
+        "language": None,
+        "subtitles": {"live_chat": [{"ext": "json"}]},
+        "automatic_captions": {},
+    }
+    _patch_fake_ydl(monkeypatch, probe_info, {})
+
+    out = youtube._download_subtitles_sync(
+        url="https://www.youtube.com/watch?v=video1",
+        cookies=[],
+        dir=tmp_path,
+        lang_preferences=["en", "ru"],
+    )
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — retry with backoff (and a cookie-less attempt) before Whisper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_subtitles_retries_then_succeeds(monkeypatch) -> None:  # noqa: ANN001
+    """First attempt (with cookies) fails; second attempt (cookie-less)
+    succeeds — the overall call must return the successful result rather
+    than conceding to Whisper after the first miss."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+        calls.append({"cookies": cookies})
+        if len(calls) == 1:
+            return None  # first attempt: no usable track
+        return [{"start": 0.0, "duration": 1.0, "text": "ok"}]
+
+    monkeypatch.setattr(youtube, "_download_subtitles_sync", _fake_sync)
+
+    cookie = Cookie(name="SID", value="x", domain=".youtube.com")
+    out = await youtube.download_subtitles(
+        url="https://www.youtube.com/watch?v=video1",
+        cookies=[cookie],
+        dir=Path("/unused"),
+        lang_preferences=["en", "ru"],
+        max_attempts=3,
+        backoff_seconds=[0, 0],
+    )
+
+    assert out == [{"start": 0.0, "duration": 1.0, "text": "ok"}]
+    assert len(calls) == 2
+    # First attempt used the caller's cookies...
+    assert calls[0]["cookies"] == [cookie]
+    # ...but the retry dropped them, since cookie-less requests have been
+    # observed to succeed on exactly the videos a cookied one failed on.
+    assert calls[1]["cookies"] == []
+
+
+@pytest.mark.asyncio
+async def test_download_subtitles_retries_on_exception(monkeypatch) -> None:  # noqa: ANN001
+    """A parse failure (e.g. a JSONDecodeError from a corrupt/unexpected
+    download) must be retried too, not treated as an immediate concession
+    to Whisper."""
+    calls = {"n": 0}
+
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise json.JSONDecodeError("boom", "doc", 0)
+        return [{"start": 0.0, "duration": 1.0, "text": "recovered"}]
+
+    monkeypatch.setattr(youtube, "_download_subtitles_sync", _fake_sync)
+
+    out = await youtube.download_subtitles(
+        url="https://www.youtube.com/watch?v=video1",
+        cookies=[],
+        dir=Path("/unused"),
+        lang_preferences=["en"],
+        max_attempts=2,
+        backoff_seconds=[0],
+    )
+    assert out == [{"start": 0.0, "duration": 1.0, "text": "recovered"}]
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_download_subtitles_gives_up_after_max_attempts(monkeypatch) -> None:  # noqa: ANN001
+    calls = {"n": 0}
+
+    def _always_fails(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(youtube, "_download_subtitles_sync", _always_fails)
+
+    out = await youtube.download_subtitles(
+        url="https://www.youtube.com/watch?v=video1",
+        cookies=[],
+        dir=Path("/unused"),
+        lang_preferences=["en"],
+        max_attempts=3,
+        backoff_seconds=[0],
+    )
+    assert out is None
+    assert calls["n"] == 3

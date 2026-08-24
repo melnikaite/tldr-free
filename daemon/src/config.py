@@ -236,6 +236,15 @@ class YouTubeConfig(BaseModel):
     # original-language track is always tried first; this list adds further
     # acceptable language codes in priority order.
     subtitle_lang_preferences: list[str] = Field(default_factory=lambda: ["en", "ru"])
+    # yt-dlp's caption probe/download intermittently fails even when the
+    # video demonstrably has captions (YouTube throttling/bot-checking a
+    # logged-in session) — before conceding to Whisper, retry this many
+    # times with backoff. Naming mirrors fast_path_max_attempts /
+    # fast_path_backoff_seconds above. The first attempt uses the request's
+    # cookies; every retry drops them, since a cookie-less request has been
+    # observed to succeed on videos a cookied one failed on.
+    caption_fallback_max_attempts: int = 3
+    caption_fallback_backoff_seconds: list[int] = Field(default_factory=lambda: [2, 8])
 
 
 class StorageConfig(BaseModel):

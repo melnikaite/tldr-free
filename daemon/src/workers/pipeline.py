@@ -251,6 +251,8 @@ async def _run_youtube(
             cookies=cookies,
             max_attempts=cfg.youtube.fast_path_max_attempts,
             backoff_seconds=cfg.youtube.fast_path_backoff_seconds,
+            preferences=cfg.youtube.subtitle_lang_preferences,
+            output_language=cfg.output.language,
         )
         transcript_source = TranscriptSource.YOUTUBE_API
     except (PermanentTranscriptError, ExhaustedRetriesError) as exc:
@@ -271,6 +273,9 @@ async def _run_youtube(
                 cookies=cookies,
                 dir=_subtitles_dir(),
                 lang_preferences=cfg.youtube.subtitle_lang_preferences,
+                output_language=cfg.output.language,
+                max_attempts=cfg.youtube.caption_fallback_max_attempts,
+                backoff_seconds=cfg.youtube.caption_fallback_backoff_seconds,
             )
         except Exception:
             log.exception("yt-dlp subtitle fallback failed for %s", job_id)

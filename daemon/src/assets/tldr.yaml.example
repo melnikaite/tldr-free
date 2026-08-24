@@ -261,6 +261,14 @@ youtube:
   # auto-generated captions before falling back to Whisper. The original
   # video language is always tried first; this list adds further preferences.
   subtitle_lang_preferences: ["en", "ru"]
+  # yt-dlp's caption probe/download intermittently fails even when the video
+  # demonstrably has captions (YouTube throttling/bot-checking a logged-in
+  # session) — before conceding to Whisper, retry this many times with
+  # backoff. The first attempt uses the request's cookies; every retry drops
+  # them, since a cookie-less request has been observed to succeed on videos
+  # a cookied one failed on.
+  caption_fallback_max_attempts: 3
+  caption_fallback_backoff_seconds: [2, 8]
 
 storage:
   data_dir: /data                   # mounted volume in the container
