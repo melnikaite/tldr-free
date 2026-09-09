@@ -45,7 +45,10 @@
       <div id="chat-messages"></div>
 
       <form id="chat-form">
-        <input id="chat-input" type="text" placeholder="Ask about this material..." disabled />
+        <!-- rows="1" matches the old single-line <input>'s resting height;
+             chat.js grows it as the user types (see the auto-grow comment
+             there) and Enter/Shift+Enter are handled in a keydown listener. -->
+        <textarea id="chat-input" rows="1" placeholder="Ask about this material..." disabled></textarea>
         <button type="submit" disabled>Ask</button>
       </form>
     </section>

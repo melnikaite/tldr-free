@@ -92,7 +92,7 @@ const badgeEl = /** @type {HTMLElement} */ (document.getElementById("processing-
 const badgeCountEl = /** @type {HTMLElement} */ (document.getElementById("processing-count"));
 const stageBadgeEl = /** @type {HTMLElement} */ (document.getElementById("stage-badge"));
 const openLibraryBtn = /** @type {HTMLButtonElement} */ (document.getElementById("open-library"));
-const chatInput = /** @type {HTMLInputElement} */ (document.getElementById("chat-input"));
+const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("chat-input"));
 const chatSubmit = /** @type {HTMLButtonElement | null} */ (
   document.querySelector("#chat-form button[type='submit']")
 );

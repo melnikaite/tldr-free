@@ -648,6 +648,8 @@ body {
   background: var(--bg);
   border-top: 1px solid var(--border);
   display: flex;
+  align-items: flex-end; /* keep "Ask" pinned to the bottom as the textarea grows,
+                             instead of stretching to match its full height */
   gap: 0.5rem;
   padding: 0.5rem 0.75rem;
 }
@@ -658,6 +660,9 @@ body {
   border-radius: 4px;
   background: var(--bg);
   color: var(--fg);
+  font: inherit; /* textarea defaults to a monospace UA font otherwise */
+  resize: none; /* no manual resize grabber — height is driven by chat.js's auto-grow */
+  overflow-y: hidden; /* toggled to auto by chat.js once content exceeds the max rows */
 }
 #chat-input:disabled {
   opacity: 0.6;

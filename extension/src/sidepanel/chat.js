@@ -64,7 +64,7 @@ export async function getActiveJob() {
 }
 
 const form = /** @type {HTMLFormElement | null} */ (document.getElementById("chat-form"));
-const input = /** @type {HTMLInputElement | null} */ (document.getElementById("chat-input"));
+const input = /** @type {HTMLTextAreaElement | null} */ (document.getElementById("chat-input"));
 const messages = /** @type {HTMLElement | null} */ (document.getElementById("chat-messages"));
 
 // Summary tab button — we toggle .tab--qa-active on it while QA is in flight.
@@ -106,6 +106,42 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") _repaintIfStreaming();
 });
 
+// Auto-grow the composer as the user types: it rests at one row (matching
+// the old single-line <input>'s height) and grows up to CHAT_INPUT_MAX_ROWS,
+// beyond which it scrolls internally instead of growing further. Called from
+// the "input" event below and after every programmatic value clear so the
+// box collapses back to one row rather than staying tall.
+const CHAT_INPUT_MAX_ROWS = 6;
+function _autoGrowChatInput() {
+  if (!input) return;
+  input.style.height = "auto"; // shrink first so scrollHeight reflects only the current content
+  const cs = getComputedStyle(input);
+  const lineHeight = parseFloat(cs.lineHeight) || 18;
+  const vertical =
+    parseFloat(cs.borderTopWidth) +
+    parseFloat(cs.borderBottomWidth) +
+    parseFloat(cs.paddingTop) +
+    parseFloat(cs.paddingBottom);
+  const maxHeight = lineHeight * CHAT_INPUT_MAX_ROWS + vertical;
+  const next = Math.min(input.scrollHeight, maxHeight);
+  input.style.height = `${next}px`;
+  input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+input?.addEventListener("input", _autoGrowChatInput);
+
+// Enter submits the question; Shift+Enter inserts a newline (the textarea's
+// default behaviour, left untouched). isComposing / keyCode 229 guards
+// against submitting mid-keystroke while an IME (e.g. Japanese, Chinese,
+// Korean input) is composing a word. requestSubmit() runs the real "submit"
+// listener below (with its own near-simultaneous-submit guard) rather than
+// bypassing it.
+input?.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" || ev.shiftKey) return;
+  if (ev.isComposing || ev.keyCode === 229) return;
+  ev.preventDefault();
+  form?.requestSubmit();
+});
+
 if (form) {
   form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -136,6 +172,7 @@ async function handleAsk(question) {
   scrollMessagesToEnd();
   if (input) {
     input.value = "";
+    _autoGrowChatInput();
     input.focus();
   }
 
