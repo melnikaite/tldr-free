@@ -196,6 +196,12 @@ body {
   margin: 0 0 0.75rem;
   color: var(--muted);
 }
+/* Backstop against unbreakable strings (long URLs, long tokens with no
+   word-break opportunity) blowing out the panel width — a single run of
+   non-whitespace chars can be wider than the panel and won't wrap on its
+   own. `anywhere` lets the browser break mid-word only when nothing else
+   fits, so normal text still wraps at spaces/hyphens first. */
+.markdown-body { overflow-wrap: anywhere; }
 
 /* "Look" affordance — sits right after a [MM:SS] timecode link whose
    moment the speaker pointed at the video's picture (see app.js's
@@ -560,13 +566,41 @@ body {
 .chat-bubble-inner {
   padding: 0.4rem 0.7rem;
   border-radius: 12px;
-  white-space: pre-wrap;
+  /* Default to "normal" wrapping — correct for assistant bubbles, which
+     hold rendered markdown HTML (see chat.js's appendBubble/renderMarkdown
+     call sites). `pre-wrap` here would preserve the literal newlines
+     `marked` emits between block tags (headings/paragraphs/list items) as
+     visible blank space, on top of .markdown-body's own block margins —
+     confirmed visually by rendering the same multi-paragraph answer both
+     ways: pre-wrap left ragged gaps between list items, normal did not.
+     User bubbles override back to pre-wrap right below, since they're
+     plain text (textContent, not markdown) and must keep the user's own
+     line breaks. */
+  white-space: normal;
   word-break: break-word;
+  /* .chat-bubble is display:flex, making this its flex item — flex items
+     default to min-width: auto, which means "never shrink narrower than
+     your content's min-content width". A long unbroken run of content (a
+     fenced code block, a long URL) would then force the bubble past the
+     panel width no matter what wrapping rules the content itself has.
+     Overriding to 0 lets normal shrink-to-fit + wrapping take over. */
+  min-width: 0;
+}
+/* Transient: set by chat.js between the first "delta" and "done", while the
+   bubble holds a raw markdown text node rather than rendered HTML. Without
+   pre-wrap the model's line breaks collapse and a streaming answer reads as
+   one run-on blob until it snaps into formatted markup at the end. */
+.chat-bubble-inner--streaming {
+  white-space: pre-wrap;
 }
 .chat-bubble--user .chat-bubble-inner {
   background: var(--user-bg);
   color: var(--user-fg);
   border-bottom-right-radius: 2px;
+  /* Plain text via textContent (see chat.js) — the composer is now a
+     multi-line textarea, so the user's own newlines must render as line
+     breaks, unlike the assistant bubble's rendered-HTML case above. */
+  white-space: pre-wrap;
 }
 .chat-bubble--assistant .chat-bubble-inner {
   background: var(--assistant-bg);

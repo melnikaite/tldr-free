@@ -251,8 +251,12 @@ async function _runQaTurn(jobId, question) {
         frameRefs = ev.items || [];
       } else if (ev.type === "delta") {
         if (_liveTextNode === null) {
-          // First token — replace spinner with streaming text.
+          // First token — replace spinner with streaming text. While this
+          // text node is live the bubble holds RAW markdown, not rendered
+          // HTML, so it needs pre-wrap to keep the model's line breaks; the
+          // class is dropped again once "done" swaps in real markup.
           assistantBubble.innerHTML = "";
+          assistantBubble.classList.add("chat-bubble-inner--streaming");
           _liveTextNode = document.createTextNode("");
           assistantBubble.appendChild(_liveTextNode);
         }
@@ -262,6 +266,7 @@ async function _runQaTurn(jobId, question) {
       } else if (ev.type === "done") {
         _liveTextNode = null;
         _liveAcc = "";
+        assistantBubble.classList.remove("chat-bubble-inner--streaming");
         const final = ev.content || "";
         // Render WITH timecode links — the QA prompt now ensures [MM:SS]
         // markers only appear when the answer came from the material, so any
@@ -281,6 +286,7 @@ async function _runQaTurn(jobId, question) {
       } else if (ev.type === "error") {
         _liveTextNode = null;
         _liveAcc = "";
+        assistantBubble.classList.remove("chat-bubble-inner--streaming");
         _setQaActive(false);
         renderErrorBubble(assistantBubble, ev.error || "Error.");
         return;
@@ -289,6 +295,7 @@ async function _runQaTurn(jobId, question) {
   } catch (err) {
     _liveTextNode = null;
     _liveAcc = "";
+    assistantBubble.classList.remove("chat-bubble-inner--streaming");
     _setQaActive(false);
     console.error("[TLDR] aiStream qa failed", err);
     renderErrorBubble(assistantBubble, err instanceof Error ? err.message : String(err));
@@ -366,7 +373,14 @@ function appendBubble(who, text, container) {
   const wrap = document.createElement("div");
   wrap.className = `chat-bubble chat-bubble--${who}`;
   const inner = document.createElement("div");
-  inner.className = "chat-bubble-inner";
+  // Assistant bubbles get rendered markdown (see _runQaTurn / renderHistory,
+  // both of which set .innerHTML via renderMarkdown()), so they need the
+  // same .markdown-body rules the summary uses (headings, lists, code
+  // blocks with overflow-x: auto, etc.) — otherwise those tags fall back to
+  // unstyled UA defaults and a fenced code block overflows the bubble.
+  // User bubbles stay plain text (set via textContent below) and must NOT
+  // get this class.
+  inner.className = who === "assistant" ? "chat-bubble-inner markdown-body" : "chat-bubble-inner";
   inner.textContent = text;
   wrap.appendChild(inner);
   target.appendChild(wrap);
