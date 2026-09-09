@@ -16,6 +16,11 @@ lone chunk isn't proof it fits. Same idea on the reduce side:
 threshold before the final reduce and folds hierarchically if it doesn't fit.
 
 Prompts: prompts/summary_single.txt, summary_chunk.txt, summary_reduce.txt.
+
+Every LLM call in this module (streaming and non-streaming, map and reduce)
+is guarded against a repetition-loop degeneration by ``llm.repetition`` —
+see that module's docstring for the measured incident and threshold
+rationale.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from pathlib import Path
 from src.config import get_config
 from src.llm import client as llm_client
 from src.llm.chunking import pack_lines, split_for_summary
+from src.llm.repetition import abort_on_repeated_lines, trim_repeated_tail
 from src.llm.tokens import count_tokens
 
 # Ceiling on the map-phase chunk budget; stream_summarize takes the actual
@@ -102,7 +108,13 @@ async def _stream_single_pass(
     prompt = _build_single_pass_prompt(
         text, title=title, output_language=output_language, source_note=source_note
     )
-    async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
+    # abort_on_repeated_lines guards against a small local model locking
+    # into a repetition loop and burning the whole max_tokens budget on one
+    # line — see llm/repetition.py for the measured incident and threshold
+    # rationale.
+    async for delta in abort_on_repeated_lines(
+        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3)
+    ):
         yield delta
 
 
@@ -124,7 +136,12 @@ async def _summarize_chunk(
         total=total,
         source_note=source_note,
     )
-    return (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
+    result = (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
+    # Non-streaming call — nothing to abort mid-generation — but a
+    # degenerate chunk summary must not be fed into the reduce phase as if
+    # it were legitimate content, so trim it the same way the streaming
+    # paths would have. See llm/repetition.py.
+    return trim_repeated_tail(result)
 
 
 def _build_reduce_prompt(
@@ -150,7 +167,9 @@ async def _stream_reduce(
     prompt = _build_reduce_prompt(
         partials, title=title, output_language=output_language, source_note=source_note
     )
-    async for delta in llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3):
+    async for delta in abort_on_repeated_lines(
+        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3)
+    ):
         yield delta
 
 
@@ -173,7 +192,10 @@ async def _intermediate_reduce(
     prompt = _build_reduce_prompt(
         group, title=title, output_language=output_language, source_note=source_note
     )
-    return (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
+    result = (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
+    # Same reasoning as _summarize_chunk: a degenerate intermediate fold
+    # would otherwise poison the next fold round / the final reduce.
+    return trim_repeated_tail(result)
 
 
 async def _fold_partials(
