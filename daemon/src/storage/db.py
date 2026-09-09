@@ -130,6 +130,17 @@ class Job(SQLModel, table=True):
     # ``transcript_missing_seconds`` above, which is why repo.py reuses the
     # same ``_UNSET`` sentinel trick for this field too.
     queued_reason: str | None = None
+    # Non-sensitive, persisted diagnostic record of a Whisper transcription
+    # attempt — JSON-encoded workers.transcribe.TranscribeDiagnostics
+    # (chunking decision + why, every coverage-recheck window + verdict,
+    # whisper backend/model, yt-dlp version, final
+    # transcript_missing_seconds). Written by workers/runner.py alongside
+    # transcript_missing_seconds; see migration v10 for the full rationale
+    # and privacy audit. Whisper-only by construction (PAGE/PDF/YouTube-
+    # caption-fast-path jobs never populate this) and ``None`` for every
+    # pre-existing row. Surfaced via ``GET /jobs/{id}/diagnostics``
+    # (api/jobs.py) and carried into the export bundle (storage/bundle.py).
+    diagnostics_json: str | None = None
 
 
 class Message(SQLModel, table=True):
@@ -226,6 +237,47 @@ def _install_pragmas(engine: Engine) -> None:
             cursor.close()
 
 
+def _py_lower(value: str | None) -> str | None:
+    """Unicode-aware lowercase, registered on every connection as the SQL
+    function ``py_lower`` (see ``_install_functions`` below).
+
+    SQLite's built-in ``LIKE`` only case-folds ASCII — ``'Мозг' LIKE '%мозг%'``
+    and ``'Über' LIKE '%über%'`` both fail to match on stock SQLite, which
+    makes a plain ``LIKE`` search close to unusable on non-Latin or
+    umlaut-bearing content (see ``storage/repo.py``'s ``list_jobs`` ``q``
+    filter, used by a library that's largely Russian/German). Python's
+    ``str.lower()`` does full Unicode case folding, so comparing through
+    ``py_lower(col) LIKE py_lower(:pattern)`` fixes every script in one move
+    with no per-language logic.
+
+    ``None``-safe: ``summary_md``/``raw_text``/translation ``text`` are all
+    nullable columns, and a NULL argument reaching a SQLite user-defined
+    function must not raise inside the C extension callback — it would take
+    the whole query down with it. Returning ``None`` here makes the
+    surrounding ``LIKE`` evaluate to NULL (no match), same as SQLite's own
+    NULL-propagation for a column compared directly.
+    """
+    return value.lower() if value is not None else None
+
+
+def _install_functions(engine: Engine) -> None:
+    """Register a connect listener that installs ``py_lower`` (see above) on
+    every connection. SQLite user-defined functions are connection-scoped,
+    same reasoning as ``_install_pragmas``: a pooled connection that never
+    passes through this listener would raise ``no such function: py_lower``
+    at query time instead of silently degrading, so this must run on every
+    checkout, not just once at engine-creation time — ``event.listens_for``
+    with ``"connect"`` guarantees that.
+
+    ``deterministic=True`` lets SQLite's query planner treat repeated calls
+    with the same input as cacheable — safe here since ``str.lower()`` is a
+    pure function of its argument."""
+
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn: Any, _connection_record: Any) -> None:  # noqa: ANN401
+        dbapi_conn.create_function("py_lower", 1, _py_lower, deterministic=True)
+
+
 def _build_engine(db_path: Path | str) -> Engine:
     """Create a fresh engine for ``db_path`` (or `:memory:` SQLite URL).
 
@@ -244,6 +296,7 @@ def _build_engine(db_path: Path | str) -> Engine:
         connect_args={"check_same_thread": False, "timeout": 30.0},
     )
     _install_pragmas(engine)
+    _install_functions(engine)
     return engine
 
 

@@ -72,12 +72,35 @@ isn't natively async, follow the same pattern — don't block the event loop.
 | New HTTP endpoint | `src/api/<file>.py` route + `src/api/schemas.py` model + mirror in `extension/src/lib/api-types.js` (same commit). See [contract.md](contract.md). |
 | New user-editable setting | Add to `LLMConfig`/`WhisperConfig`/`OutputConfig` in `src/config.py`, then surface it on the matching `*ConfigOut`/`*ConfigPatch` pair in `src/api/config.py` + `schemas.py` (`GET`/`PATCH /config`) — never write `tldr.yaml` itself, `PATCH` goes through `config.write_overrides` into `tldr.local.yaml`. See [contract.md](contract.md). |
 | New AI mode | Extend `POST /ai/stream` body in `api/ai.py` — keep the same event shapes. Add a new endpoint only if the response semantics are genuinely different. |
-| New SQLite column | Edit the v1 migration in `src/storage/migrations.py` (we wipe DB pre-1.0) + field on model in `src/storage/db.py` + helper in `repo.py`. If user-visible, add to `repo.job_summary_dict` so `/events` carries it. |
+| New SQLite column | v1 is frozen — add a new version in `src/storage/migrations.py` (`ALTER TABLE ... ADD COLUMN`, registered in `MIGRATIONS`, following the v3-v10 pattern) + field on model in `src/storage/db.py` + helper in `repo.py`. If user-visible, add to `repo.job_summary_dict` so `/events` carries it. |
 | New repo write function | Follow the auto-emit pattern: call the `_publish_*` helper at the end so callers don't need explicit broker calls. See [events.md](events.md). |
 | New external integration | File under `src/workers/`. Typed errors in `workers/errors.py` with a `code` matching `DeferredReason`. Run blocking calls through `asyncio.to_thread`. |
 | New global state to broadcast | Publish via `get_event_broker().publish(workers_event(...))` from the owner module; do NOT add a parallel SSE endpoint. |
 | LLM behavior change | `src/llm/` + prompts in `src/prompts/`. Always thread `output_language` from config — see [llm.md](llm.md). |
 | New CLI / task | `Taskfile.yml` one-liner that delegates to a script in `scripts/`. See [ops.md](ops.md). |
+
+## Job id on every worker log line, and a per-job diagnostic record
+
+`workers/log_context.py` holds a `contextvars.ContextVar` for "the job
+currently being processed" plus a `logging.Filter` (`JobIdLogFilter`) that
+stamps it onto every record reaching the daemon's rotating file handler
+(`logging_setup.configure_logging` attaches the filter to the handler
+itself, not to any one logger, so it covers every `src.*` logger that
+propagates there). Bound once per job at the top of `pipeline.run_pipeline`
+and `runner._process_one` (reset in a `finally`) — never threaded through
+individual function signatures. If you add a new top-level job-processing
+entry point (a new pipeline branch, a new persistent worker loop), bind/
+reset the job id there too.
+
+Separately, `workers/transcribe.TranscribeDiagnostics` builds a non-
+sensitive record of one Whisper transcription attempt (chunking decision,
+every coverage-recheck verdict, backend/model, yt-dlp version) as
+`transcribe_audio()` runs. `runner.py` JSON-encodes it onto
+`Job.diagnostics_json` (migration v10) alongside `raw_segments_json`/
+`transcript_missing_seconds`, surfaced via `GET /jobs/{id}/diagnostics`
+(distinct from the daemon-wide `GET /diagnostics`) and carried into the
+export bundle. Whisper-only by construction — never touch cookies or
+transcript text when extending it; see the dataclass's own docstring.
 
 ## Gotchas
 

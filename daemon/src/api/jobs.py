@@ -37,12 +37,14 @@ from src.api.schemas import (
     JobDeleteRequest,
     JobDeleteResponse,
     JobDetails,
+    JobDiagnosticsResponse,
     JobExportRequest,
     JobImportResponse,
     JobKind,
     JobListResponse,
     JobStatus,
     JobSummary,
+    LowConfidenceRange,
     MessagesListResponse,
     MomentsListResponse,
     TranscriptSource,
@@ -153,6 +155,56 @@ def _build_segments_text(raw_segments_json: str | None) -> str | None:
     return timecodes.format_segments_as_marked_text(dict_segments) or None
 
 
+def _derive_low_confidence_ranges(raw_segments_json: str | None) -> list[LowConfidenceRange]:
+    """Merge low_confidence-flagged segments (see
+    workers.transcribe._restore_unresolved_windows) into contiguous
+    [start, end] spans for the side panel to mark on the transcript,
+    in whatever language it's currently displaying — the ranges are
+    time-based, not text-based, so they apply unchanged to translations.
+
+    Returns [] for every job before this flag existed, every non-Whisper
+    job (raw_segments_json is Whisper-only), and any Whisper job whose
+    recheck budget never needed to fall back to low-confidence text.
+    Same defensive JSON handling as _build_segments_text above — malformed
+    or missing input reads as "nothing to show", not an error.
+    """
+    if not raw_segments_json:
+        return []
+    try:
+        segments = json.loads(raw_segments_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(segments, list):
+        return []
+    flagged = [s for s in segments if isinstance(s, dict) and s.get("low_confidence")]
+    if not flagged:
+        return []
+
+    def _start(seg: dict[str, Any]) -> float:
+        try:
+            return float(seg.get("start", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _end(seg: dict[str, Any]) -> float:
+        try:
+            return float(seg.get("end", _start(seg)))
+        except (TypeError, ValueError):
+            return _start(seg)
+
+    flagged.sort(key=_start)
+    ranges: list[list[float]] = []
+    for seg in flagged:
+        start, end = _start(seg), _end(seg)
+        if end < start:
+            end = start
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    return [LowConfidenceRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
+
+
 def _to_details(job: Any) -> JobDetails:
     # Include in-flight buffer for running jobs so reconnecting clients can
     # replay buffered content without waiting for future delta events.
@@ -196,6 +248,9 @@ def _to_details(job: Any) -> JobDetails:
         partial_summary=partial or None,
         transcript_language=getattr(job, "transcript_language", None),
         transcript_translations=translations,
+        low_confidence_ranges=_derive_low_confidence_ranges(
+            getattr(job, "raw_segments_json", None)
+        ),
         alt_media_candidates=alt_candidates,
         queued_reason=getattr(job, "queued_reason", None),
         whisper_queue_position=get_queue().position(job.id),
@@ -504,17 +559,28 @@ def list_jobs(
         description="Exact URL match (used by the extension to look up whether "
         "the current tab has already been summarized)",
     ),
+    q: str | None = Query(
+        default=None,
+        description="Case-insensitive substring search across title, summary, "
+        "raw transcript, and every cached translation's text (any language). "
+        "Combined with status/kind/since/url via AND, not a separate mode.",
+    ),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> JobListResponse:
     statuses = _parse_status_filter(status)
     since_dt = _parse_since(since)
+    # Blank/whitespace-only q means "no search", same as an absent q — kept
+    # as a single normalization point here rather than letting `q=""` and
+    # `q=None` both need handling further down in repo.list_jobs.
+    q_stripped = q.strip() if q else None
 
     rows, total = repo.list_jobs(
         status=statuses,
         kind=kind,
         since=since_dt,
         url=url,
+        q=q_stripped or None,
         limit=limit,
         offset=offset,
     )
@@ -529,6 +595,48 @@ def get_job(job_id: str) -> JobDetails:
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
     return _to_details(job)
+
+
+@router.get("/{job_id}/diagnostics", response_model=JobDiagnosticsResponse)
+def get_job_diagnostics(job_id: str) -> JobDiagnosticsResponse:
+    """Per-job Whisper diagnostic record — see migration v10 /
+    ``workers.transcribe.TranscribeDiagnostics``. Distinct from the
+    daemon-wide ``GET /diagnostics``: this answers "what happened during
+    THIS job's transcription" (chunking decision, every coverage-recheck
+    window + verdict, backend/model, yt-dlp version), meant to be handed to
+    someone else without a developer reading rotating logs by hand.
+
+    ``available=False`` (every other field null/empty) for a job that was
+    never Whisper-transcribed, or was transcribed before this feature
+    existed — both cases mean "nothing recorded", not an error, so this is
+    still a 200. Only an unknown ``job_id`` 404s.
+    """
+    job = repo.get_job(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"job {job_id} not found")
+
+    raw = getattr(job, "diagnostics_json", None)
+    if not raw:
+        return JobDiagnosticsResponse(job_id=job_id, available=False)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("job %s has malformed diagnostics_json; reporting unavailable", job_id)
+        return JobDiagnosticsResponse(job_id=job_id, available=False)
+    if not isinstance(data, dict):
+        return JobDiagnosticsResponse(job_id=job_id, available=False)
+
+    return JobDiagnosticsResponse(
+        job_id=job_id,
+        available=True,
+        chunking=data.get("chunking"),
+        coverage_rechecks=data.get("coverage_rechecks") or [],
+        max_coverage_rechecks=data.get("max_coverage_rechecks"),
+        final_missing_seconds=data.get("final_missing_seconds"),
+        whisper_backend_base_url=data.get("whisper_backend_base_url"),
+        whisper_model=data.get("whisper_model"),
+        yt_dlp_version=data.get("yt_dlp_version"),
+    )
 
 
 @router.post("/{job_id}/transcript/translate", status_code=202)

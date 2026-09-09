@@ -171,7 +171,7 @@ async def test_global_bound_respected(
     concurrent = 0
     max_concurrent = 0
 
-    async def fake_post_audio(path: Path) -> dict:
+    async def fake_post_audio(path: Path, **_kwargs: object) -> dict:
         nonlocal concurrent, max_concurrent
         async with lock:
             concurrent += 1
@@ -248,7 +248,7 @@ async def test_per_job_cap_of_one_while_global_allows_more(
     global_concurrent = 0
     global_max = 0
 
-    async def fake_post_audio(path: Path) -> dict:
+    async def fake_post_audio(path: Path, **_kwargs: object) -> dict:
         nonlocal global_concurrent, global_max
         key = job_key(path)
         async with lock:
@@ -311,7 +311,7 @@ async def test_ensure_coverage_ordering_survives_concurrent_jobs(
     max_concurrent = 0
     lock = asyncio.Lock()
 
-    async def fake_post(path: Path) -> dict:
+    async def fake_post(path: Path, **_kwargs: object) -> dict:
         nonlocal concurrent, max_concurrent
         async with lock:
             concurrent += 1
@@ -398,7 +398,7 @@ async def test_max_concurrent_requests_one_no_deadlock(
 
     call_count = 0
 
-    async def fake_post_audio(path: Path) -> dict:
+    async def fake_post_audio(path: Path, **_kwargs: object) -> dict:
         nonlocal call_count
         call_count += 1
         return {"segments": [{"start": 0.0, "end": 999999.0, "text": "ok"}], "language": "en"}

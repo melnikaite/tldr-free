@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from src.storage import repo
-from src.storage.db import dispose_engine, init_engine
+from src.storage.db import dispose_engine, init_engine, session_scope
 from src.storage.migrations import run_migrations
 
 
@@ -244,6 +244,200 @@ def test_list_jobs_pagination_and_total(isolated_db) -> None:
     assert len(page3) == 1
     seen = {r.id for r in page1 + page2 + page3}
     assert seen == set(ids)
+
+
+# ---------------------------------------------------------------------------
+# list_jobs `q` — content search (title / summary_md / raw_text /
+# transcript_translation), Phase 5b of media-captions-whisper-plan.md.
+# ---------------------------------------------------------------------------
+
+
+def test_list_jobs_q_matches_title(isolated_db) -> None:
+    a = repo.create_job(url="https://a", kind="page", title="Zebra Migration Notes")
+    repo.create_job(url="https://b", kind="page", title="Something else entirely")
+
+    rows, total = repo.list_jobs(q="zebra", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_matches_summary(isolated_db) -> None:
+    a = repo.create_job(url="https://a", kind="page", title="A")
+    repo.mark_done(
+        a.id, raw_text="irrelevant body", summary_md="mentions unicorns explicitly",
+        transcript_source="trafilatura",
+    )
+    b = repo.create_job(url="https://b", kind="page", title="B")
+    repo.mark_done(
+        b.id, raw_text="nothing here either", summary_md="perfectly ordinary content",
+        transcript_source="trafilatura",
+    )
+
+    rows, total = repo.list_jobs(q="unicorns", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_matches_raw_text(isolated_db) -> None:
+    a = repo.create_job(url="https://a", kind="page", title="A")
+    repo.mark_done(
+        a.id, raw_text="the speaker said something truly memorable here",
+        summary_md="summary", transcript_source="trafilatura",
+    )
+    b = repo.create_job(url="https://b", kind="page", title="B")
+    repo.mark_done(
+        b.id, raw_text="totally unrelated content", summary_md="summary",
+        transcript_source="trafilatura",
+    )
+
+    rows, total = repo.list_jobs(q="memorable", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_matches_translation_text(isolated_db) -> None:
+    """Search must cover cached transcript_translation rows too — the whole
+    point (owner's call, Phase 5) is that a user reading a translation can
+    find a phrase they read there, not just in the original language."""
+    from src.storage.db import TranscriptTranslation, session_scope
+
+    a = repo.create_job(url="https://a", kind="youtube", title="A")
+    repo.mark_done(a.id, raw_text="original text", summary_md="summary", transcript_source="whisper")
+    with session_scope() as session:
+        session.add(
+            TranscriptTranslation(
+                job_id=a.id,
+                language_code="ru",
+                status="done",
+                text="здесь упоминается редкий kumquat",
+            )
+        )
+
+    b = repo.create_job(url="https://b", kind="youtube", title="B")
+    repo.mark_done(b.id, raw_text="original text two", summary_md="summary", transcript_source="whisper")
+
+    rows, total = repo.list_jobs(q="kumquat", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_does_not_filter_translation_by_status(isolated_db) -> None:
+    """A ``partial``/``queued``/``failed`` translation row is still
+    searchable as long as it carries text — the spec is explicit that the
+    subquery must not filter by translation status."""
+    from src.storage.db import TranscriptTranslation, session_scope
+
+    a = repo.create_job(url="https://a", kind="youtube", title="A")
+    repo.mark_done(a.id, raw_text="x", summary_md="y", transcript_source="whisper")
+    with session_scope() as session:
+        session.add(
+            TranscriptTranslation(
+                job_id=a.id,
+                language_code="de",
+                status="partial",
+                text="enthaelt das wort loganberry irgendwo",
+            )
+        )
+
+    rows, total = repo.list_jobs(q="loganberry", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_percent_is_literal(isolated_db) -> None:
+    """`%` and `_` in the search text must be escaped so they match
+    literally instead of acting as SQL LIKE wildcards."""
+    a = repo.create_job(url="https://a", kind="page", title="Discount 50% off today")
+    repo.create_job(url="https://b", kind="page", title="Discount fifty off today")
+
+    rows, total = repo.list_jobs(q="50%", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+    # A bare '%' alone must not become "match everything".
+    rows, total = repo.list_jobs(q="%", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_list_jobs_q_composes_with_status_filter(isolated_db) -> None:
+    """`q` narrows whatever status/kind/etc. already selected — it's an AND,
+    not an independent search mode."""
+    a = repo.create_job(url="https://a", kind="page", title="Zebra report one")
+    repo.create_job(url="https://b", kind="page", title="Zebra report two")
+    repo.mark_done(a.id, raw_text="x", summary_md="y", transcript_source="trafilatura")
+    # b stays in "running" — excluded by status="done" even though it
+    # matches the text search on its own.
+
+    rows, total = repo.list_jobs(q="zebra", status="done", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+    rows, total = repo.list_jobs(q="zebra", status="running", limit=50, offset=0)
+    assert total == 1
+
+
+def test_list_jobs_q_blank_means_no_filter(isolated_db) -> None:
+    repo.create_job(url="https://a", kind="page", title="A")
+    repo.create_job(url="https://b", kind="page", title="B")
+
+    rows, total = repo.list_jobs(q=None, limit=50, offset=0)
+    assert total == 2
+    rows, total = repo.list_jobs(q="", limit=50, offset=0)
+    assert total == 2
+
+
+def test_list_jobs_q_matches_cyrillic_case_insensitively(isolated_db) -> None:
+    """Regression test for the case-sensitivity defect: SQLite's bare LIKE
+    only case-folds ASCII, so searching for lowercase 'мозг' must still find
+    a title stored with a different case ('Мозг') — the py_lower-wrapped
+    comparison (storage/db.py's _install_functions) is what makes this
+    work, not SQLite's own LIKE."""
+    a = repo.create_job(url="https://a", kind="page", title="Как работает Мозг")
+    repo.create_job(url="https://b", kind="page", title="Другая тема совсем")
+
+    rows, total = repo.list_jobs(q="мозг", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+    # Also the other direction: uppercase query against lowercase stored text.
+    b = repo.create_job(url="https://c", kind="page", title="что такое ноутбук")
+    rows, total = repo.list_jobs(q="НОУТБУК", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == b.id
+
+
+def test_list_jobs_q_matches_german_umlaut_case_insensitively(isolated_db) -> None:
+    """Same defect, German umlauts: 'Über' vs 'über' must match — this is
+    exactly the ASCII-only case-folding gap SQLite's built-in LIKE has."""
+    a = repo.create_job(url="https://a", kind="page", title="Über den Wolken")
+    repo.create_job(url="https://b", kind="page", title="Ganz woanders gelegen")
+
+    rows, total = repo.list_jobs(q="über", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+    rows, total = repo.list_jobs(q="ÜBER", limit=50, offset=0)
+    assert total == 1
+    assert rows[0].id == a.id
+
+
+def test_py_lower_is_registered_on_the_real_engine_setup_path(isolated_db) -> None:
+    """Guards against a regression where py_lower is registered on some
+    hand-built test connection but not on the actual engine/session path the
+    app uses — that would raise 'no such function: py_lower' at request
+    time instead of failing a test. Goes through session_scope() (the same
+    path every repo function, including list_jobs, uses), not a fresh
+    sqlite3.connect() of its own."""
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    with session_scope() as session:
+        result = session.execute(sa_select(func.py_lower("MiXeD CaSe"))).scalar()
+        assert result == "mixed case"
+        # None-safety: must not raise inside the SQLite C callback.
+        result_none = session.execute(sa_select(func.py_lower(None))).scalar()
+        assert result_none is None
 
 
 # ---------------------------------------------------------------------------

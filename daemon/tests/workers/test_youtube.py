@@ -223,6 +223,25 @@ def test_pick_subtitle_lang_never_picks_arbitrary_machine_translation() -> None:
     assert result != sorted(available.keys())[0]
 
 
+def test_pick_subtitle_lang_generalises_to_generic_site_single_manual_track() -> None:
+    """The generic-media shape (Phase 1): a non-YouTube site typically has
+    exactly one manually-created track and NO automatic_captions at all —
+    unlike YouTube, which usually offers dozens of machine-translated auto
+    tracks alongside at most one real one. ``_pick_subtitle_lang`` is shared
+    unchanged between both callers of ``_download_subtitles_sync``; this
+    documents that the existing priority chain already covers the generic
+    case (falls to the "any manually-created track" step) without any
+    YouTube-specific reasoning."""
+    available = {"deu": []}  # merged auto ({}) + manual ({"deu": []})
+    manual = {"deu": []}
+    # Original language/preferences/output_language all miss (foreign site,
+    # default config) — must still land on the one real track that exists.
+    result = youtube._pick_subtitle_lang(
+        available, manual, original_lang=None, preferences=["en", "ru"], output_language="en",
+    )
+    assert result == "deu"
+
+
 # ---------------------------------------------------------------------------
 # _parse_subtitle_json3 — pure parsing of YouTube's json3 caption format
 # ---------------------------------------------------------------------------
@@ -273,6 +292,91 @@ def test_parse_subtitle_json3_defaults_missing_duration(tmp_path: Path) -> None:
 
 def test_parse_subtitle_json3_no_events(tmp_path: Path) -> None:
     assert youtube._parse_subtitle_json3(_write_json3(tmp_path, {})) == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_subtitle_vtt — pure parsing of WebVTT (the format non-YouTube sites
+# actually serve: ZDF, ARD, Vimeo, TED, Coursera, …)
+# ---------------------------------------------------------------------------
+
+
+def _write_vtt(tmp_path: Path, lines: list[str]) -> Path:
+    p = tmp_path / "subs.vtt"
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def test_parse_subtitle_vtt_basic(tmp_path: Path) -> None:
+    path = _write_vtt(
+        tmp_path,
+        ["WEBVTT", "", "00:00:01.500 --> 00:00:03.500", "hello world", ""],
+    )
+    out = youtube._parse_subtitle_vtt(path)
+    assert out == [{"start": 1.5, "duration": 2.0, "text": "hello world"}]
+
+
+def test_parse_subtitle_vtt_multiline_cue_joined_with_space(tmp_path: Path) -> None:
+    path = _write_vtt(
+        tmp_path,
+        ["WEBVTT", "", "00:00:00.000 --> 00:00:02.000", "line one", "line two", ""],
+    )
+    out = youtube._parse_subtitle_vtt(path)
+    assert out == [{"start": 0.0, "duration": 2.0, "text": "line one line two"}]
+
+
+def test_parse_subtitle_vtt_strips_cue_id_settings_and_inline_tags(tmp_path: Path) -> None:
+    """Cue identifier lines, trailing cue settings (``align:``/``position:``)
+    and inline markup (``<c>``, karaoke timestamps like ``<00:00:06.000>``)
+    must all be stripped down to plain text."""
+    path = _write_vtt(
+        tmp_path,
+        [
+            "WEBVTT",
+            "",
+            "1",
+            "00:00:05.000 --> 00:00:07.000 align:start position:0%",
+            "<c.colorE5E5E5>Hey <00:00:06.000>Fred</c>",
+            "",
+        ],
+    )
+    out = youtube._parse_subtitle_vtt(path)
+    assert out == [{"start": 5.0, "duration": 2.0, "text": "Hey Fred"}]
+
+
+def test_parse_subtitle_vtt_supports_hours_and_comma_decimal(tmp_path: Path) -> None:
+    """SRT-flavoured WebVTT (comma decimal separator) and hour-including
+    timestamps must both parse — some non-YouTube extractors emit either."""
+    path = _write_vtt(
+        tmp_path,
+        ["WEBVTT", "", "01:00:00,250 --> 01:00:02,750", "an hour in", ""],
+    )
+    out = youtube._parse_subtitle_vtt(path)
+    assert out == [{"start": 3600.25, "duration": 2.5, "text": "an hour in"}]
+
+
+def test_parse_subtitle_vtt_skips_header_note_and_empty_cues(tmp_path: Path) -> None:
+    path = _write_vtt(
+        tmp_path,
+        [
+            "WEBVTT",
+            "Kind: captions",
+            "Language: de",
+            "",
+            "NOTE this is a comment block",
+            "",
+            "00:00:01.000 --> 00:00:02.000",
+            "",
+            "00:00:03.000 --> 00:00:04.000",
+            "real cue",
+            "",
+        ],
+    )
+    out = youtube._parse_subtitle_vtt(path)
+    assert out == [{"start": 3.0, "duration": 1.0, "text": "real cue"}]
+
+
+def test_parse_subtitle_vtt_no_cues_returns_empty_list(tmp_path: Path) -> None:
+    assert youtube._parse_subtitle_vtt(_write_vtt(tmp_path, ["WEBVTT", ""])) == []
 
 
 # ---------------------------------------------------------------------------
@@ -586,10 +690,12 @@ class _FakeYoutubeDL:
     ``_download_subtitles_sync`` performs.
 
     ``probe_info`` is returned verbatim for the probe pass (no
-    ``subtitleslangs`` in opts). For the download pass, writes a json3 file
-    for the requested language at the conventional ``<id>.<lang>.json3``
-    path and returns an info dict pointing at it, so the parse step exercises
-    a real file on disk exactly like the real yt-dlp flow does.
+    ``subtitleslangs`` in opts). For the download pass, writes a file for
+    the requested language at the conventional ``<id>.<lang>.<ext>`` path
+    (``ext`` defaults to ``"json3"``, matching real yt-dlp/YouTube; set it to
+    ``"vtt"`` or anything else to exercise format-negotiation dispatch) and
+    returns an info dict pointing at it, so the parse step exercises a real
+    file on disk exactly like the real yt-dlp flow does.
     """
 
     def __init__(self, opts: dict[str, Any]) -> None:
@@ -607,8 +713,12 @@ class _FakeYoutubeDL:
         chosen = self.opts["subtitleslangs"][0]
         out_dir = Path(self.opts["outtmpl"]).parent
         video_id = "video1"
-        sub_path = out_dir / f"{video_id}.{chosen}.json3"
-        _write_json3_file(sub_path, _FakeYoutubeDL.events_by_lang[chosen])
+        ext = _FakeYoutubeDL.ext
+        sub_path = out_dir / f"{video_id}.{chosen}.{ext}"
+        if ext == "json3":
+            _write_json3_file(sub_path, _FakeYoutubeDL.events_by_lang[chosen])
+        else:
+            sub_path.write_text(_FakeYoutubeDL.raw_text_by_lang[chosen], encoding="utf-8")
         return {
             "id": video_id,
             "requested_subtitles": {chosen: {"filepath": str(sub_path)}},
@@ -617,11 +727,22 @@ class _FakeYoutubeDL:
     # Set per-test via monkeypatch before instantiation.
     probe_info: dict[str, Any] = {}
     events_by_lang: dict[str, list[dict]] = {}
+    ext: str = "json3"
+    raw_text_by_lang: dict[str, str] = {}
 
 
-def _patch_fake_ydl(monkeypatch, probe_info: dict[str, Any], events_by_lang: dict[str, list[dict]]) -> None:  # noqa: ANN001
+def _patch_fake_ydl(  # noqa: ANN001
+    monkeypatch,
+    probe_info: dict[str, Any],
+    events_by_lang: dict[str, list[dict]],
+    *,
+    ext: str = "json3",
+    raw_text_by_lang: dict[str, str] | None = None,
+) -> None:
     _FakeYoutubeDL.probe_info = probe_info
     _FakeYoutubeDL.events_by_lang = events_by_lang
+    _FakeYoutubeDL.ext = ext
+    _FakeYoutubeDL.raw_text_by_lang = raw_text_by_lang or {}
     monkeypatch.setattr("yt_dlp.YoutubeDL", _FakeYoutubeDL)
     # ffmpeg/deno opt-builders shell out to resolve host binaries; keep them
     # inert so tests don't depend on what's installed on the host.
@@ -672,6 +793,64 @@ def test_download_subtitles_sync_no_real_tracks_returns_none(
 
     out = youtube._download_subtitles_sync(
         url="https://www.youtube.com/watch?v=video1",
+        cookies=[],
+        dir=tmp_path,
+        lang_preferences=["en", "ru"],
+    )
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — format negotiation: non-YouTube sites serve WebVTT, not json3
+# ---------------------------------------------------------------------------
+
+
+def test_download_subtitles_sync_dispatches_to_vtt_parser(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """A generic site (ZDF/ARD/Vimeo/TED/Coursera/…) offers only a manual
+    track in WebVTT, never json3. ``_download_subtitles_sync`` must still
+    request+download it (``_SUBTITLE_FORMAT_PREFERENCE`` falls back past
+    json3 to vtt) and dispatch to ``_parse_subtitle_vtt`` based on the
+    actual downloaded file's extension, not assume json3."""
+    probe_info = {
+        "language": "deu",
+        "subtitles": {"deu": [{"ext": "vtt", "url": "https://example.invalid/deu.vtt"}]},
+        "automatic_captions": {},
+    }
+    vtt_text = "\n".join(
+        ["WEBVTT", "", "00:00:01.000 --> 00:00:04.000", "Hallo Welt", ""]
+    )
+    _patch_fake_ydl(
+        monkeypatch, probe_info, {}, ext="vtt", raw_text_by_lang={"deu": vtt_text},
+    )
+
+    out = youtube._download_subtitles_sync(
+        url="https://www.zdf.de/play/example",
+        cookies=[],
+        dir=tmp_path,
+        lang_preferences=["en", "ru"],
+    )
+    assert out == [{"start": 1.0, "duration": 3.0, "text": "Hallo Welt"}]
+
+
+def test_download_subtitles_sync_unsupported_format_returns_none(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    """If yt-dlp lands on a format we have no parser for (e.g. a site
+    offering only ttml/dfxp), the probe must fail soft — None, so the caller
+    falls through to Whisper — rather than crash trying to parse it."""
+    probe_info = {
+        "language": "deu",
+        "subtitles": {"deu": [{"ext": "ttml", "url": "https://example.invalid/deu.ttml"}]},
+        "automatic_captions": {},
+    }
+    _patch_fake_ydl(
+        monkeypatch, probe_info, {}, ext="ttml", raw_text_by_lang={"deu": "<tt></tt>"},
+    )
+
+    out = youtube._download_subtitles_sync(
+        url="https://www.zdf.de/play/example",
         cookies=[],
         dir=tmp_path,
         lang_preferences=["en", "ru"],
@@ -765,3 +944,67 @@ async def test_download_subtitles_gives_up_after_max_attempts(monkeypatch) -> No
     )
     assert out is None
     assert calls["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — retry_on_no_track=False: the generic media path's retry policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_subtitles_no_track_not_retried_when_disabled(monkeypatch) -> None:  # noqa: ANN001
+    """Generic media path (pipeline._run_media passes retry_on_no_track=False):
+    a CLEAN "no usable captions" result must be accepted after the first
+    attempt, not retried — unlike YouTube, "this site has no subtitle track"
+    reproduces identically on every attempt, so retrying just burns extra
+    probes + backoff sleeps on the common captionless case."""
+    calls = {"n": 0}
+
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+        calls["n"] += 1
+        return None  # clean "no track" outcome, every time
+
+    monkeypatch.setattr(youtube, "_download_subtitles_sync", _fake_sync)
+
+    out = await youtube.download_subtitles(
+        url="https://example.invalid/media",
+        cookies=[],
+        dir=Path("/unused"),
+        lang_preferences=["en"],
+        max_attempts=3,
+        backoff_seconds=[0, 0],
+        retry_on_no_track=False,
+    )
+    assert out is None
+    assert calls["n"] == 1  # no retry burned on a clean "no track" result
+
+
+@pytest.mark.asyncio
+async def test_download_subtitles_still_retries_exceptions_when_no_track_disabled(  # noqa: ANN001
+    monkeypatch,
+) -> None:
+    """retry_on_no_track=False only short-circuits a CLEAN no-track result.
+    A genuine transient failure (here: a parse exception on the first
+    attempt) must still be retried — that's the "genuine transient failures
+    ... still are [retried]" half of the policy."""
+    calls = {"n": 0}
+
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise json.JSONDecodeError("boom", "doc", 0)
+        return [{"start": 0.0, "duration": 1.0, "text": "recovered"}]
+
+    monkeypatch.setattr(youtube, "_download_subtitles_sync", _fake_sync)
+
+    out = await youtube.download_subtitles(
+        url="https://example.invalid/media",
+        cookies=[],
+        dir=Path("/unused"),
+        lang_preferences=["en"],
+        max_attempts=3,
+        backoff_seconds=[0],
+        retry_on_no_track=False,
+    )
+    assert out == [{"start": 0.0, "duration": 1.0, "text": "recovered"}]
+    assert calls["n"] == 2

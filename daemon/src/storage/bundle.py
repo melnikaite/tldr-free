@@ -185,6 +185,11 @@ def _write_job_entry(zf: zipfile.ZipFile, job: Job) -> None:
         "raw_segments_json": job.raw_segments_json,
         "alt_media_candidates_json": job.alt_media_candidates_json,
         "transcript_missing_seconds": job.transcript_missing_seconds,
+        # Already scrubbed of cookies/transcript text at write time — see
+        # workers/transcribe.TranscribeDiagnostics and migration v10's
+        # docstring — so it's safe to carry into the bundle verbatim, same
+        # as every other field here.
+        "diagnostics_json": job.diagnostics_json,
         # queued_reason deliberately excluded: only ever non-null while
         # status=="queued", and runner.py clears it back to None before a
         # job can reach "done" — a status=="done" row can never have one.
@@ -497,6 +502,7 @@ def _import_one_job(
                 raw_segments_json=payload.get("raw_segments_json"),
                 alt_media_candidates_json=payload.get("alt_media_candidates_json"),
                 transcript_missing_seconds=payload.get("transcript_missing_seconds"),
+                diagnostics_json=payload.get("diagnostics_json"),
                 messages=messages,
                 translations=translations,
             )

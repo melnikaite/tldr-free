@@ -58,6 +58,7 @@ from pathlib import Path
 
 from src import paths
 from src.config import Config
+from src.workers.log_context import JobIdLogFilter
 
 log = logging.getLogger(__name__)
 
@@ -156,7 +157,15 @@ def configure_logging(config: Config) -> None:
     handlers rather than adding to them.
     """
     level = getattr(logging, config.logging.level.upper(), logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
+    # [job=%(job_id)s] is stamped by JobIdLogFilter below, attached to THIS
+    # handler (not any one logger) so it applies uniformly to every record
+    # that reaches the rotating file — root, uvicorn.*, and every
+    # src.workers.*/src.llm.* logger that propagates up to it — regardless
+    # of which logger emitted it. "-" when no job is currently being
+    # processed on the task that logged the line (see workers/log_context.py).
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s [job=%(job_id)s] | %(message)s"
+    )
 
     directory = log_dir(config)
     directory.mkdir(parents=True, exist_ok=True)
@@ -164,6 +173,7 @@ def configure_logging(config: Config) -> None:
         log_file_path(config), maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(JobIdLogFilter())
     setattr(file_handler, _MANAGED_MARKER, True)
 
     in_container = _is_container()

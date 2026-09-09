@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from src.api.jobs import _derive_low_confidence_ranges
 from src.main import app
 from src.storage.db import dispose_engine, init_engine
 from src.storage.migrations import run_migrations
@@ -456,6 +457,57 @@ def test_get_transcript_pending_when_raw_text_missing(client: TestClient) -> Non
     assert body["is_original"] is True
 
 
+def test_derive_low_confidence_ranges_merges_touching_segments() -> None:
+    """Two low_confidence segments that touch (one's end == the next's
+    start) merge into a single contiguous range."""
+    segments = [
+        {"start": 0.0, "end": 5.0, "text": "a", "low_confidence": True},
+        {"start": 5.0, "end": 9.0, "text": "b", "low_confidence": True},
+    ]
+    ranges = _derive_low_confidence_ranges(json.dumps(segments))
+    assert len(ranges) == 1
+    assert ranges[0].start_seconds == 0.0
+    assert ranges[0].end_seconds == 9.0
+
+
+def test_derive_low_confidence_ranges_keeps_gapped_segments_separate() -> None:
+    """A real gap between one flagged segment's end and the next's start
+    means two separate ranges, not one merged span."""
+    segments = [
+        {"start": 0.0, "end": 5.0, "text": "a", "low_confidence": True},
+        {"start": 8.0, "end": 10.0, "text": "b", "low_confidence": True},
+    ]
+    ranges = _derive_low_confidence_ranges(json.dumps(segments))
+    assert len(ranges) == 2
+    assert (ranges[0].start_seconds, ranges[0].end_seconds) == (0.0, 5.0)
+    assert (ranges[1].start_seconds, ranges[1].end_seconds) == (8.0, 10.0)
+
+
+def test_derive_low_confidence_ranges_none_flagged_returns_empty() -> None:
+    """Segments present, but none flagged low_confidence, → []."""
+    segments = [
+        {"start": 0.0, "end": 5.0, "text": "a"},
+        {"start": 5.0, "end": 9.0, "text": "b", "low_confidence": False},
+    ]
+    assert _derive_low_confidence_ranges(json.dumps(segments)) == []
+
+
+def test_derive_low_confidence_ranges_legacy_inputs_return_empty() -> None:
+    """Legacy raw_segments_json (None, empty string, or segments predating
+    the low_confidence flag entirely) reads as "nothing to show"."""
+    assert _derive_low_confidence_ranges(None) == []
+    assert _derive_low_confidence_ranges("") == []
+    legacy_segments = [{"start": 0.0, "end": 5.0, "text": "no flag key at all"}]
+    assert _derive_low_confidence_ranges(json.dumps(legacy_segments)) == []
+
+
+def test_derive_low_confidence_ranges_malformed_json_returns_empty() -> None:
+    """Not-valid-JSON and valid-JSON-that-isn't-a-list both fail safe,
+    matching _build_segments_text's defensive style."""
+    assert _derive_low_confidence_ranges("not json{{{") == []
+    assert _derive_low_confidence_ranges(json.dumps({"not": "a list"})) == []
+
+
 def test_post_jobs_persists_alt_media_candidates(client: TestClient) -> None:
     """When the extension finds multiple media sources on a page (lecture
     page with 3 talks, news article with promo + main video, etc.) the
@@ -521,6 +573,24 @@ def test_get_job_returns_empty_alt_media_for_legacy_rows(client: TestClient) -> 
     assert detail["alt_media_candidates"] == []
 
 
+def test_get_job_returns_empty_low_confidence_ranges_for_fresh_job(
+    client: TestClient,
+) -> None:
+    """A job that never had Whisper low_confidence segments (every job
+    before Phase 6, and every non-Whisper job) must get back
+    ``low_confidence_ranges: []`` — not null, not missing."""
+    r = client.post(
+        "/jobs",
+        json={"url": "https://example.com/no-low-conf", "kind": "page", "page_text": "hi"},
+    )
+    job_id = r.json()["id"]
+    _wait_until_done(client, job_id)
+
+    detail = client.get(f"/jobs/{job_id}").json()
+    assert "low_confidence_ranges" in detail
+    assert detail["low_confidence_ranges"] == []
+
+
 def test_list_filters_by_exact_url(client: TestClient) -> None:
     """Extension uses ?url= to find the cached job for the current tab."""
     target = "https://example.com/article-x"
@@ -539,6 +609,35 @@ def test_list_filters_by_exact_url(client: TestClient) -> None:
     r = client.get("/jobs", params={"url": "https://nowhere"})
     body = r.json()
     assert body["total"] == 0
+
+
+def test_list_jobs_q_searches_title(client: TestClient) -> None:
+    """GET /jobs?q= is wired through to repo.list_jobs's content search (see
+    daemon/tests/test_repo.py for the exhaustive title/summary/raw_text/
+    translation/escaping coverage of the query builder itself)."""
+    j = client.post(
+        "/jobs",
+        json={"url": "https://example.com/zebra-piece", "kind": "page",
+              "page_title": "Zebra Migration Notes", "page_text": "hi"},
+    ).json()
+    client.post(
+        "/jobs",
+        json={"url": "https://example.com/other-piece", "kind": "page",
+              "page_title": "Something else", "page_text": "hi"},
+    )
+    _wait_until_done(client, j["id"])
+
+    r = client.get("/jobs", params={"q": "zebra"})
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["id"] == j["id"]
+
+    r = client.get("/jobs", params={"q": "no-such-term"})
+    assert r.json()["total"] == 0
+
+    # Blank q means "no filter", same as omitting it entirely.
+    r = client.get("/jobs", params={"q": "   "})
+    assert r.json()["total"] == 2
 
 
 def test_post_jobs_returns_existing_for_same_url(client: TestClient) -> None:
@@ -1163,5 +1262,113 @@ def test_fetch_moment_frames_download_failure_returns_502(
     r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
     assert r.status_code == 502
     assert "ffmpeg exited with code 8" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/diagnostics — persisted per-job Whisper diagnostic record
+# (migration v10, workers.transcribe.TranscribeDiagnostics). Distinct from
+# GET /diagnostics (the daemon-wide health report tested in
+# test_diagnostics.py).
+# ---------------------------------------------------------------------------
+
+
+def test_get_job_diagnostics_404_for_unknown_job(client: TestClient) -> None:
+    r = client.get("/jobs/does-not-exist/diagnostics")
+    assert r.status_code == 404
+
+
+def test_get_job_diagnostics_unavailable_for_job_without_a_record(
+    client: TestClient,
+) -> None:
+    """A job that exists but never had a Whisper diagnostic record (every
+    non-Whisper job, and any Whisper job predating migration v10) reports
+    available=False rather than 404ing or erroring."""
+    job_id = _make_audio_job(client, transcript_source="whisper")
+
+    r = client.get(f"/jobs/{job_id}/diagnostics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["available"] is False
+    assert body["chunking"] is None
+    assert body["coverage_rechecks"] == []
+
+
+def test_get_job_diagnostics_returns_persisted_record(client: TestClient) -> None:
+    from src.storage import repo
+
+    job_id = _make_audio_job(client, transcript_source="whisper")
+    diagnostics = {
+        "chunking": {
+            "chunked": True,
+            "audio_size_bytes": 20_000_000,
+            "max_upload_bytes": 15_000_000,
+            "num_chunks": 2,
+            "chunk_seconds": 748.0,
+            "reason": "19.2 MB > 15 MB cap -> 2 chunks of ~748s",
+        },
+        "coverage_rechecks": [
+            {
+                "unit": "chunk 1/2", "index": 1, "of": 12,
+                "window_start": 150.0, "window_end": 240.0,
+                "verdict": "recovered_real_speech",
+            },
+            {
+                "unit": "chunk 1/2", "index": 4, "of": 12,
+                "window_start": 427.0, "window_end": 517.0,
+                "verdict": "decode_loop_again",
+            },
+        ],
+        "max_coverage_rechecks": 12,
+        "final_missing_seconds": 314.6,
+        "whisper_backend_base_url": "http://127.0.0.1:1240/v1",
+        "whisper_model": "whisper-large-q5_0",
+        "yt_dlp_version": "2026.08.19",
+    }
+    repo.mark_done(
+        job_id,
+        raw_text="placeholder raw text",
+        summary_md="placeholder summary",
+        transcript_source="whisper",
+        diagnostics_json=json.dumps(diagnostics),
+    )
+
+    r = client.get(f"/jobs/{job_id}/diagnostics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["available"] is True
+    assert body["chunking"]["num_chunks"] == 2
+    assert body["chunking"]["reason"] == diagnostics["chunking"]["reason"]
+    assert len(body["coverage_rechecks"]) == 2
+    assert body["coverage_rechecks"][1]["verdict"] == "decode_loop_again"
+    assert body["max_coverage_rechecks"] == 12
+    assert body["final_missing_seconds"] == 314.6
+    assert body["whisper_backend_base_url"] == "http://127.0.0.1:1240/v1"
+    assert body["whisper_model"] == "whisper-large-q5_0"
+    assert body["yt_dlp_version"] == "2026.08.19"
+
+
+def test_get_job_diagnostics_never_carries_transcript_text(client: TestClient) -> None:
+    """The hard privacy constraint: even if a job's raw_text/summary_md
+    carry sensitive content, GET /jobs/{id}/diagnostics's response never
+    echoes it back — the endpoint only ever reads Job.diagnostics_json,
+    never raw_text/summary_md."""
+    from src.storage import repo
+
+    job_id = _make_audio_job(client, transcript_source="whisper")
+    repo.mark_done(
+        job_id,
+        raw_text="the secret transcript text nobody should ever see here",
+        summary_md="a private summary",
+        transcript_source="whisper",
+        diagnostics_json=json.dumps({"chunking": {"chunked": False}}),
+    )
+
+    r = client.get(f"/jobs/{job_id}/diagnostics")
+    assert r.status_code == 200
+    body_text = r.text
+    assert "secret transcript" not in body_text
+    assert "private summary" not in body_text
 
 

@@ -106,6 +106,7 @@ async def test_runner_processes_one_task_end_to_end(
         audio_path: Path,
         *,
         total_duration: float | None,
+        **_kwargs: object,
     ):
         assert audio_path == audio_file
         assert total_duration == 90.0
@@ -253,6 +254,7 @@ async def test_runner_deletes_audio_even_on_transcribe_error(
         audio_path: Path,
         *,
         total_duration: float | None,
+        **_kwargs: object,
     ):
         raise RuntimeError("mlx 503")
 
@@ -368,7 +370,7 @@ async def test_runner_media_long_probed_duration_normal_path(
         download_calls.append({"url": url})
         return audio_file, 900.0
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
@@ -427,7 +429,7 @@ async def test_runner_media_probe_failure_falls_through_to_normal_path(
         download_calls.append({"url": url})
         return audio_file, 120.0
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
@@ -488,7 +490,7 @@ async def test_runner_media_empty_transcript_falls_back_to_page_text(
     ) -> tuple[Path, float | None]:
         return audio_file, 30.0
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         # No segments -> build_marked_text produces "" -> empty transcript.
         return TranscribeResult(segments=[], language=None, duration_seconds=total_duration)
@@ -605,7 +607,7 @@ async def test_runner_youtube_job_ignores_media_only_fallback(
         download_calls.append({"url": url})
         return audio_file, 90.0
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
@@ -688,7 +690,7 @@ async def test_runner_media_static_asset_post_download_probe_skips_whisper(
         assert path == audio_file
         return 3.0  # post-download local ffprobe: the real, authoritative value
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         raise AssertionError("Whisper must not be called for a 3s post-download probe")
 
     summarize_calls: list[dict[str, Any]] = []
@@ -775,7 +777,7 @@ async def test_runner_media_static_asset_post_download_probe_confirms_long_durat
 
     transcribe_calls: list[dict[str, Any]] = []
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         transcribe_calls.append({"audio_path": audio_path, "total_duration": total_duration})
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
@@ -845,7 +847,7 @@ async def test_runner_media_annotation_only_transcript_falls_back_to_page_text(
     ) -> tuple[Path, float | None]:
         return audio_file, 15.0
 
-    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None):
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
         from src.workers.transcribe import TranscribeResult
         # 7 non-empty characters, annotation-only — NOT caught by
         # `not raw_text.strip()`.

@@ -378,6 +378,49 @@ def _migration_v9(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v10 — Job.diagnostics_json
+# ---------------------------------------------------------------------------
+# A non-sensitive, persisted diagnostic record of a Whisper job's
+# transcription attempt: the chunking decision and why, every coverage-
+# recheck window with its verdict, the Whisper backend/model in use, the
+# yt-dlp version, and the final transcript_missing_seconds — see
+# workers/transcribe.py's TranscribeDiagnostics (built up during
+# transcribe_audio()) and workers/runner.py (JSON-serialises it here via
+# repo.set_extracted / repo.mark_done). Surfaced to a human via
+# GET /jobs/{id}/diagnostics (api/jobs.py) — the whole point of this column
+# is to make a bad Whisper result diagnosable by someone who isn't sitting
+# at the machine reading rotating logs by hand, and to survive that
+# rotation in the first place.
+#
+# Whisper-only by construction (PAGE/PDF/YouTube-caption-fast-path jobs
+# never call transcribe_audio, so they never pass this) and null for every
+# pre-existing row (no way to retroactively reconstruct it) — both read the
+# same as "nothing to show", exactly like transcript_missing_seconds
+# before it.
+#
+# Deliberately excludes cookies (transcribe.py never receives them to begin
+# with) and full transcript text (coverage-recheck entries carry only
+# timestamps/counts/a verdict string, never what a recheck actually
+# transcribed) — see TranscribeDiagnostics's own docstring for the full
+# audit of what this column can and cannot contain. That's what makes it
+# safe to include verbatim in the export bundle (storage/bundle.py) and
+# hand to someone else.
+
+_V10_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN diagnostics_json TEXT",
+)
+
+
+def _migration_v10(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V10_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -392,6 +435,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (7, _migration_v7),
     (8, _migration_v8),
     (9, _migration_v9),
+    (10, _migration_v10),
 ]
 
 

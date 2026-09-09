@@ -56,6 +56,7 @@ from src.workers.errors import (
     ExhaustedRetriesError,
     PermanentTranscriptError,
 )
+from src.workers.log_context import reset_job_id, set_job_id
 from src.workers.queue import WhisperTask, get_queue
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,12 @@ async def run_pipeline(
     all failures are swallowed into ``mark_failed`` + ``error_event``.
     """
     broker = get_broker()
+    # Bind job_id for every worker log line emitted while this job is being
+    # processed (page/youtube/media/pdf branches below, plus anything they
+    # call into) — see workers/log_context.py. Reset in `finally` so the
+    # binding never leaks into whatever this task (or thread pool) does
+    # next.
+    token = set_job_id(job_id)
     try:
         if kind == JobKind.PAGE:
             await _run_page(job_id, url=url, page_text=page_text, page_title=page_title)
@@ -146,6 +153,8 @@ async def run_pipeline(
         except Exception:
             log.exception("repo.mark_failed also failed for %s", job_id)
         broker.publish(job_id, error_event(f"pipeline error: {exc}"))
+    finally:
+        reset_job_id(token)
 
 
 # ---------------------------------------------------------------------------
@@ -306,15 +315,55 @@ async def _run_youtube(
             broker.publish(job_id, stage_event("queued", detail=reason.value))
             return
 
-    # Fast path success (either source) — produce raw_text with [MM:SS] markers.
+    # Fast path success (either source) — shared tail with the generic media
+    # captions path below.
     assert segments is not None and transcript_source is not None
+    await _finish_caption_fast_path(
+        job_id,
+        url=url,
+        cookies=cookies,
+        segments=segments,
+        transcript_source=transcript_source,
+        video_id=video_id,
+        page_title=page_title,
+        cfg=cfg,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared: the tail of every caption-based fast path (YouTube API, YouTube's
+# own yt-dlp captions, and generic site captions below)
+# ---------------------------------------------------------------------------
+
+
+async def _finish_caption_fast_path(
+    job_id: str,
+    *,
+    url: str,
+    cookies: list[Any],
+    segments: list[dict[str, Any]],
+    transcript_source: TranscriptSource,
+    video_id: str | None,
+    page_title: str | None,
+    cfg: Any,
+) -> None:
+    """Build [MM:SS]-marked text, resolve title/language, persist, summarize.
+
+    Common to any path that already has caption segments in hand (``{start,
+    duration, text}``) and just needs to turn them into a finished job —
+    whether those segments came from youtube-transcript-api, yt-dlp captions
+    on YouTube, or yt-dlp captions on a generic site. ``video_id`` is
+    YouTube-only (``None`` for generic media); nothing here branches on it.
+    """
+    broker = get_broker()
+
     raw_text = timecodes.build_marked_text(
         segments,
         window_seconds=cfg.youtube.segment_window_seconds,
     )
     # Also serialise the fine-grained segments themselves so the Transcript
     # tab can render one line per ~2-5 s caption cue (vs the 30 s buckets
-    # ``raw_text`` uses for summary). youtube-transcript-api hands us
+    # ``raw_text`` uses for summary). Caption sources hand us
     # {start, duration, text}; we normalise into the {start, end, text}
     # shape ``_build_segments_text`` in api/jobs.py consumes.
     raw_segments_json: str | None = None
@@ -335,11 +384,11 @@ async def _run_youtube(
     # Pause checkpoint before another yt-dlp probe (metadata) + persist + summary.
     await _checkpoint_pause(job_id, broker, "extracting")
 
-    # Authoritative title from YouTube via yt-dlp metadata. The extension
-    # scrapes ``document.title`` / ``h1`` from a possibly stale SPA DOM
-    # (especially when injected into a backgrounded tab), so its guess can
-    # belong to the previous video. Fall back to the extension's title only
-    # if the probe fails.
+    # Authoritative title from yt-dlp metadata. The extension scrapes
+    # ``document.title`` / ``h1`` from a possibly stale DOM (especially a
+    # YouTube SPA injected into a backgrounded tab, but also true of generic
+    # media pages), so its guess can be wrong. Fall back to the extension's
+    # title only if the probe fails.
     metadata = await youtube.fetch_video_metadata(
         url=url, cookies=cookies, scratch_dir=_subtitles_dir(),
     )
@@ -382,11 +431,18 @@ async def _run_youtube(
 # Generic media path (non-YouTube): direct mp4/webm, HLS/DASH, iframe embeds
 # Vimeo/Dailymotion/Twitch/Bunny/Brightcove/JW/Wistia/Streamable/SoundCloud/…
 #
-# No subtitle fast path (most non-YouTube sites don't expose machine-readable
-# captions). Drop straight onto the Whisper queue, which already handles
-# yt-dlp audio download → transcribe → summarize for any URL yt-dlp can
-# extract from. The runner is URL-agnostic — ``WhisperTask.url`` becomes the
-# argument to ``youtube.download_audio`` regardless of the original kind.
+# Same caption-first, Whisper-fallback shape as the YouTube path above: many
+# non-YouTube sites publish real subtitle tracks yt-dlp can list and fetch
+# (ZDF, ARD, Vimeo, TED, Coursera, …) — confirmed concretely against a ZDF
+# episode whose site captions covered 24:54 of a 24:56 runtime while our
+# Whisper run on the same audio left ~5 minutes of gaps. ``download_subtitles``
+# (workers/youtube.py) already probes/downloads/parses generically for any
+# yt-dlp-supported URL; it only needed WebVTT format negotiation alongside
+# YouTube's json3. An empty/failed probe is NOT an error — it falls straight
+# through to the Whisper queue, which already handles yt-dlp audio download →
+# transcribe → summarize for any URL yt-dlp can extract from. The runner is
+# URL-agnostic — ``WhisperTask.url`` becomes the argument to
+# ``youtube.download_audio`` regardless of the original kind.
 # ---------------------------------------------------------------------------
 
 
@@ -394,11 +450,62 @@ async def _run_media(
     job_id: str,
     *,
     media_url: str,
-    page_title: str | None,  # noqa: ARG001  — title is read from the DB row by the worker
+    page_title: str | None,
     page_text: str | None,
     cookies: list[Any],
 ) -> None:
     broker = get_broker()
+    cfg = get_config()
+
+    repo.update_status(job_id, status=JobStatus.RUNNING.value, progress_stage="extracting")
+    broker.publish(job_id, stage_event("extracting"))
+
+    # Pause checkpoint before the caption probe.
+    await _checkpoint_pause(job_id, broker, "extracting")
+
+    broker.publish(job_id, stage_event("fetching_captions"))
+    try:
+        segments = await youtube.download_subtitles(
+            url=media_url,
+            cookies=cookies,
+            dir=_subtitles_dir(),
+            lang_preferences=cfg.youtube.subtitle_lang_preferences,
+            output_language=cfg.output.language,
+            max_attempts=cfg.youtube.caption_fallback_max_attempts,
+            backoff_seconds=cfg.youtube.caption_fallback_backoff_seconds,
+            # Unlike YouTube (where an empty result is often a throttled/
+            # bot-checked session — see download_subtitles's docstring), a
+            # generic site either has a subtitle track or it doesn't: a
+            # clean "no track" result reproduces identically on every
+            # attempt, so retrying it here would only add 2 more
+            # extract_info probes + backoff sleeps to the common captionless
+            # case for nothing. Real transient failures (exceptions) still
+            # retry up to max_attempts regardless of this flag.
+            retry_on_no_track=False,
+        )
+    except Exception:
+        log.exception("caption probe failed for media job %s", job_id)
+        segments = None
+
+    if segments:
+        log.info(
+            "job %s: fetched %d caption segments from site subtitles",
+            job_id, len(segments),
+        )
+        await _finish_caption_fast_path(
+            job_id,
+            url=media_url,
+            cookies=cookies,
+            segments=segments,
+            transcript_source=TranscriptSource.SITE_CAPTIONS,
+            video_id=None,
+            page_title=page_title,
+            cfg=cfg,
+        )
+        return
+
+    # No usable site captions (or the probe itself failed) — Whisper, same
+    # as always.
     try:
         await get_queue().put(
             WhisperTask(job_id=job_id, url=media_url, cookies=cookies, page_text=page_text)

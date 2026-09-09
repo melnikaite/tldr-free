@@ -7,7 +7,7 @@ Public surface:
     mark_done(job_id, *, raw_text, summary_md, transcript_source, ...) -> None
     mark_failed(job_id, *, error) -> None
     get_job(job_id) -> Job | None
-    list_jobs(*, status=None, kind=None, since=None, limit, offset)
+    list_jobs(*, status=None, kind=None, since=None, url=None, q=None, limit, offset)
         -> tuple[list[Job], int]
     delete_job(job_id) -> None                  # cascades into Message
     find_pending_for_restart() -> list[Job]     # status in {queued, running}
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from nanoid import generate as _nanoid_generate
-from sqlalchemy import func
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import defer
 from sqlmodel import select
 
@@ -129,6 +129,7 @@ def insert_imported_job(
     messages: list[dict[str, Any]],
     translations: list[dict[str, Any]],
     transcript_missing_seconds: float | None = None,
+    diagnostics_json: str | None = None,
 ) -> Job:
     """Insert a fully-formed Job (plus its Messages + TranscriptTranslations)
     as one atomic transaction — used by ``storage.bundle`` when importing an
@@ -183,6 +184,13 @@ def insert_imported_job(
     whose coverage came back complete — an old bundle just can't say which,
     and treats them identically (no shortfall shown).
 
+    ``diagnostics_json`` round-trips the exporting machine's persisted
+    Whisper diagnostic record (see ``Job.diagnostics_json`` / migration
+    v10) verbatim — it was already scrubbed of cookies/transcript text at
+    write time (see ``workers/transcribe.TranscribeDiagnostics``), so no
+    further sanitisation is needed on import. ``None`` for every bundle
+    written before this column existed, or for a non-Whisper job.
+
     Emits ``job_event("created", …)`` same as ``create_job`` so an open
     Library page renders the imported row live.
     """
@@ -210,6 +218,7 @@ def insert_imported_job(
         raw_segments_json=raw_segments_json,
         alt_media_candidates_json=alt_media_candidates_json,
         transcript_missing_seconds=transcript_missing_seconds,
+        diagnostics_json=diagnostics_json,
     )
     with session_scope() as session:
         session.add(job)
@@ -307,6 +316,7 @@ def mark_done(
     transcript_language: str | None = None,
     raw_segments_json: str | None = None,
     transcript_missing_seconds: float | None = _UNSET,
+    diagnostics_json: str | None = None,
 ) -> None:
     """Finalise a job with status=done, persisting all extracted fields.
 
@@ -321,6 +331,12 @@ def mark_done(
     those jobs. When the Whisper runner DOES pass it — even explicitly
     ``None``, meaning "checked, fully covered" — it's written unconditionally
     so a successful retry can clear a shortfall a previous attempt left set.
+
+    ``diagnostics_json`` (see ``Job.diagnostics_json`` / migration v10) is
+    the same Whisper-only, "leave untouched when the caller doesn't pass
+    it" shape as ``raw_segments_json`` — only written when not ``None``, so
+    a non-Whisper caller (or a Whisper retry that somehow produced no
+    diagnostics) never clobbers a previously-recorded value with nothing.
 
     Emits ``job_event("updated", …)`` so the Library row flips to done with the
     final title in one event.
@@ -346,6 +362,8 @@ def mark_done(
             job.raw_segments_json = raw_segments_json
         if transcript_missing_seconds is not _UNSET:
             job.transcript_missing_seconds = transcript_missing_seconds
+        if diagnostics_json is not None:
+            job.diagnostics_json = diagnostics_json
         job.completed_at = now
         job.updated_at = now
         job.error = None
@@ -364,6 +382,7 @@ def set_extracted(
     transcript_language: str | None = None,
     raw_segments_json: str | None = None,
     transcript_missing_seconds: float | None = _UNSET,
+    diagnostics_json: str | None = None,
 ) -> None:
     """Persist extraction output mid-pipeline (before the summary call).
 
@@ -379,6 +398,10 @@ def set_extracted(
 
     ``transcript_missing_seconds`` — see ``mark_done``'s docstring; same
     "unconditional write when passed, untouched when omitted" contract.
+
+    ``diagnostics_json`` — see ``mark_done``'s docstring; written mid-
+    pipeline here (same as ``transcript_missing_seconds``) so the record
+    survives even if the later summary call fails.
 
     Emits ``job_event("updated", …)`` — this is the path that surfaces the
     canonical YouTube title to the Library mid-pipeline.
@@ -400,6 +423,8 @@ def set_extracted(
             job.raw_segments_json = raw_segments_json
         if transcript_missing_seconds is not _UNSET:
             job.transcript_missing_seconds = transcript_missing_seconds
+        if diagnostics_json is not None:
+            job.diagnostics_json = diagnostics_json
         job.updated_at = now
         session.add(job)
     _emit_updated(job_id)
@@ -629,16 +654,25 @@ def _emit_deleted(job_id: str) -> None:
     _publish_job_event("deleted", {"id": job_id})
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQLite ``LIKE`` metacharacters (``%``, ``_``, and the escape
+    character itself) so user-typed search text is matched literally rather
+    than as a pattern. Paired with ``.like(..., escape="\\\\")`` at the call
+    site, which declares ``\\`` as the escape character for the query."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def list_jobs(
     *,
     status: str | Iterable[str] | None = None,
     kind: str | None = None,
     since: datetime | None = None,
     url: str | None = None,
+    q: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[Job], int]:
-    """List jobs filtered by status / kind / since / url, with pagination.
+    """List jobs filtered by status / kind / since / url / q, with pagination.
 
     ``status`` accepts either a single string ("queued") or an iterable
     (["queued", "running"]) — the comma-split form from the API maps cleanly
@@ -646,6 +680,42 @@ def list_jobs(
 
     ``url`` does an exact match. Used by the extension to look up whether the
     current tab has already been summarized.
+
+    ``q`` is a case-insensitive substring search combined with every other
+    filter via AND — it narrows whatever ``status``/``kind``/``since``/``url``
+    already selected, rather than being a separate search mode. It matches
+    across ``Job.title``, ``Job.summary_md``, ``Job.raw_text``, OR any cached
+    ``transcript_translation.text`` for the job, in ANY language — searching
+    only the original transcript would miss a phrase the user read in a
+    translation. The translation check is a single
+    ``EXISTS (SELECT 1 FROM transcript_translation WHERE job_id = job.id AND
+    py_lower(text) LIKE py_lower(:q))`` correlated subquery, which covers
+    every language present for a job without enumerating languages anywhere
+    in code — a job with 5 cached translations costs the same one EXISTS
+    check as a job with none. It does not filter by translation ``status``:
+    if text is stored (``done`` or ``partial`` rows both carry it), it is
+    searchable. ``%``/``_`` in ``q`` are escaped (see ``_escape_like``) so
+    they match literally instead of acting as wildcards.
+
+    Case-insensitivity goes through ``py_lower`` (``storage/db.py``'s
+    ``_install_functions``, a ``str.lower()`` registered on every SQLite
+    connection as a scalar function), NOT SQLite's own ``LIKE`` — SQLite's
+    built-in ``LIKE`` only case-folds ASCII, so it silently fails to match
+    e.g. Cyrillic or German-umlaut text typed in a different case than
+    what's stored, which is close to unusable for a library that's largely
+    non-English. ``py_lower(col) LIKE py_lower(:pattern) ESCAPE '\\'`` fixes
+    every script in one move, still with no per-language logic. Do not
+    "simplify" this back to a bare ``.like()`` — that would silently regress
+    non-ASCII search back to case-sensitive.
+
+    A plain scan of these columns (through ``py_lower``, so not sargable —
+    no index can be used) is the right call at the library's current scale:
+    measured at ~2.6 MB of total searchable text (raw_text + summaries +
+    translations) across the live library, this full four-way query runs in
+    ~21 ms. SQLite FTS5 would add a migration, a shadow index kept in sync
+    via triggers, and tokenizer/language decisions — worth it at 10x+ this
+    size, not before. Revisit if the library ever grows an order of
+    magnitude.
 
     Returns a (rows, total_count) tuple where ``total_count`` is the number of
     rows matching the filters *before* pagination (so the UI can render proper
@@ -668,6 +738,29 @@ def list_jobs(
         if url is not None:
             base_stmt = base_stmt.where(Job.url == url)
             count_stmt = count_stmt.where(Job.url == url)
+        if q:
+            from src.storage.db import TranscriptTranslation
+
+            # Both sides go through py_lower (storage/db.py's
+            # _install_functions) — SQLite's bare LIKE only case-folds
+            # ASCII, so comparing raw columns against a raw pattern would
+            # silently miss e.g. 'Мозг'/'мозг' or 'Über'/'über'. See this
+            # function's docstring for the full reasoning.
+            pattern = func.py_lower(f"%{_escape_like(q)}%")
+            translation_hit = exists(
+                select(TranscriptTranslation.job_id).where(
+                    TranscriptTranslation.job_id == Job.id,
+                    func.py_lower(TranscriptTranslation.text).like(pattern, escape="\\"),
+                )
+            )
+            content_filter = or_(
+                func.py_lower(Job.title).like(pattern, escape="\\"),
+                func.py_lower(Job.summary_md).like(pattern, escape="\\"),
+                func.py_lower(Job.raw_text).like(pattern, escape="\\"),
+                translation_hit,
+            )
+            base_stmt = base_stmt.where(content_filter)
+            count_stmt = count_stmt.where(content_filter)
 
         total = int(session.exec(count_stmt).one())
 

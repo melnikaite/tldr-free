@@ -136,15 +136,21 @@ Restart-safe: repo.find_pending_for_restart() re-enqueues queued/running
 rows on daemon startup.
 ```
 
-### Generic media (deferred to Whisper)
+### Generic media (site captions, else deferred to Whisper)
 
 `JobKind.MEDIA` covers any audio/video the extension finds in the DOM —
 native `<video>`/`<audio>` or an iframe-embed (whitelist lives in
-`extension/src/content/extract.js`). The pipeline branch is identical to
-YouTube-without-captions minus the caption probe: enqueue a `WhisperTask`,
-runner downloads via yt-dlp, transcribes, summarizes.
+`extension/src/content/extract.js`). The pipeline branch mirrors
+YouTube-without-the-transcript-API: it probes for the site's own subtitle
+track first (`youtube.download_subtitles`, format-negotiated between
+YouTube's json3 and WebVTT — most non-YouTube sites with captions serve vtt,
+e.g. ZDF/ARD/Vimeo/TED/Coursera), and only enqueues a `WhisperTask` when that
+probe comes back empty. A found track is stored as
+`transcript_source=site_captions` and goes straight to summarization,
+skipping the queue entirely — no separate on-disk audio download or ASR
+pass. An empty/failed probe is not an error, just a fallback signal.
 
-Not restart-safe — see [workers.md](workers.md) for why.
+Not restart-safe (Whisper branch only) — see [workers.md](workers.md) for why.
 
 ### PDF (text-first, vision OCR fallback)
 

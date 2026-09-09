@@ -30,6 +30,34 @@ YouTube job's transcript fast path defers to Whisper,
 `workers/runner.py`'s `_process_one` clears it back to `None` the moment
 that job actually resumes.
 
+`Job.diagnostics_json` (`storage/db.py`, migration v10) ↔
+`JobDiagnosticsResponse`/`JobDiagnosticsChunking`/
+`JobDiagnosticsCoverageRecheck` (`schemas.py`) ↔ their JSDoc twins
+(`api-types.js`) is a fourth instance — `GET /jobs/{id}/diagnostics`
+(`api/jobs.py`), distinct from the daemon-wide `GET /diagnostics`. The
+stored JSON shape is produced by `workers/transcribe.TranscribeDiagnostics`
+(`dataclasses.asdict`, written by `runner.py`) and read back into the
+Pydantic models field-by-field in the route handler — keep the two shapes
+in step the same manual way as everything else here. Hard privacy
+constraint on this one: never add cookies or transcript text to it (see
+the dataclass's own docstring for the full audit) — the whole point is
+that the resulting JSON is safe to hand to someone else.
+
+`GET /jobs`'s `q` param (`api/jobs.py` → `storage/repo.list_jobs`) is a case-
+insensitive `LIKE '%...%'` search across `Job.title`, `Job.summary_md`,
+`Job.raw_text`, and `transcript_translation.text` for every language cached
+for that job, combined with `status`/`kind`/`since`/`url` via AND. No schema
+change was needed (additive query param on an existing list endpoint), but
+the translation half of it IS an invariant worth protecting: it's a single
+correlated `EXISTS (SELECT 1 FROM transcript_translation WHERE job_id =
+job.id AND text LIKE :q)`, not filtered by translation `status`. Do not
+replace it with a per-language column, a language list in code/config, or a
+separate query per language — the whole point is that it falls out of the
+`(job_id, language_code)` schema and needs no maintenance as languages are
+added. `%`/`_` in `q` are escaped (`repo._escape_like`) so user text matches
+literally. Plain `LIKE` (not FTS5) is a deliberate scale call — see the
+docstring on `list_jobs` for when to revisit.
+
 ## The export bundle is a second, slower-moving contract
 
 `storage/bundle.py`'s zip format has its own `version` in `manifest.json`,

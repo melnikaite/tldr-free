@@ -48,6 +48,7 @@ class JobStatus(StrEnum):
 class TranscriptSource(StrEnum):
     YOUTUBE_API = "youtube_api"
     YOUTUBE_AUTO_CAPTIONS = "youtube_auto_captions"  # via yt-dlp --write-auto-sub
+    SITE_CAPTIONS = "site_captions"   # non-YouTube site's own subtitle track, via yt-dlp
     WHISPER = "whisper"
     PAGE_EXTRACT = "page_extract"     # extension extracted via Readability
     TRAFILATURA = "trafilatura"       # daemon fallback for pages without page_text
@@ -62,6 +63,7 @@ AUDIO_TRANSCRIPT_SOURCES = frozenset(
         TranscriptSource.WHISPER,
         TranscriptSource.YOUTUBE_AUTO_CAPTIONS,
         TranscriptSource.YOUTUBE_API,
+        TranscriptSource.SITE_CAPTIONS,
     }
 )
 
@@ -203,6 +205,23 @@ class TranscriptTranslationSummary(BaseModel):
     error: str | None = None
 
 
+class LowConfidenceRange(BaseModel):
+    """A contiguous span, merged from one or more segments in
+    ``raw_segments_json`` that were flagged ``"low_confidence": True`` (see
+    ``workers.transcribe._restore_unresolved_windows``, which falls back to
+    the original — possibly wrong — first-pass text when a coverage-recheck
+    window couldn't be resolved, rather than leaving a hole in the
+    transcript).
+
+    ``start_seconds``/``end_seconds`` are in the ORIGINAL AUDIO's timeline
+    (seconds), same units as
+    ``JobDiagnosticsCoverageRecheck.window_start``/``window_end``. Touching
+    or overlapping flagged segments are merged into one range.
+    """
+    start_seconds: float
+    end_seconds: float
+
+
 class JobDetails(JobSummary):
     """Full job with summary_md and partial_summary for reconnect replay."""
     summary_md: str | None
@@ -221,6 +240,18 @@ class JobDetails(JobSummary):
     # this list — it's served from ``Job.raw_text`` directly. Empty list
     # for jobs no-one ever translated.
     transcript_translations: list[TranscriptTranslationSummary] = []
+    # Contiguous spans (original audio timeline, seconds) where Whisper's
+    # coverage recheck couldn't resolve a stretch and fell back to
+    # low-confidence first-pass text (see ``LowConfidenceRange`` and
+    # ``workers.transcribe._restore_unresolved_windows``). Empty for every
+    # job created before this feature existed (legacy ``raw_segments_json``
+    # with no ``low_confidence`` keys), every non-Whisper job (PAGE/PDF/
+    # YouTube-caption-fast-path never populate ``raw_segments_json`` this
+    # way), and any Whisper job whose transcript came back fully resolved.
+    # Detail-only (not on JobSummary) because deriving it means parsing
+    # ``raw_segments_json``, which we don't want to do for every row in a
+    # job list.
+    low_confidence_ranges: list[LowConfidenceRange] = []
     # Other playable sources the extension discovered on the page at
     # job-creation time. Surfaced by the sidepanel as a "wrong source?"
     # chip when non-empty — clicking opens the list so the user can
@@ -319,6 +350,74 @@ class JobDeleteResponse(BaseModel):
     cleanup as a single ``DELETE /jobs/{id}``), an unknown id simply doesn't
     add to the count."""
     deleted: int
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/diagnostics — a persisted, per-job Whisper diagnostic
+# record, distinct from GET /diagnostics (DiagnosticsResponse above, a
+# daemon-wide health/config report). This one answers "what happened during
+# THIS job's transcription" — chunking decision, every coverage-recheck
+# window with its verdict, backend/model, yt-dlp version — so a bad Whisper
+# result can be diagnosed without reading rotating logs by hand (see
+# storage/migrations.py's v10 and workers/transcribe.TranscribeDiagnostics,
+# which is what actually builds this record during transcribe_audio()).
+#
+# Same privacy posture as GET /diagnostics: safe to hand to someone else.
+# Never contains cookies (transcribe.py never receives them) or transcript
+# text (a recheck's own verdict is a closed-set string, never what it
+# transcribed).
+# ---------------------------------------------------------------------------
+
+
+class JobDiagnosticsChunking(BaseModel):
+    """Whether the audio was split into time-based chunks before upload,
+    and why — mirrors ``workers.transcribe.ChunkingDiagnostics``."""
+    chunked: bool
+    audio_size_bytes: int | None = None
+    max_upload_bytes: int | None = None
+    num_chunks: int | None = None
+    chunk_seconds: float | None = None
+    reason: str = ""
+
+
+class JobDiagnosticsCoverageRecheck(BaseModel):
+    """One coverage-recheck window and its verdict — see
+    ``workers.transcribe._ensure_coverage``. ``unit`` is ``"whole"`` for an
+    unchunked transcription or ``"chunk N/M"`` for a chunked one; ``index``/
+    ``of`` mirror the same recheck-budget counters the log lines already
+    print (``coverage recheck %d/%d``). ``window_start``/``window_end`` are
+    seconds into the ORIGINAL audio's timeline (chunk-relative offsets are
+    already applied)."""
+    unit: str
+    index: int
+    of: int
+    window_start: float
+    window_end: float
+    verdict: Literal[
+        "recovered_real_speech",
+        "confirmed_non_speech",
+        "decode_loop_again",
+        "recut_unavailable",
+        "skipped_too_small",
+    ]
+
+
+class JobDiagnosticsResponse(BaseModel):
+    """``GET /jobs/{id}/diagnostics``. ``available=False`` (every other
+    field null/empty) for a job that was never Whisper-transcribed
+    (PAGE/PDF/YouTube-caption-fast-path jobs never populate this) or that
+    predates this feature (migration v10) — both read as "nothing to
+    show", same convention as ``transcript_missing_seconds``."""
+    job_id: str
+    available: bool
+    chunking: JobDiagnosticsChunking | None = None
+    coverage_rechecks: list[JobDiagnosticsCoverageRecheck] = []
+    max_coverage_rechecks: int | None = None
+    final_missing_seconds: float | None = None
+    # Same values already surfaced verbatim by GET /config — not secrets.
+    whisper_backend_base_url: str | None = None
+    whisper_model: str | None = None
+    yt_dlp_version: str | None = None
 
 
 # ---------------------------------------------------------------------------

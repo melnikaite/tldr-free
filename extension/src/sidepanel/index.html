@@ -54,12 +54,37 @@
          calls daemon.getTranscript only when the user clicks the tab.
          Sticky language bar floats over the scrolling transcript content. -->
     <section id="pane-transcript" class="tab-pane hidden" role="tabpanel">
-      <div id="lang-bar" class="lang-bar">
-        <!-- chips + input rendered by transcript.js -->
+      <div id="lang-bar-row" class="lang-bar-row">
+        <div id="lang-bar" class="lang-bar">
+          <!-- chips + input rendered by transcript.js -->
+        </div>
+        <!-- Exports the currently-selected language only (_currentLang in
+             transcript.js) via GET /jobs/{id}/transcript?lang= — no picker,
+             the selected chip already says what the user wants. Disabled
+             until that language's text has actually loaded. -->
+        <button
+          id="export-transcript-btn"
+          type="button"
+          class="transcript-export-btn hidden"
+          title="Export this transcript"
+          aria-label="Export this transcript"
+          disabled
+        ><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><polyline points="7 10 12 15 17 10"></polyline><path d="M4 19h16"></path></svg></button>
       </div>
-      <div id="transcript-missing-notice" class="transcript-missing-notice hidden">
-        <!-- rendered by transcript.js's _renderMissingNotice() when
-             Job.transcript_missing_seconds is a positive number -->
+      <div id="transcript-source-notice" class="transcript-source-notice hidden">
+        <!-- rendered by transcript.js's _renderSourceNotice() when
+             Job.transcript_source === "site_captions" -->
+      </div>
+      <div id="diagnostics-section" class="diagnostics-section hidden">
+        <!-- shown by transcript.js's _renderDiagnosticsControl() only for
+             Job.transcript_source === "whisper" — GET /jobs/{id}/diagnostics -->
+        <button id="show-diagnostics" type="button">View Whisper diagnostics</button>
+        <div id="diagnostics-status" class="hint"></div>
+        <div id="diagnostics-actions" class="hidden">
+          <button id="copy-diagnostics" type="button">Copy</button>
+          <button id="save-diagnostics" type="button">Save to file</button>
+        </div>
+        <textarea id="diagnostics-report" rows="10" readonly class="hidden"></textarea>
       </div>
       <div id="transcript-body" class="transcript-body">
         <p class="placeholder">Open this tab to load the transcript.</p>

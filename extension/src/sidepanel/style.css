@@ -750,15 +750,25 @@ body {
  * binary search).
  * ------------------------------------------------------------------------- */
 
-.lang-bar {
-  /* Third link in the sticky chain (topbar → tab-nav → lang-bar). Without
-     a top offset matching topbar+tab-nav height it would slide under the
-     topbar (z 10 > 5) and look "not sticky" to the user. */
+.lang-bar-row {
+  /* Third link in the sticky chain (topbar → tab-nav → lang-bar-row).
+     Without a top offset matching topbar+tab-nav height it would slide
+     under the topbar (z 10 > 5) and look "not sticky" to the user. Holds
+     the language bar (chips + input, rebuilt from scratch on every
+     transcript.js _renderChips() call) and the export icon (a static
+     button that must survive that rebuild) side by side. */
   position: sticky;
   top: 4.8rem; /* topbar (~2.6rem) + tab-nav (~2.2rem) */
   z-index: 5;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: flex-start;
+  gap: 0.3rem;
+}
+.lang-bar {
+  flex: 1;
+  min-width: 0;
   padding: 0.4rem 0.6rem;
   display: flex;
   flex-wrap: wrap;
@@ -827,21 +837,76 @@ body {
   border-color: var(--accent);
 }
 
-/* Whisper-coverage-gap notice (daemon Job.transcript_missing_seconds, see
-   storage/db.py) — shown when Whisper's coverage check found the
-   transcript stops short of the audio's known duration. A sibling of
-   .queued-hint's box shape, but amber (matches .lang-chip--partial's
-   #c90) instead of neutral: this is a caveat about data quality on an
-   otherwise-successful job, not a live status. */
-.transcript-missing-notice {
+/* Export-current-language icon (GET /jobs/{id}/transcript?lang=) — sits
+   outside #lang-bar (a sibling in .lang-bar-row) so transcript.js's
+   _renderChips(), which rebuilds #lang-bar's innerHTML from scratch on
+   every chip/translation update, never wipes it out. Deliberately a small
+   icon-only control, same quiet-affordance sizing as .look-affordance
+   elsewhere in the sidepanel — this tab already carries chips, two notices
+   and a diagnostics block, and must not grow into a toolbar. */
+.transcript-export-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  margin: 0.4rem 0.5rem 0 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 0;
+}
+.transcript-export-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.transcript-export-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.transcript-export-btn.hidden { display: none; }
+
+/* Site-captions provenance notice (Job.transcript_source === "site_captions",
+   see api-types.js) — same box shape as .diagnostics-section below, but
+   using --accent instead of amber: this is provenance information (the
+   transcript came from the site's own subtitles, not Whisper), not a data-
+   quality warning. */
+.transcript-source-notice {
   margin: 0 0 0.4rem;
   padding: 0.5rem 0.75rem;
   background: var(--assistant-bg);
   border-radius: 6px;
-  border-left: 3px solid #c90;
-  color: #c90;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
   font-size: 0.85rem;
   text-align: left;
+}
+
+/* Per-job Whisper diagnostic record control (GET /jobs/{id}/diagnostics) —
+   only shown for Job.transcript_source === "whisper" (see
+   transcript.js's _renderDiagnosticsControl()). Mirrors the options
+   page's "Build diagnostics report" copy/save flow, scoped to one job. */
+.diagnostics-section {
+  margin: 0 0 0.4rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--assistant-bg);
+  border-radius: 6px;
+  text-align: left;
+}
+.diagnostics-section .hint { font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; }
+.diagnostics-section .hint.ok { color: #137333; }
+.diagnostics-section .hint.err { color: #c5221f; }
+.diagnostics-section #diagnostics-actions button { margin-right: 0.5rem; }
+.diagnostics-section textarea {
+  width: 100%;
+  margin-top: 0.4rem;
+  font-family: monospace;
+  font-size: 0.75rem;
+  box-sizing: border-box;
 }
 
 .transcript-body {
@@ -859,6 +924,18 @@ body {
   font-variant-numeric: tabular-nums;
   font-size: 0.85em;
   margin-right: 0.4rem;
+}
+/* Marks a cue whose timestamp falls inside a JobDetails.low_confidence_ranges
+   span (Phase 7) — supersedes the old .transcript-missing-notice banner.
+   Deliberately small/low-opacity: a job can have many marked lines, and this
+   must not turn the transcript into a wall of warnings. */
+.tx-low-mark {
+  display: inline-block;
+  margin-left: 0.35rem;
+  font-size: 0.7em;
+  color: #c90;
+  opacity: 0.8;
+  cursor: default;
 }
 .tx-line--current {
   background: color-mix(in srgb, var(--accent) 18%, transparent);

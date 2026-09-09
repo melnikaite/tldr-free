@@ -25,6 +25,7 @@ fast path or the deferred whisper queue.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -43,6 +44,7 @@ from src.workers.broker import (
     stage_event,
 )
 from src.workers.control import get_control
+from src.workers.log_context import reset_job_id, set_job_id
 from src.workers.queue import WhisperQueue
 
 log = logging.getLogger(__name__)
@@ -206,6 +208,14 @@ async def _process_one(
     """
     cfg = get_config()
     broker = get_broker()
+
+    # Bind job_id for every worker log line emitted while this task is
+    # processed — download, transcribe (workers/transcribe.py's "transcribe:"
+    # / coverage-recheck lines), summarize. whisper_worker calls this
+    # function once per dequeued task in a persistent loop, so the binding
+    # is set fresh per call and reset in the `finally` block below rather
+    # than left to leak into the next iteration's job. See workers/log_context.py.
+    job_id_token = set_job_id(task_job_id)
 
     get_job = repo_module.get_job  # type: ignore[attr-defined]
     update_status = repo_module.update_status  # type: ignore[attr-defined]
@@ -405,11 +415,44 @@ async def _process_one(
         # sit on it until the call returns. See workers/transcribe.py.
         broker.publish(task_job_id, stage_event("transcribing"))
 
+        # Publisher-declared language (yt-dlp's `language`/
+        # `original_language` metadata field — see
+        # youtube.fetch_video_metadata), threaded in as the language pin's
+        # HIGHEST-priority source (transcribe.transcribe_audio /
+        # _bootstrap_language). Authoritative and free when we already have
+        # it (kind=media, no cached-audio reuse — see `metadata_fetched`
+        # above); `metadata` is `{}` otherwise (YouTube jobs fetch it only
+        # AFTER transcription, below), so `.get("language")` is simply
+        # `None` in that case and transcribe_audio falls back to its own
+        # backend-report / two-chunk-agreement tiers, unchanged. Passed
+        # RAW (e.g. "deu") — transcribe_audio normalises ISO-639-2 -> 1
+        # itself (_normalize_metadata_language), same as the post-
+        # transcription backfill below already relies on for
+        # `languages.short_lang_code`.
         whisper_result = await transcribe.transcribe_audio(
             audio_path,
             total_duration=audio_duration,
+            metadata_language=metadata.get("language"),
         )
         transcribe_done = True
+
+        # Non-sensitive diagnostic record of this transcription attempt —
+        # chunking decision, every coverage-recheck verdict, backend/model,
+        # yt-dlp version, final missing_seconds (see
+        # transcribe.TranscribeDiagnostics). JSON-encoded once here so
+        # both set_extracted (mid-pipeline, survives a later summary
+        # failure) and mark_done below can persist it the same way
+        # raw_segments_json already is. None when transcribe_audio()
+        # never built one (e.g. total_duration was unknown) — set_extracted/
+        # mark_done leave the column untouched in that case, same "only
+        # write when not None" contract as transcript_missing_seconds.
+        diagnostics_json: str | None = None
+        if whisper_result.diagnostics is not None:
+            diagnostics_json = json.dumps(
+                dataclasses.asdict(whisper_result.diagnostics),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
 
         # transcribe_audio already retried a short chunk/file before giving
         # up — a nonzero missing_seconds here means the transcript is known
@@ -507,6 +550,7 @@ async def _process_one(
                 transcript_language=whisper_language,
                 raw_segments_json=raw_segments_json,
                 transcript_missing_seconds=transcript_missing_seconds,
+                diagnostics_json=diagnostics_json,
             )
         except Exception:
             log.exception("set_extracted failed for %s; continuing", task_job_id)
@@ -564,6 +608,7 @@ async def _process_one(
             transcript_language=whisper_language,
             raw_segments_json=raw_segments_json,
             transcript_missing_seconds=transcript_missing_seconds,
+            diagnostics_json=diagnostics_json,
         )
         broker.publish(task_job_id, done_event(summary))
     finally:
@@ -599,6 +644,7 @@ async def _process_one(
                 task_job_id,
                 audio_path,
             )
+        reset_job_id(job_id_token)
 
 
 async def whisper_worker(queue: WhisperQueue, repo_module: object) -> None:

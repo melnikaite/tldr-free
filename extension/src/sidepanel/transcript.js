@@ -42,9 +42,34 @@ const langBarEl = /** @type {HTMLElement | null} */ (
 const bodyEl = /** @type {HTMLElement | null} */ (
   document.getElementById("transcript-body")
 );
-const missingNoticeEl = /** @type {HTMLElement | null} */ (
-  document.getElementById("transcript-missing-notice")
+const sourceNoticeEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("transcript-source-notice")
 );
+const exportTranscriptBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("export-transcript-btn")
+);
+const diagnosticsSectionEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("diagnostics-section")
+);
+const showDiagnosticsBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("show-diagnostics")
+);
+const diagnosticsStatusEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("diagnostics-status")
+);
+const diagnosticsActionsEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("diagnostics-actions")
+);
+const copyDiagnosticsBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("copy-diagnostics")
+);
+const saveDiagnosticsBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("save-diagnostics")
+);
+const diagnosticsReportEl = /** @type {HTMLTextAreaElement | null} */ (
+  document.getElementById("diagnostics-report")
+);
+let _lastDiagnosticsText = "";
 
 // Cache of {jobId+lang → TranscriptResponse} so re-clicking a chip
 // is instant. Cleared on job switch.
@@ -112,7 +137,9 @@ _eventStream.subscribe((event) => {
     // (we don't want to bother re-fetching JobDetails just for chips).
     _job.transcript_translations = next;
     _renderChips();
-    _renderMissingNotice();
+    _renderSourceNotice();
+    _renderDiagnosticsControl();
+    _syncExportButton();
     // If the just-completed translation is the language the user is
     // looking at, refetch + re-render the body. /events doesn't carry
     // the text payload itself — translation bodies can be megabytes,
@@ -191,6 +218,10 @@ export function setJob(job) {
   }
   _job = job;
   _syncTabVisibility();
+  // Keep the export icon in step even when the pane isn't visible right
+  // now (e.g. a job switch while the Summary tab is showing) — a stale
+  // "enabled" button from the PREVIOUS job must not survive a real switch.
+  _syncExportButton();
   if (!paneEl?.classList.contains("tab-pane--active") || !_shouldShowTab()) return;
   if (!sameJob) {
     // Re-open for the new job (fetches transcript, kicks polling, renders chips).
@@ -200,7 +231,9 @@ export function setJob(job) {
   // Same job, just patched fields — re-render chips off the new data
   // without re-fetching the body.
   _renderChips();
-  _renderMissingNotice();
+  _renderSourceNotice();
+  _renderDiagnosticsControl();
+  _syncExportButton();
 }
 
 /**
@@ -290,7 +323,9 @@ async function _open() {
 function _renderNoJobState() {
   if (!bodyEl) return;
   if (langBarEl) langBarEl.innerHTML = "";
-  _renderMissingNotice();
+  _renderSourceNotice();
+  _renderDiagnosticsControl();
+  _syncExportButton();
   bodyEl.innerHTML = `
     <div class="placeholder-block">
       <p class="muted small">No transcript yet — process this page to extract one.</p>
@@ -327,7 +362,9 @@ async function _showLanguage(lang) {
 
   _currentLang = lang;
   _renderChips();
-  _renderMissingNotice();
+  _renderSourceNotice();
+  _renderDiagnosticsControl();
+  _syncExportButton();
 
   const key = `${_job.id}::${lang ?? ""}`;
   let data = _textCache.get(key);
@@ -337,6 +374,7 @@ async function _showLanguage(lang) {
       data = await daemon.getTranscript(_job.id, lang ?? undefined);
     } catch (err) {
       bodyEl.innerHTML = `<p class="placeholder">Couldn't load transcript: ${stringifyError(err)}</p>`;
+      _syncExportButton();
       return;
     }
     _textCache.set(key, data);
@@ -352,15 +390,32 @@ async function _showLanguage(lang) {
     bodyEl.innerHTML = `<div class="transcript-translating"><div class="spinner"></div><p>${label}</p></div>`;
     // Don't start polling / inject captions until we actually have text.
     _stopPoll();
+    _syncExportButton();
     return;
   }
 
   _renderLines(data.text);
+  _syncExportButton();
   _injectCaptionsIntoTab(data).catch((err) =>
     console.warn("[TLDR] caption injection failed:", err),
   );
   // Resume / start polling so the line highlight follows playback.
   _startPoll();
+}
+
+/**
+ * Whether ``sec`` falls inside any of ``_job.low_confidence_ranges``
+ * (inclusive both ends) — see JobDetails.low_confidence_ranges
+ * (api-types.js) / workers.transcribe._restore_unresolved_windows
+ * (daemon). Ranges are time-based, so this applies unchanged whatever
+ * language _renderLines is currently rendering.
+ * @param {number} sec
+ * @returns {boolean}
+ */
+function _isLowConfidence(sec) {
+  const ranges = _job?.low_confidence_ranges;
+  if (!ranges || !ranges.length) return false;
+  return ranges.some((r) => sec >= r.start_seconds && sec <= r.end_seconds);
 }
 
 /**
@@ -406,6 +461,15 @@ function _renderLines(rawText) {
       a.textContent = `[${m[0].slice(1, m[0].indexOf("]"))}]`;
       p.appendChild(a);
       p.appendChild(document.createTextNode(" " + (m[4] || "")));
+      if (_isLowConfidence(sec)) {
+        const flag = document.createElement("span");
+        flag.className = "tx-low-mark";
+        flag.textContent = "⚠";
+        flag.title =
+          "This stretch was hard to make out — treat it as low-confidence, not exact.";
+        flag.setAttribute("aria-label", "Low-confidence transcription");
+        p.appendChild(flag);
+      }
     } else {
       p.textContent = trimmed;
     }
@@ -469,35 +533,189 @@ function _setTimecodeTarget(a) {
 }
 
 // ---------------------------------------------------------------------------
-// Whisper coverage-gap notice (Job.transcript_missing_seconds)
+// Site-captions provenance notice (Job.transcript_source === "site_captions")
 // ---------------------------------------------------------------------------
 
 /**
- * Fills/hides ``#transcript-missing-notice`` with a caveat when Whisper's
- * coverage check (daemon workers/transcribe.py) found the transcript stops
- * short of the audio's known duration — see
- * ``JobDetails.transcript_missing_seconds`` (api-types.js) /
- * ``Job.transcript_missing_seconds`` (daemon storage/db.py). Hidden (no DOM
- * change) when the value is null/0/absent. Built with textContent, not
- * innerHTML — same convention as the rest of this module.
+ * Fills/hides ``#transcript-source-notice`` when the transcript came from
+ * the site's own subtitle track (``TranscriptSource.SITE_CAPTIONS`` —
+ * daemon/src/api/schemas.py, fetched by ``workers.youtube.download_subtitles``
+ * for non-YouTube media jobs). Unlike Whisper or YouTube's own caption
+ * tracks, a generic site's captions are an unknown quantity: some sites
+ * serve auto-translated or slightly desynced tracks, and there is no
+ * reliable signal to detect that automatically — so this just surfaces the
+ * provenance and lets the user judge. Hidden for every other source.
  */
-function _renderMissingNotice() {
-  if (!missingNoticeEl) return;
-  const missing = _job?.transcript_missing_seconds;
-  if (!missing || missing <= 0) {
-    missingNoticeEl.classList.add("hidden");
-    missingNoticeEl.textContent = "";
+function _renderSourceNotice() {
+  if (!sourceNoticeEl) return;
+  if (_job?.transcript_source !== "site_captions") {
+    sourceNoticeEl.classList.add("hidden");
+    sourceNoticeEl.textContent = "";
     return;
   }
-  const amount =
-    missing < 60
-      ? `${Math.round(missing)} seconds`
-      : `${Math.round(missing / 60)} minute${Math.round(missing / 60) === 1 ? "" : "s"}`;
-  missingNoticeEl.textContent =
-    `Whisper couldn't make out roughly ${amount} of this recording — ` +
-    "the rest of the transcript should be accurate.";
-  missingNoticeEl.classList.remove("hidden");
+  sourceNoticeEl.textContent =
+    "Transcript from this site's own subtitles (not machine-transcribed) — " +
+    "occasionally auto-translated or out of sync on some sites.";
+  sourceNoticeEl.classList.remove("hidden");
 }
+
+// ---------------------------------------------------------------------------
+// Whisper diagnostic record (GET /jobs/{id}/diagnostics) — a persisted,
+// non-sensitive record of the chunking decision + every coverage-recheck
+// verdict for a Whisper-transcribed job, so a bad result can be handed to
+// someone else without them reading rotating daemon logs by hand. See
+// storage/migrations.py's v10 and workers/transcribe.TranscribeDiagnostics
+// on the daemon side.
+// ---------------------------------------------------------------------------
+
+/**
+ * Shows/hides ``#diagnostics-section`` — only ever populated for a
+ * Whisper-transcribed job (``TranscriptSource.WHISPER`` — every other
+ * source never writes ``Job.diagnostics_json``). Resets any previously
+ * fetched report so switching jobs (or re-rendering the same one) never
+ * shows stale content from a different job under a fresh "View" click.
+ */
+function _renderDiagnosticsControl() {
+  if (!diagnosticsSectionEl) return;
+  if (_job?.transcript_source !== "whisper") {
+    diagnosticsSectionEl.classList.add("hidden");
+    return;
+  }
+  diagnosticsSectionEl.classList.remove("hidden");
+  _lastDiagnosticsText = "";
+  if (diagnosticsStatusEl) diagnosticsStatusEl.textContent = "";
+  diagnosticsActionsEl?.classList.add("hidden");
+  if (diagnosticsReportEl) {
+    diagnosticsReportEl.value = "";
+    diagnosticsReportEl.classList.add("hidden");
+  }
+}
+
+showDiagnosticsBtn?.addEventListener("click", async () => {
+  if (!_job) return;
+  if (diagnosticsStatusEl) {
+    diagnosticsStatusEl.textContent = "Fetching…";
+    diagnosticsStatusEl.className = "hint";
+  }
+  diagnosticsActionsEl?.classList.add("hidden");
+  diagnosticsReportEl?.classList.add("hidden");
+  try {
+    const report = await daemon.getJobDiagnostics(_job.id);
+    if (!report.available) {
+      if (diagnosticsStatusEl) {
+        diagnosticsStatusEl.textContent = "No diagnostics were recorded for this job.";
+        diagnosticsStatusEl.className = "hint";
+      }
+      return;
+    }
+    _lastDiagnosticsText = JSON.stringify(report, null, 2);
+    if (diagnosticsReportEl) {
+      diagnosticsReportEl.value = _lastDiagnosticsText;
+      diagnosticsReportEl.classList.remove("hidden");
+    }
+    diagnosticsActionsEl?.classList.remove("hidden");
+    if (diagnosticsStatusEl) {
+      diagnosticsStatusEl.textContent =
+        "Nothing is sent anywhere — review it, then copy or save it yourself.";
+      diagnosticsStatusEl.className = "hint";
+    }
+  } catch (err) {
+    if (diagnosticsStatusEl) {
+      diagnosticsStatusEl.textContent = `Failed to fetch diagnostics: ${stringifyError(err)}`;
+      diagnosticsStatusEl.className = "hint err";
+    }
+  }
+});
+
+copyDiagnosticsBtn?.addEventListener("click", async () => {
+  if (!_lastDiagnosticsText || !diagnosticsStatusEl) return;
+  try {
+    await navigator.clipboard.writeText(_lastDiagnosticsText);
+    diagnosticsStatusEl.textContent = "Copied to clipboard.";
+    diagnosticsStatusEl.className = "hint ok";
+  } catch (err) {
+    diagnosticsStatusEl.textContent = `Copy failed: ${stringifyError(err)}`;
+    diagnosticsStatusEl.className = "hint err";
+  }
+});
+
+saveDiagnosticsBtn?.addEventListener("click", () => {
+  if (!_lastDiagnosticsText || !_job) return;
+  const blob = new Blob([_lastDiagnosticsText], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tldr-diagnostics-${_job.id}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// ---------------------------------------------------------------------------
+// Export the currently-selected language's transcript (Phase 5a). No new
+// endpoint: GET /jobs/{id}/transcript?lang= (daemon.getTranscript) already
+// serves exactly the text this tab has on screen — the same call
+// _showLanguage() makes to populate the body, cached in ``_textCache`` under
+// the same ``${jobId}::${lang}`` key. Deliberately no picker: the selected
+// chip (``_currentLang``) already states what the user wants, same as the
+// library's export flow only ever exports what's currently selected.
+// ---------------------------------------------------------------------------
+
+/**
+ * Enable/disable + show/hide ``#export-transcript-btn`` from current module
+ * state. Hidden entirely when there's no job or the tab wouldn't show
+ * anyway (mirrors ``_syncTabVisibility``); shown-but-disabled while the
+ * currently-selected language has no usable text yet (still loading,
+ * pending translation, or a fetch error) so the icon is never a dead click.
+ */
+function _syncExportButton() {
+  if (!exportTranscriptBtn) return;
+  if (!_job || !_shouldShowTab()) {
+    exportTranscriptBtn.classList.add("hidden");
+    exportTranscriptBtn.disabled = true;
+    return;
+  }
+  exportTranscriptBtn.classList.remove("hidden");
+  const key = `${_job.id}::${_currentLang ?? ""}`;
+  const data = _textCache.get(key);
+  exportTranscriptBtn.disabled = !data || !data.text;
+}
+
+/**
+ * Turn arbitrary job-title text into a filename-safe fragment: strip
+ * characters that are illegal (or awkward) in a filename on any of
+ * Windows/macOS/Linux plus control characters, collapse the resulting
+ * whitespace to single hyphens, and cap the length so one very long title
+ * can't produce an unwieldy filename. Deliberately keeps non-ASCII letters
+ * (Cyrillic, CJK, …) intact — titles and transcripts here are routinely
+ * non-English, and forcing ASCII would turn every non-Latin title into the
+ * same fallback.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function _safeFilenamePart(text) {
+  const cleaned = text
+    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, " ")
+    .trim()
+    .replace(/\s+/g, "-");
+  return cleaned.slice(0, 80) || "transcript";
+}
+
+exportTranscriptBtn?.addEventListener("click", () => {
+  if (!_job || exportTranscriptBtn.disabled) return;
+  const key = `${_job.id}::${_currentLang ?? ""}`;
+  const data = _textCache.get(key);
+  if (!data || !data.text) return; // shouldn't happen — button is disabled until this is set
+  const langPart = (data.language_code || _currentLang || "original").toLowerCase();
+  const titlePart = _safeFilenamePart(_job.title || _job.id);
+  const blob = new Blob([data.text], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tldr-transcript-${titlePart}-${langPart}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
 
 // ---------------------------------------------------------------------------
 // Language chips
@@ -588,7 +806,8 @@ function _renderChips() {
               },
             ];
             _renderChips();
-            _renderMissingNotice();
+            _renderSourceNotice();
+            _renderDiagnosticsControl();
           }
         }
       })

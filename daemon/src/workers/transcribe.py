@@ -173,29 +173,78 @@ real dialogue. So any suspicious interval longer than
 oversized request — see that constant's own comment for the exact size
 and why.
 
-Rechecks are bounded (``_MAX_COVERAGE_RECHECKS`` — one shared counter
-across every slice of every suspicious interval in the unit, so one huge
-hole's slicing can't silently consume the whole budget and starve
-everything else) and memoized (a slice already re-transcribed this call
-is never asked again — same discipline ``workers/translator.py`` uses
-for its bisection retries) so the loop provably terminates regardless of
-how many suspicious intervals — or how large any one of them is — a
-pathological transcript produces. A slice that comes back as real speech
-(or a degenerate run's recovered first-occurrence portion) is spliced in
-using the same mechanism as before (backoff context on the trailing
-edge, a wider leading-edge distrust window ONLY on a suspicious
-interval's true leading edge — an artificial internal split point
-between two slices of the same oversized interval does not get that
-widening, since it isn't a real gap edge — clipped to avoid a duplicate
-seam; see ``_ensure_coverage``'s own docstring). If a slice can't be
-re-transcribed at all (ffmpeg unavailable), still reads as an
-unresolved degenerate loop, or the budget runs out before a slice is
+Rechecks are bounded per unit of work (one shared counter across every
+slice of every suspicious interval IN THAT UNIT, so one huge hole's
+slicing can't silently consume the whole budget and starve everything
+else) and memoized so the loop provably terminates regardless of how many
+suspicious intervals — or how large any one of them is — a pathological
+transcript produces. The bound itself now SCALES with the unit's own
+duration (``_coverage_recheck_budget``, config'd via
+``whisper.coverage_recheck_budget_factor`` /
+``min_coverage_rechecks`` / ``max_coverage_rechecks``) rather than being one
+fixed number shared by a 30s chunk and a 300s one alike — see that
+function's docstring. Memoisation is overlap-based, not exact-key
+(``_overlaps_checked`` / ``_WINDOW_OVERLAP_DEDUP_FRACTION``): splicing a
+retry's result back into the timeline shifts the REMAINING gap's edges by
+a fraction of a second between outer-loop iterations, so an exact-key
+"already asked this" check under-catches — measured live, three
+consecutive rechecks (``469s-490s``, ``468s-490s``, ``467s-490s``) were
+spent on what was really one hole, each overlapping the last by >90%. A
+slice that comes back as real speech (or a degenerate run's recovered
+first-occurrence portion) is spliced in using the same mechanism as before
+(backoff context on the trailing edge, a wider leading-edge distrust
+window ONLY on a suspicious interval's true leading edge — an artificial
+internal split point between two slices of the same oversized interval
+does not get that widening, since it isn't a real gap edge — clipped to
+avoid a duplicate seam; see ``_ensure_coverage``'s own docstring). If a
+slice can't be re-transcribed at all (ffmpeg unavailable), still reads as
+an unresolved degenerate loop, or the budget runs out before a slice is
 checked, we don't know what's there — conservatively, that still counts
 toward ``missing_seconds`` rather than silently assuming it's fine.
 Callers persist the residual on the job
 (``Job.transcript_missing_seconds``) so the UI can tell the user this
 "done" job's transcript is known-incomplete, instead of it looking
 exactly like a full one.
+
+**Language is detected once per call, then pinned.** Every Whisper request
+independently auto-detects language when none is supplied — fine for a
+short, unambiguous clip, but on a chunked long-form transcription each
+chunk (and each chunk's own coverage rechecks) used to auto-detect
+SEPARATELY. Measured live: the opening ~3 minutes of a German episode came
+back transcribed in English while ``transcript_language`` was recorded as
+``"de"`` — the first chunk's own detection wobbled on a noisy/musical
+opening. The first request of a call to ``transcribe_audio`` (the whole
+file, or a chunked path's first chunk) still auto-detects with no
+``language`` sent; every request after that — the rest of that unit's
+coverage rechecks, and every subsequent chunk plus ITS rechecks — pins
+whatever language got bootstrapped from that first request (see
+``_bootstrap_language``), rather than re-asking Whisper to guess again on
+smaller, more ambiguous slices where a wrong guess is more likely.
+Confirmed empirically before relying on this: the LocalAI/whisper.cpp
+backend measurably CONSUMES the ``language`` form field for decoding (an
+intentionally garbage value measurably changed the output), not merely
+echoing it back in the response.
+
+**The bootstrap has two tiers, because the backend that motivated fix 4
+turned out not to REPORT the field it consumes.** Measured live against
+the actual LocalAI instance and a real long-form episode: the response to
+every ``POST /v1/audio/transcriptions`` carried no ``language`` field at
+all — top-level keys were just ``duration``/``segments``/``text`` — even
+though the same backend genuinely uses ``language`` when it IS sent on the
+request (see ``_post_audio``'s docstring). Pinning "whatever the first
+response reported" is therefore inert on this backend: the field being
+pinned from is always absent, so ``pinned_language`` stays ``None`` for
+the whole call and every request keeps auto-detecting independently —
+precisely the failure this feature exists to eliminate, just never
+actually engaging. So ``_bootstrap_language`` prefers the backend's own
+report when present, and otherwise derives a language from the first
+request's own transcribed text via ``llm.languages.detect_language`` —
+the same function ``runner.py`` already falls back to, but applied here
+BEFORE the rest of the call instead of after the whole transcription,
+early enough to actually pin something. Provenance
+(``"reported_by_backend"`` / ``"detected_from_text"`` / ``"unpinned"``) is
+recorded on ``TranscribeDiagnostics`` — this incident is the reason that
+matters.
 """
 
 from __future__ import annotations
@@ -208,7 +257,7 @@ import os
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -216,6 +265,7 @@ from typing import Any
 import httpx
 
 from src.config import get_config
+from src.llm import languages
 from src.workers.timecodes import collapse_repeated_segments
 
 log = logging.getLogger(__name__)
@@ -243,7 +293,12 @@ def _global_whisper_lock() -> asyncio.Semaphore:
     return asyncio.Semaphore(n)
 
 
-async def _call_whisper(per_job_lock: asyncio.Semaphore, audio_path: Path) -> dict[str, Any]:
+async def _call_whisper(
+    per_job_lock: asyncio.Semaphore,
+    audio_path: Path,
+    *,
+    language: str | None = None,
+) -> dict[str, Any]:
     """Gate one ``_post_audio`` call through both semaphores: the per-job
     lock first (never contended in practice — see below), then the global
     fairness lock (this is the one that may actually wait on other jobs).
@@ -256,9 +311,15 @@ async def _call_whisper(per_job_lock: asyncio.Semaphore, audio_path: Path) -> di
     not just relied on as an accident of the current sequential code —
     that's what guards against a future change (e.g. someone parallelizing
     chunk processing for speed) silently breaking the fairness guarantee.
+
+    ``language`` is passed straight through to ``_post_audio`` — ``None``
+    (the default) means "let Whisper auto-detect", used for exactly one
+    request per call to ``transcribe_audio`` (the first one). Every caller
+    after that pins whatever language got detected — see the module
+    docstring's "Language is detected once per call, then pinned" section.
     """
     async with per_job_lock, _global_whisper_lock():
-        return await _post_audio(audio_path)
+        return await _post_audio(audio_path, language=language)
 
 
 @dataclass
@@ -294,6 +355,174 @@ class TranscribeResult:
     language: str | None
     duration_seconds: float | None
     missing_seconds: float = 0.0
+    # Non-sensitive record of how this transcription went — chunking
+    # decision, every coverage-recheck verdict, backend/model, yt-dlp
+    # version. None only when this TranscribeResult was constructed
+    # somewhere that never populated it (defensive default; every real
+    # transcribe_audio() call fills it in). See TranscribeDiagnostics.
+    diagnostics: TranscribeDiagnostics | None = None
+
+
+@dataclass
+class ChunkingDiagnostics:
+    """Non-sensitive record of the chunking decision for one
+    ``transcribe_audio()`` call: was the audio split before upload, and
+    why. Part of ``TranscribeDiagnostics`` — see its docstring for the
+    privacy rationale and where this ends up persisted."""
+
+    chunked: bool = False
+    audio_size_bytes: int | None = None
+    max_upload_bytes: int | None = None
+    num_chunks: int | None = None
+    chunk_seconds: float | None = None
+    # How many chunks EACH bound independently implied — populated only on
+    # the chunked path, where num_chunks = max(chunks_by_bytes,
+    # chunks_by_seconds). Whichever is larger determined num_chunks; both are
+    # kept (not just the winner) so a diagnostic reader can see how close the
+    # other bound came, not just which one won.
+    chunks_by_bytes: int | None = None
+    chunks_by_seconds: int | None = None
+    # The whisper.max_chunk_seconds value in effect for this call — config
+    # can change between runs, so the raw number alone (chunks_by_seconds)
+    # isn't reconstructable without this.
+    max_chunk_seconds_cap: float | None = None
+    reason: str = ""
+
+
+@dataclass
+class TranscribeDiagnostics:
+    """A persistable, privacy-safe record of one ``transcribe_audio()``
+    call, built up as the call proceeds — the chunking decision
+    (``ChunkingDiagnostics``), every coverage-recheck window and its
+    verdict (``_ensure_coverage``), the Whisper backend/model in use, the
+    yt-dlp version, and the final ``missing_seconds``. ``runner.py``
+    JSON-serialises this (``dataclasses.asdict``) onto
+    ``Job.diagnostics_json`` (migration v10) so a bad transcription can be
+    diagnosed without reading rotating logs by hand — see
+    ``api/jobs.py``'s ``GET /jobs/{id}/diagnostics``.
+
+    Deliberately excludes, by construction (never even threaded in here to
+    begin with): cookies (this module never receives them), the audio
+    bytes, and any transcript TEXT — ``coverage_rechecks`` entries carry
+    only timestamps, counts, and a closed-set verdict string, never the
+    text a recheck actually produced. ``whisper_backend_base_url`` /
+    ``whisper_model`` are the same values already surfaced verbatim by
+    ``GET /config`` — configuration, not secrets.
+    """
+
+    chunking: ChunkingDiagnostics = field(default_factory=ChunkingDiagnostics)
+    coverage_rechecks: list[dict[str, Any]] = field(default_factory=list)
+    # The CONFIGURED ceiling (whisper.max_coverage_rechecks) in effect for
+    # this call — a summary/reference value. The budget actually enforced
+    # for any one unit (chunk, or the whole file) is usually smaller and
+    # scales with that unit's own duration; see each coverage_rechecks
+    # entry's own "of" field for the real per-unit number, and
+    # _coverage_recheck_budget for the formula.
+    max_coverage_rechecks: int = 0
+    # Suspicious windows that were SKIPPED because they overlapped an
+    # already-checked window beyond the dedup threshold (see
+    # _WINDOW_OVERLAP_DEDUP_FRACTION / _overlaps_checked) rather than
+    # because they were resolved — evidence that memoisation actually did
+    # something, distinct from a normal recheck outcome.
+    overlap_suppressed: list[dict[str, Any]] = field(default_factory=list)
+    final_missing_seconds: float = 0.0
+    # The language pinned for every request after this call's first one
+    # (see _bootstrap_language / the module docstring's "Language is
+    # detected once per call, then pinned" section), and how it was
+    # obtained: "reported_by_backend" (the first request's own response
+    # carried a language), "detected_from_text" (the backend never reports
+    # one at all — measured live against LocalAI/whisper.cpp — so it was
+    # derived from the first request's transcribed text via
+    # llm.languages.detect_language), or "unpinned" (neither source gave a
+    # confident answer, so every request in this call still auto-detects
+    # independently, same as before fix 4 existed). A code alone
+    # ("de") is not sensitive — the same value already lands in
+    # Job.transcript_language.
+    pinned_language: str | None = None
+    language_pin_source: str = "unpinned"
+    # Phase 6 (owner ruling, 2026-08-28 — "a wrong transcript beats a
+    # hole"): every span where the recheck budget ran out unresolved but
+    # the FIRST PASS had produced something, so the original (low-
+    # confidence) text was restored instead of leaving the span empty —
+    # see _restore_unresolved_windows. Per-span detail (unit + window,
+    # never text — same privacy posture as coverage_rechecks) plus the two
+    # summary numbers a reader actually wants at a glance: how many spans,
+    # and how many seconds of the transcript are now backfilled rather
+    # than either missing outright or fully trustworthy.
+    backfilled_spans: list[dict[str, Any]] = field(default_factory=list)
+    backfill_count: int = 0
+    backfill_total_seconds: float = 0.0
+    whisper_backend_base_url: str | None = None
+    whisper_model: str | None = None
+    yt_dlp_version: str | None = None
+
+    def record_recheck(
+        self, *, unit: str, index: int, of: int, start: float, end: float, verdict: str,
+    ) -> None:
+        """Append one coverage-recheck outcome. ``verdict`` is one of
+        "recovered_real_speech" / "confirmed_non_speech" /
+        "decode_loop_again" / "recut_unavailable" / "skipped_too_small" /
+        "recovered_unpinned" / "confirmed_non_speech_both_ways" — the last
+        two only occur when a language was pinned for this call AND the
+        pinned decode came back confirmed-silent, triggering the one-shot
+        unpinned (auto-detect) retry of the SAME cut (see the "language and
+        _is_confirmed_silence" branch in ``_ensure_coverage``): the pin
+        itself either cost us content ("recovered_unpinned" — the
+        unpinned retry found real/degenerate text the pinned decode
+        missed) or didn't ("confirmed_non_speech_both_ways" — both decodes
+        agree there's nothing there). See the call sites in
+        ``_ensure_coverage``, each of which already logs the same event;
+        this just gives it a durable, structured twin."""
+        self.coverage_rechecks.append(
+            {
+                "unit": unit,
+                "index": index,
+                "of": of,
+                "window_start": round(start, 1),
+                "window_end": round(end, 1),
+                "verdict": verdict,
+            }
+        )
+
+    def record_overlap_suppressed(self, *, unit: str, start: float, end: float) -> None:
+        """Append one window that memoisation skipped as a near-duplicate
+        of an already-checked one — see _overlaps_checked."""
+        self.overlap_suppressed.append(
+            {
+                "unit": unit,
+                "window_start": round(start, 1),
+                "window_end": round(end, 1),
+            }
+        )
+
+    def record_backfill(self, *, unit: str, start: float, end: float) -> None:
+        """Append one span that Phase 6 restored original first-pass text
+        into (marked low-confidence) instead of leaving it empty — see
+        _restore_unresolved_windows. Updates the two summary counters too,
+        so a reader doesn't have to sum backfilled_spans by hand."""
+        self.backfilled_spans.append(
+            {
+                "unit": unit,
+                "window_start": round(start, 1),
+                "window_end": round(end, 1),
+            }
+        )
+        self.backfill_count += 1
+        self.backfill_total_seconds += end - start
+
+
+def _yt_dlp_version() -> str | None:
+    """Best-effort yt-dlp version string for the diagnostic record.
+    Imported lazily (module-load shouldn't pay this cost — same rationale
+    as ``workers/youtube.py``'s lazy ``yt_dlp`` imports) and swallows every
+    failure to ``None``; a missing/unreadable version must never block
+    transcription."""
+    try:
+        from yt_dlp.version import __version__ as yt_dlp_version
+
+        return str(yt_dlp_version)
+    except Exception:
+        return None
 
 
 # How long a suspicious interval (a collapse-discarded run, or an arithmetic
@@ -371,16 +600,16 @@ _RETRY_BACKOFF_SECONDS = 5.0
 # covers it, so whatever's really there comes back with corrected timing.
 _PREFIX_DISTRUST_SECONDS = 30.0
 
-# Hard cap on RECHECKS per unit of work (one chunk, or the whole file on the
+# Cap on RECHECKS per unit of work (one chunk, or the whole file on the
 # single-request path) — the budget the module docstring promises. Bounded
 # the same way translator.py bounds its bisection retries — each recheck
 # only re-transcribes ONE SLICE (see _MAX_RECHECK_SLICE_SECONDS — never a
 # whole oversized interval, never the whole unit), and a slice already
-# rechecked this call is never asked again (see the ``checked`` set in
-# ``_ensure_coverage``), so together this guarantees the loop terminates and
-# total added cost per unit stays bounded regardless of how many distinct
-# suspicious intervals — or how large any one of them is — a pathological
-# transcript produces.
+# checked this call (or overlapping one closely enough, see
+# _overlaps_checked) is never asked again, so together this guarantees the
+# loop terminates and total added cost per unit stays bounded regardless of
+# how many distinct suspicious intervals — or how large any one of them is —
+# a pathological transcript produces.
 #
 # One shared counter across every slice of every suspicious interval in the
 # unit (not a separate budget per interval) is deliberate: it's what stops
@@ -389,21 +618,66 @@ _PREFIX_DISTRUST_SECONDS = 30.0
 # interval's own slices are all in ``checked``, it stops competing for
 # budget, freeing the rest for whatever else is pending.
 #
-# 12 comes directly from the slice size above: the worst measured hole
-# (562s) needs ceil(562 / 90) = 7 slices to fully re-cover; 12 leaves
-# headroom for a second, smaller hole in the same unit, or for a slice that
-# only partially resolves (a degenerate repeat on the recheck itself, see
-# below) and needs a follow-up on its own remainder — while still being a
-# small, fixed, auditable number rather than "however many it takes".
-_MAX_COVERAGE_RECHECKS = 12
+# UNLIKE the original version of this cap, the budget is no longer one fixed
+# number shared by every unit regardless of size — see _coverage_recheck_budget
+# just below. A fixed 12 was derived from ONE incident's worst hole (562s
+# inside an unbounded ~748s chunk); once whisper.max_chunk_seconds bounds how
+# long a first-pass chunk can even BE (see WhisperConfig), a short chunk
+# doesn't need the same budget as a much longer one, and a first-pass unit
+# that's still long (the single-request path has no chunk-size bound at all)
+# should get more than 12 rather than being stuck with a number sized for a
+# different, smaller unit.
+def _coverage_recheck_budget(window_duration: float) -> int:
+    """How many rechecks THIS unit of work (one chunk, or the whole file on
+    the single-request path) gets — scaled by the unit's OWN duration
+    instead of one fixed number shared by every unit regardless of size.
+
+    Formula: how many _MAX_RECHECK_SLICE_SECONDS-sized slices it would take
+    to recheck the unit's ENTIRE window (i.e. the worst case — the whole
+    unit turns out to be one giant hole), times
+    ``whisper.coverage_recheck_budget_factor`` for headroom (a second,
+    smaller hole in the same unit; a slice that only partially resolves via
+    a degenerate-repeat splice and needs a follow-up on its remainder — see
+    ``_ensure_coverage``). Clamped to
+    ``[whisper.min_coverage_rechecks, whisper.max_coverage_rechecks]`` so
+    neither a very short unit nor a very long one escapes a small, bounded,
+    auditable budget — "scaled" must never mean "unbounded".
+
+    Worked example matching the original fixed value's derivation: a 300s
+    chunk (the default whisper.max_chunk_seconds) needs
+    ceil(300 / 90) = 4 slices to recheck end to end; with the default
+    factor 2.0 that's 8 — comfortably more than the 4 needed if the ENTIRE
+    chunk turned out to be one hole, same shape as the original 12-from-7
+    reasoning, scaled down because the unit itself is now bounded smaller.
+    """
+    cfg = get_config().whisper
+    slices_needed = max(1, math.ceil(window_duration / _MAX_RECHECK_SLICE_SECONDS))
+    scaled = math.ceil(slices_needed * cfg.coverage_recheck_budget_factor)
+    return min(cfg.max_coverage_rechecks, max(cfg.min_coverage_rechecks, scaled))
 
 
 async def transcribe_audio(
     audio_path: Path,
     *,
     total_duration: float | None,
+    metadata_language: str | None = None,
 ) -> TranscribeResult:
     """Transcribe the audio, splitting it first if it exceeds the upload cap.
+
+    ``metadata_language`` is the PUBLISHER's own declared language — e.g.
+    yt-dlp's ``language``/``original_language`` metadata field
+    (``workers/youtube.fetch_video_metadata``), threaded in by
+    ``workers/runner.py``. Raw, un-normalised (``"deu"``, ``"de"``,
+    ``"German"`` all accepted) — normalised once here via
+    ``_normalize_metadata_language`` before use. When present, it is the
+    HIGHEST-priority source for the language pinned across every request
+    in this call (see ``_bootstrap_language``): authoritative, free, and
+    immune to the Whisper-mis-detection failure mode text-based bootstrap
+    fell into (see that function's docstring). ``None`` when the caller
+    doesn't have one — falls through to the backend's own report, then
+    (chunked path only) a two-independent-chunk-agreement text detection,
+    then unpinned per-request auto-detect, exactly as before this
+    parameter existed.
 
     Most Whisper backends reject large bodies (LocalAI ~15 MB, OpenAI 25 MB).
     For audio over ``whisper.max_upload_mb`` we split it into time-based chunks
@@ -446,10 +720,35 @@ async def transcribe_audio(
     cfg = get_config().whisper
     max_bytes = max(1, cfg.max_upload_mb) * 1024 * 1024
     size = audio_path.stat().st_size
+    normalized_metadata_language = _normalize_metadata_language(metadata_language)
+
+    # Non-sensitive diagnostic record for this call — see
+    # TranscribeDiagnostics. Built up as the call proceeds and handed back
+    # on the result so runner.py can persist it (Job.diagnostics_json,
+    # migration v10) without this module knowing anything about storage.
+    diagnostics = TranscribeDiagnostics(
+        max_coverage_rechecks=cfg.max_coverage_rechecks,
+        whisper_backend_base_url=cfg.base_url,
+        whisper_model=cfg.model,
+        yt_dlp_version=_yt_dlp_version(),
+    )
 
     if size <= max_bytes:
+        diagnostics.chunking = ChunkingDiagnostics(
+            chunked=False,
+            audio_size_bytes=size,
+            max_upload_bytes=max_bytes,
+            reason=(
+                f"{size / 1024 / 1024:.1f} MB <= {max_bytes / 1024 / 1024:.0f} MB "
+                "cap — single request"
+            ),
+        )
         result = await _transcribe_whole(
-            audio_path, total_duration=total_duration, per_job_lock=per_job_lock
+            audio_path,
+            total_duration=total_duration,
+            per_job_lock=per_job_lock,
+            diagnostics=diagnostics,
+            metadata_language=normalized_metadata_language,
         )
     else:
         result = await _transcribe_chunked(
@@ -457,25 +756,134 @@ async def transcribe_audio(
             total_duration=total_duration,
             max_bytes=max_bytes,
             per_job_lock=per_job_lock,
+            metadata_language=normalized_metadata_language,
+            diagnostics=diagnostics,
         )
 
+    diagnostics.final_missing_seconds = result.missing_seconds
     final_segments, _discarded = collapse_repeated_segments(result.segments)
     return TranscribeResult(
         segments=final_segments,
         language=result.language,
         duration_seconds=result.duration_seconds,
         missing_seconds=result.missing_seconds,
+        diagnostics=diagnostics,
     )
 
 
+def _normalize_metadata_language(raw: object) -> str | None:
+    """Normalise a publisher-declared language (yt-dlp's ``language`` /
+    ``original_language`` metadata field — e.g. ``"deu"``, ``"de"``,
+    ``"German"``) to the ISO-639-1 code Whisper's ``language`` request
+    field expects.
+
+    Reuses ``llm.languages.normalize_lang`` — the SAME canonicalisation
+    already applied to user-typed translation targets, whose alias table
+    already maps common ISO-639-2 codes (``"deu"`` -> ``"de"``) — rather
+    than duplicating that table here. Anything ``normalize_lang`` doesn't
+    recognise (a code outside the ~20 languages it knows, garbage, empty)
+    comes back ``None`` rather than being passed through raw: sending
+    Whisper a code it doesn't understand is worse than sending none at all
+    (falls back to auto-detect / the text-agreement fallback below,
+    exactly as if metadata had never reported anything).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return languages.normalize_lang(raw).code
+    except languages.UnknownLanguageError:
+        return None
+
+
+def _bootstrap_language(
+    payload: dict[str, Any],
+    result: TranscribeResult,
+    *,
+    metadata_language: str | None,
+) -> tuple[str | None, str]:
+    """Decide the language to PIN starting from this call's very FIRST
+    request, and how that decision was reached — the second value is a
+    provenance tag (``"from_metadata"`` / ``"reported_by_backend"`` /
+    ``"unpinned"``) recorded on ``TranscribeDiagnostics`` so a future
+    incident doesn't need to rediscover this by hand.
+
+    Priority, highest first:
+
+    1. ``metadata_language`` — the PUBLISHER's own declaration (yt-dlp's
+       ``language``/``original_language`` metadata field, already
+       normalised by ``_normalize_metadata_language``; threaded in from
+       ``workers/runner.py``, which extracts it via
+       ``workers/youtube.fetch_video_metadata``). Authoritative, free (the
+       metadata probe already happens for other reasons), and immune to
+       the failure below — it doesn't depend on Whisper's own output at
+       all, so it can't be corrupted by Whisper mis-detecting.
+    2. Whatever the backend itself reported (``result.language``, from
+       ``_parse_payload``) — a single sample, but a self-reported model
+       decision over the actual audio, not a guess from already-possibly-
+       wrong text.
+
+    Deliberately does NOT fall back to text-detection here any more. A
+    live regression (job ``r56sj0_o1ihv``, a 24:56 German episode) showed
+    why: ``llm.languages.detect_language`` on chunk 0's own transcribed
+    text returned a CONFIDENT ``"en"`` for chunk 0's musical, sparse-
+    dialogue opening (the exact stretch Whisper's own auto-detect already
+    wobbles on) — detect_language's short-input guard did not save this,
+    because the input was long enough, just wrong. That "en" then got
+    PINNED and forced onto every subsequent chunk, corrupting a transcript
+    that was 96% correct without any pinning at all (9.6 German-marker-
+    word ratio before this feature existed, 0.0 after). The perverse
+    dynamic: text detection was being applied to text produced by the very
+    mis-detection it was supposed to correct — a single low-confidence
+    sample can never safely be the PRIMARY signal for something that then
+    gets forced onto every other sample. See ``_transcribe_chunked`` for
+    the fallback this function no longer performs: text-detection is only
+    trusted there when TWO INDEPENDENT chunks agree, never from one.
+    """
+    if metadata_language:
+        return metadata_language, "from_metadata"
+    if result.language:
+        return result.language, "reported_by_backend"
+    return None, "unpinned"
+
+
 async def _transcribe_whole(
-    audio_path: Path, *, total_duration: float | None, per_job_lock: asyncio.Semaphore
+    audio_path: Path,
+    *,
+    total_duration: float | None,
+    per_job_lock: asyncio.Semaphore,
+    diagnostics: TranscribeDiagnostics | None = None,
+    unit_label: str = "whole",
+    metadata_language: str | None = None,
 ) -> TranscribeResult:
     """Transcribe ``audio_path`` in one request, checking + retrying coverage
     when ``total_duration`` is known. Shared by the single-request path and
-    both of ``_transcribe_chunked``'s "can't actually chunk" fallbacks."""
-    payload = await _call_whisper(per_job_lock, audio_path)
+    both of ``_transcribe_chunked``'s "can't actually chunk" fallbacks —
+    ``unit_label`` distinguishes those in the diagnostic record (default
+    ``"whole"``, since a fallback callsite still means "we ended up doing
+    ONE request", even if chunking was attempted first).
+
+    Language: when ``metadata_language`` (the publisher's own declaration —
+    see ``_bootstrap_language``) is known, THIS request is sent with it
+    already (never auto-detects at all); otherwise it auto-detects (no
+    ``language`` sent — see ``_call_whisper``'s docstring). Either way,
+    whatever gets PINNED (``_bootstrap_language`` — metadata, or the
+    backend's own report) is used for every coverage-recheck request
+    ``_ensure_coverage`` makes below, so a recheck never re-guesses on a
+    smaller, more ambiguous slice. Deliberately never falls back to
+    single-sample text-detection here — this is the ONLY request in the
+    unit, so there is no second, independent sample to require agreement
+    from (see ``_transcribe_chunked`` for where that fallback lives); if
+    metadata is absent and the backend doesn't self-report, this stays
+    unpinned and every recheck auto-detects independently, exactly as
+    before language pinning existed at all."""
+    payload = await _call_whisper(per_job_lock, audio_path, language=metadata_language)
     result = _parse_payload(payload, total_duration=total_duration)
+    pinned_language, provenance = _bootstrap_language(
+        payload, result, metadata_language=metadata_language
+    )
+    if diagnostics is not None:
+        diagnostics.pinned_language = pinned_language
+        diagnostics.language_pin_source = provenance
     if total_duration is None or total_duration <= 0:
         # Nothing to compare against — can't tell a short transcript from a
         # short recording. Same trust-the-backend behaviour as before this
@@ -486,6 +894,9 @@ async def _transcribe_whole(
         source_path=audio_path,
         window_duration=total_duration,
         per_job_lock=per_job_lock,
+        diagnostics=diagnostics,
+        unit_label=unit_label,
+        language=pinned_language,
     )
     return TranscribeResult(
         segments=segments,
@@ -501,8 +912,17 @@ async def _transcribe_chunked(
     total_duration: float | None,
     max_bytes: int,
     per_job_lock: asyncio.Semaphore,
+    diagnostics: TranscribeDiagnostics | None = None,
+    metadata_language: str | None = None,
 ) -> TranscribeResult:
-    """Split oversized audio with ffmpeg, transcribe parts, merge segments."""
+    """Split oversized audio with ffmpeg, transcribe parts, merge segments.
+
+    ``metadata_language`` (see ``_bootstrap_language``) is used from chunk
+    0's OWN first request onward when known; when it's absent, language
+    pinning here additionally supports a text-detection fallback that
+    requires TWO independent chunks (0 and 1) to agree before pinning
+    anything — see the loop below and the module docstring's language
+    section for why a single chunk's text-based guess is never trusted."""
     duration = total_duration if total_duration and total_duration > 0 else None
     if duration is None:
         duration = await asyncio.to_thread(_probe_duration, audio_path)
@@ -511,33 +931,117 @@ async def _transcribe_chunked(
         # the backend's own error surface if it really is too big. No known
         # duration also means no coverage check is possible here either.
         log.warning("transcribe: unknown duration, cannot chunk; trying single upload")
+        if diagnostics is not None:
+            diagnostics.chunking = ChunkingDiagnostics(
+                chunked=False,
+                reason="unknown audio duration — cannot chunk; single upload",
+            )
         return await _transcribe_whole(
-            audio_path, total_duration=total_duration, per_job_lock=per_job_lock
+            audio_path,
+            total_duration=total_duration,
+            per_job_lock=per_job_lock,
+            diagnostics=diagnostics,
+            metadata_language=metadata_language,
         )
 
     size = audio_path.stat().st_size
     # Target 90% of the cap for VBR headroom; at least 2 chunks since we're here.
     target = max(1, int(max_bytes * 0.9))
-    num_chunks = max(2, math.ceil(size / target))
+    chunks_by_bytes = math.ceil(size / target)
+    # Bound chunk DURATION too, not just size — see WhisperConfig.
+    # max_chunk_seconds's own comment for why the byte cap alone isn't
+    # enough (well-compressed audio can pack many minutes under it, and a
+    # first-pass request that long reproduces the exact decode-loop failure
+    # _MAX_RECHECK_SLICE_SECONDS already works around for rechecks).
+    max_chunk_seconds = get_config().whisper.max_chunk_seconds
+    chunks_by_seconds = (
+        math.ceil(duration / max_chunk_seconds) if max_chunk_seconds > 0 else 1
+    )
+    num_chunks = max(2, chunks_by_bytes, chunks_by_seconds)
     chunk_seconds = duration / num_chunks
+    bound = "seconds" if chunks_by_seconds > chunks_by_bytes else "bytes"
     log.info(
-        "transcribe: audio %.1f MB > cap → %d chunks of ~%.0f s",
+        "transcribe: audio %.1f MB > cap → %d chunks of ~%.0f s (bound: %s; "
+        "%d by size, %d by %.0fs/chunk cap)",
         size / 1024 / 1024,
         num_chunks,
         chunk_seconds,
+        bound,
+        chunks_by_bytes,
+        chunks_by_seconds,
+        max_chunk_seconds,
     )
+    if diagnostics is not None:
+        diagnostics.chunking = ChunkingDiagnostics(
+            chunked=True,
+            audio_size_bytes=size,
+            max_upload_bytes=max_bytes,
+            num_chunks=num_chunks,
+            chunk_seconds=round(chunk_seconds, 1),
+            chunks_by_bytes=chunks_by_bytes,
+            chunks_by_seconds=chunks_by_seconds,
+            max_chunk_seconds_cap=max_chunk_seconds,
+            reason=(
+                f"{size / 1024 / 1024:.1f} MB > {max_bytes / 1024 / 1024:.0f} MB "
+                f"cap -> {chunks_by_bytes} chunks by size; {duration:.0f}s / "
+                f"{max_chunk_seconds:.0f}s cap -> {chunks_by_seconds} chunks by "
+                f"duration -> using {num_chunks} chunks of ~{chunk_seconds:.0f}s "
+                f"(bound: {bound})"
+            ),
+        )
 
     chunks = await asyncio.to_thread(
         _split_audio, audio_path, num_chunks, chunk_seconds
     )
     if not chunks:
         log.warning("transcribe: ffmpeg split produced nothing; trying single upload")
+        if diagnostics is not None:
+            diagnostics.chunking = ChunkingDiagnostics(
+                chunked=False,
+                audio_size_bytes=size,
+                max_upload_bytes=max_bytes,
+                reason="ffmpeg split produced nothing — single upload",
+            )
         return await _transcribe_whole(
-            audio_path, total_duration=duration, per_job_lock=per_job_lock
+            audio_path,
+            total_duration=duration,
+            per_job_lock=per_job_lock,
+            diagnostics=diagnostics,
+            metadata_language=metadata_language,
         )
 
     all_segments: list[dict[str, Any]] = []
     language: str | None = None
+    # Pinned language for every request from chunk 0 onward — see the
+    # module docstring's "Language is detected once per call, then pinned"
+    # section. Decided from chunk 0's own response via _bootstrap_language
+    # (metadata, or the backend's own report), so chunk 0's own coverage
+    # rechecks (right below) already get the pinned value, not just chunk
+    # 1 onward.
+    #
+    # When NEITHER metadata nor the backend gives an answer, this ALSO
+    # supports one more fallback that _bootstrap_language deliberately does
+    # NOT perform on its own: text-detection, but ONLY pinned once a
+    # SECOND, independent chunk (chunk 1) agrees with chunk 0's own
+    # detected guess. ``chunk0_text_lang`` holds that first guess as a mere
+    # CANDIDATE — never assigned to ``pinned_language`` on its own — until
+    # chunk 1 either confirms it (pin, provenance "detected_agreed") or
+    # disagrees / can't be detected either (stays unpinned for the rest of
+    # the call, falling back to today's per-request auto-detect). This is
+    # the fix for a live regression (job r56sj0_o1ihv): chunk 0's own text
+    # detection alone returned a confident WRONG answer ("en" for a German
+    # episode) that then got forced onto every other chunk, corrupting an
+    # otherwise-96%-correct transcript. See _bootstrap_language's own
+    # docstring for the measured before/after.
+    #
+    # Seeded with metadata_language (already normalised), not None: unlike
+    # a backend self-report or text-detection, metadata is known BEFORE
+    # any Whisper call happens at all, so chunk 0's own FIRST request
+    # should already be pinned when we have it, not just requests after
+    # it.
+    pinned_language: str | None = metadata_language
+    language_provenance = "from_metadata" if metadata_language else "unpinned"
+    chunk0_text_lang: str | None = None
     missing_total = 0.0
     try:
         for idx, (chunk_path, offset) in enumerate(chunks):
@@ -545,8 +1049,34 @@ async def _transcribe_chunked(
             # here — is what makes the per-job semaphore never contended in
             # practice (see _call_whisper's docstring); it's still acquired
             # explicitly on every call rather than relied on implicitly.
-            payload = await _call_whisper(per_job_lock, chunk_path)
+            payload = await _call_whisper(per_job_lock, chunk_path, language=pinned_language)
             part = _parse_payload(payload, total_duration=chunk_seconds)
+            if idx == 0:
+                pinned_language, language_provenance = _bootstrap_language(
+                    payload, part, metadata_language=metadata_language
+                )
+                if pinned_language is None:
+                    # No metadata, no backend report — hold a CANDIDATE
+                    # from chunk 0's own text, but do NOT pin it: see this
+                    # block's own comment above and _bootstrap_language's
+                    # docstring for why a single chunk's text-based guess
+                    # is never trusted on its own any more.
+                    chunk0_text_lang = languages.detect_language(
+                        str(payload.get("text") or "")
+                    )
+            elif idx == 1 and pinned_language is None and chunk0_text_lang is not None:
+                chunk1_text_lang = languages.detect_language(str(payload.get("text") or ""))
+                if chunk1_text_lang is not None and chunk1_text_lang == chunk0_text_lang:
+                    pinned_language = chunk0_text_lang
+                    language_provenance = "detected_agreed"
+                # Disagreement (or chunk 1 undetectable too) — stays
+                # unpinned deliberately; do not average, do not prefer
+                # either guess, do not retry with a third chunk. Two
+                # independent samples disagreeing is exactly the signal
+                # that text-detection isn't reliable for THIS episode.
+            if diagnostics is not None:
+                diagnostics.pinned_language = pinned_language
+                diagnostics.language_pin_source = language_provenance
             # The last chunk may be shorter than chunk_seconds if the file
             # doesn't divide evenly (ffmpeg's -t just stops at EOF) — use
             # whatever's actually left of the known total as this chunk's
@@ -557,6 +1087,9 @@ async def _transcribe_chunked(
                 source_path=chunk_path,
                 window_duration=expected_local_duration,
                 per_job_lock=per_job_lock,
+                diagnostics=diagnostics,
+                unit_label=f"chunk {idx + 1}/{len(chunks)}",
+                language=pinned_language,
             )
             if missing > 0:
                 missing_total += missing
@@ -566,12 +1099,17 @@ async def _transcribe_chunked(
                     idx + 1, len(chunks), missing,
                 )
             for seg in segments:
+                # dict(seg, ...) — NOT a fresh {"start"/"end"/"text"}
+                # literal — preserves any OTHER key the segment carries
+                # (e.g. Phase 6's low_confidence flag on a restored
+                # segment) instead of silently stripping it. Measured
+                # regression: the original 3-key literal here dropped
+                # low_confidence on every chunked job's backfilled spans,
+                # even though _restore_unresolved_windows set it correctly
+                # per chunk — this loop discarded it on the very next line
+                # merging chunks back together.
                 all_segments.append(
-                    {
-                        "start": seg["start"] + offset,
-                        "end": seg["end"] + offset,
-                        "text": seg["text"],
-                    }
+                    dict(seg, start=seg["start"] + offset, end=seg["end"] + offset)
                 )
             if language is None:
                 language = part.language
@@ -603,6 +1141,19 @@ def _segment_end(seg: dict[str, Any]) -> float:
         return float(seg.get("end", 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _segment_ending_at(segments: list[dict[str, Any]], t: float) -> dict[str, Any] | None:
+    """The segment in ``segments`` whose ``end`` exactly equals ``t``, or
+    ``None``. Used by ``_restore_unresolved_windows`` to find whatever
+    already sits immediately before a restored span — ``t`` there is
+    always a cursor value ``_find_gaps`` derived directly from some
+    segment's own unmodified ``end`` (``max(cursor, end)``), so exact
+    float equality is safe here, not a rounding gamble."""
+    for seg in segments:
+        if _segment_end(seg) == t:
+            return seg
+    return None
 
 
 def _find_gaps(
@@ -684,35 +1235,117 @@ def _suspicious_windows(
 
 
 def _window_key(start: float, end: float) -> tuple[float, float]:
-    """Dedup key for a suspicious window (or slice of one) — rounded
-    defensively against float jitter, though in practice the SAME
-    unchanged window recurs bit-for-bit across loop iterations of
-    ``_ensure_coverage`` when nothing about it was touched (e.g. confirmed
-    non-speech)."""
+    """Rounding helper for logging/diagnostics only — NOT used for dedup
+    membership any more (see ``_overlaps_checked``): exact-key equality
+    under-catches, because splicing a retry's result back into the timeline
+    shifts the REMAINING gap's edges by a fraction of a second on the very
+    next outer-loop iteration (see that function's docstring for the
+    measured example), so the "same" unresolved hole almost never recurs
+    bit-for-bit."""
     return (round(start, 3), round(end, 3))
+
+
+# How much of a CANDIDATE window must already be covered by something in
+# ``checked`` — as a fraction of the CANDIDATE's own length — before it's
+# treated as "already checked" rather than a genuinely new recheck target.
+#
+# Exact-boundary equality (the ORIGINAL memoisation rule) is the trivial
+# 100%-overlap case but isn't enough on its own: splicing a retry's result
+# back into the timeline shifts the REMAINING gap's edges by a fraction of
+# a second (a decode-loop leaves a slightly different confirmed segment on
+# either side depending on exactly where the retry's own output got
+# clipped — see ``_clip_to_gap``), so the "same" unresolved hole reappears
+# as a slightly different ``(start, end)`` pair on the next outer-loop
+# iteration and an exact key match never fires again. Measured live in job
+# ``r56sj0_o1ihv``: THREE separate rechecks spent on what was really one
+# ~22s hole — ``469s-490s``, then ``468s-490s``, then ``467s-490s`` — each
+# consecutive pair overlapping the other by more than 90% of the shorter
+# window's length, burning 3 slots of a 12-slot budget on a hole that
+# needed exactly ONE.
+#
+# 0.8 sits below that measured >90% floor with real margin, while still
+# requiring MOST of a CANDIDATE window to coincide with something already
+# checked before two genuinely distinct suspicious intervals could ever be
+# confused for the same one — and two such intervals that touched or
+# overlapped at all would already have been folded into one by
+# ``_merge_intervals`` upstream, so two windows surviving as separate
+# ``_suspicious_windows`` entries in the first place are already either
+# non-overlapping or overlapping only slightly.
+_WINDOW_OVERLAP_DEDUP_FRACTION = 0.8
+
+
+def _overlaps_checked(
+    window: tuple[float, float], checked: list[tuple[float, float]]
+) -> bool:
+    """True when at least ``_WINDOW_OVERLAP_DEDUP_FRACTION`` of ``window``
+    (the CANDIDATE, about to become a new recheck) is already covered by
+    some interval in ``checked`` — see that constant's own docstring for
+    why exact-key equality isn't enough.
+
+    Deliberately measured against the CANDIDATE's own length, NOT
+    ``min(candidate, checked)`` — that symmetric form has a real coverage
+    hole in the opposite direction from the one this function exists to
+    fix: a LARGE new candidate that merely *contains* a small
+    already-checked interval (e.g. checked has a 10s slice at
+    ``(400, 410)``, and splicing produces a fresh 90s candidate
+    ``(400, 490)``) would read as "already checked" under ``min()``
+    (overlap 10s / min(90, 10) = 1.0), silently skipping the 80s that were
+    NEVER actually examined — the same class of bug (memoisation answering
+    the wrong question) this function was written to fix, just inverted.
+    Measuring against the candidate's own length instead means a small
+    candidate fully inside a large checked interval still suppresses
+    (overlap equals the candidate's whole length, ratio 1.0), while a large
+    candidate that only partially overlaps a small checked interval does
+    NOT (10s / 90s = 0.11, well under the threshold) — the asymmetry is the
+    point, since the question is "is this candidate mostly already
+    covered", which is a property of the candidate, not of whichever
+    interval happens to be shorter.
+    """
+    start, end = window
+    length = end - start
+    if length <= 0:
+        return True
+    for c_start, c_end in checked:
+        overlap = min(end, c_end) - max(start, c_start)
+        if overlap <= 0:
+            continue
+        if overlap / length >= _WINDOW_OVERLAP_DEDUP_FRACTION:
+            return True
+    return False
 
 
 def _pending_slices(
     working: list[dict[str, Any]],
     window_duration: float,
-    checked: set[tuple[float, float]],
-) -> list[tuple[float, float, bool]]:
+    checked: list[tuple[float, float]],
+) -> tuple[list[tuple[float, float, bool]], list[tuple[float, float]]]:
     """Every re-checkable ``(slice_start, slice_end, is_leading)`` still
     worth asking Whisper about: suspicious windows above the cost cutoff
     (``_MIN_RECHECK_SECONDS``), split into ``_MAX_RECHECK_SLICE_SECONDS``
     slices so no single recheck request ever covers more than that, minus
-    whatever's already in ``checked`` this call.
+    whatever overlaps something already in ``checked`` beyond
+    ``_WINDOW_OVERLAP_DEDUP_FRACTION`` (see ``_overlaps_checked``).
+
+    Returns ``(pending, suppressed)`` — the still-open slices, and the
+    ones filtered out specifically because they matched something already
+    checked (as opposed to being below the cost cutoff, which isn't
+    "suppressed", just never a recheck candidate at all). The caller uses
+    ``suppressed`` only for diagnostics — it plays no role in the budget or
+    the loop's termination.
     """
     pending: list[tuple[float, float, bool]] = []
+    suppressed: list[tuple[float, float]] = []
     for start, end in _suspicious_windows(working, window_duration):
         if (end - start) <= _MIN_RECHECK_SECONDS:
             continue
         for slice_start, slice_end, leading in _split_into_slices(
             start, end, _MAX_RECHECK_SLICE_SECONDS
         ):
-            if _window_key(slice_start, slice_end) not in checked:
+            if _overlaps_checked((slice_start, slice_end), checked):
+                suppressed.append((slice_start, slice_end))
+            else:
                 pending.append((slice_start, slice_end, leading))
-    return pending
+    return pending, suppressed
 
 
 def _uncovered_by_confirmed_silence(
@@ -737,6 +1370,182 @@ def _uncovered_by_confirmed_silence(
         if overlap > 0:
             remaining -= overlap
     return max(remaining, 0.0)
+
+
+def _subtract_confirmed_silent(
+    window: tuple[float, float], confirmed_silent: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """``window`` minus every overlapping interval in ``confirmed_silent``,
+    as a list of the ``[start, end)`` pieces still genuinely UNRESOLVED (0,
+    1, or more pieces, depending on how many confirmed-silent intervals cut
+    into the middle of ``window``).
+
+    Used ONLY to decide what Phase 6's restoration
+    (``_restore_unresolved_windows``) is allowed to backfill —
+    ``missing_seconds`` itself is computed with the length-only
+    ``_uncovered_by_confirmed_silence`` above and is NOT affected by this
+    function. The two answer different questions: that one asks "how much
+    of this window is still uncertain" (a number); this one asks "which
+    exact sub-ranges are still uncertain" (so restoration never touches a
+    span a recheck already independently confirmed has no speech in).
+    """
+    pieces = [window]
+    for silent_start, silent_end in confirmed_silent:
+        next_pieces: list[tuple[float, float]] = []
+        for start, end in pieces:
+            if silent_end <= start or silent_start >= end:
+                next_pieces.append((start, end))
+                continue
+            if silent_start > start:
+                next_pieces.append((start, silent_start))
+            if silent_end < end:
+                next_pieces.append((silent_end, end))
+        pieces = next_pieces
+    return [(start, end) for start, end in pieces if end - start > 0]
+
+
+def _restore_unresolved_windows(
+    working: list[dict[str, Any]],
+    original_segments: list[dict[str, Any]],
+    final_windows: list[tuple[float, float]],
+    confirmed_silent: list[tuple[float, float]],
+    *,
+    diagnostics: TranscribeDiagnostics | None,
+    unit_label: str,
+) -> list[dict[str, Any]]:
+    """Owner ruling, 2026-08-28: **"a wrong transcript beats a hole."**
+    Never let a span end up with literally ZERO text once the recheck
+    budget for this unit is exhausted, as long as the FIRST PASS
+    (``original_segments`` — captured in ``_ensure_coverage`` before any
+    recheck splice ran, since a splice can itself remove the original
+    content for a span it only partially resolved) actually produced
+    SOMETHING for it.
+
+    Applies only to the sub-ranges of each still-open ``final_windows``
+    entry that are NOT confirmed non-speech (``_subtract_confirmed_silent``)
+    — a CONFIRMED-silent span is a stronger, different claim (an
+    independent recheck positively established there's no speech there),
+    and restoring the original, already-discarded hallucination over it
+    would reintroduce KNOWN-WRONG content over a span we've actually
+    verified is silent. Those are deliberately left exactly as before this
+    feature existed.
+
+    Does NOT change ``missing_seconds``: the caller computes that from the
+    SAME ``final_windows``/``confirmed_silent`` BEFORE calling this, and it
+    stays exactly as it was before Phase 6 — this only changes which TEXT
+    the caller gets back, never what still counts as uncertain. Where
+    ``original_segments`` has nothing overlapping a sub-range (the first
+    pass genuinely produced nothing there), nothing is restored — there is
+    nothing TO restore, and the span stays open exactly as before.
+
+    Guards against reintroducing a full collapsed run (the ruling's second
+    constraint): the original segments for each sub-range are run back
+    through ``collapse_repeated_segments`` UNCHANGED — the same function,
+    same thresholds, used everywhere else in this module — before anything
+    is spliced in, so a 40x hallucination loop still collapses to its one
+    first-occurrence survivor. Whatever ``collapse_repeated_segments``
+    keeps for the sub-range (normally that one instance; occasionally more
+    than one, e.g. a short repeated line under its own SHORT-run tolerance
+    that never triggered collapse in the first place) is what gets
+    restored, each copy marked ``low_confidence: True`` on the segment
+    dict (a plain, additive key — nothing downstream currently reads it,
+    and JSON-serialises/persists fine alongside ``start``/``end``/
+    ``text``). The LAST restored segment's own ``end`` is extended to the
+    sub-range's end purely so the reader sees continuous, if uncertain,
+    coverage instead of the text stopping short with nothing after it: the
+    timing past that first kept instance was never trustworthy anyway
+    (that is the whole reason the interval was suspicious in the first
+    place), so stretching it doesn't discard anything that was actually
+    known-good.
+
+    One more guard the ruling's second constraint requires in practice:
+    the segment collapse already kept immediately BEFORE this sub-range
+    (its survivor from the SAME run) is usually still sitting in
+    ``working``, untouched, with the identical text we're about to
+    restore. Leaving both would hand a LATER ``collapse_repeated_segments``
+    pass over the whole merged transcript (``transcribe_audio`` runs one,
+    once, at the very end) two adjacent identical-text segments — which is
+    exactly what that function collapses, re-discarding this restoration
+    and silently recreating the hole it exists to prevent. So when that
+    neighbour's text matches, this widens the restored segment's ``start``
+    back to the neighbour's own start (absorbing it into ONE segment)
+    instead of leaving two — the only case this function ever touches a
+    restored segment's ``start``, and it never touches any OTHER kept
+    segment's bounds.
+    """
+    restored: list[dict[str, Any]] = []
+    restored_ranges: list[tuple[float, float]] = []
+    for w_start, w_end in final_windows:
+        if (w_end - w_start) <= _MIN_RECHECK_SECONDS:
+            continue
+        for sub_start, sub_end in _subtract_confirmed_silent(
+            (w_start, w_end), confirmed_silent
+        ):
+            clipped = _clip_to_gap(original_segments, sub_start, sub_end)
+            if not clipped:
+                continue  # first pass genuinely produced nothing here
+            collapsed, _discarded = collapse_repeated_segments(clipped)
+            if not collapsed:
+                continue
+            marked = [dict(seg, low_confidence=True) for seg in collapsed]
+            last = marked[-1]
+            if _segment_end(last) < sub_end:
+                last["end"] = sub_end
+
+            # Whatever already sits in ``working`` immediately before
+            # ``sub_start`` (collapse's own kept survivor of the SAME run,
+            # in the common case) must not be left standing right next to
+            # our restored segment if the two share identical text — a
+            # LATER collapse_repeated_segments pass over the whole merged
+            # transcript operates purely on adjacent text equality and
+            # would treat that pair as the run continuing, re-discarding
+            # our restoration and recreating the exact hole this function
+            # exists to prevent. So absorb it instead: widen this
+            # restored segment's OWN start back to the neighbour's start
+            # (same text either way, just one segment instead of two) and
+            # mark the neighbour's span as replaced too.
+            range_start = sub_start
+            left_neighbor = _segment_ending_at(working, sub_start)
+            if left_neighbor is not None and str(
+                left_neighbor.get("text") or ""
+            ) == str(marked[0].get("text") or ""):
+                range_start = _segment_start(left_neighbor)
+                marked[0] = dict(marked[0], start=range_start)
+
+            restored.extend(marked)
+            restored_ranges.append((range_start, sub_end))
+            if diagnostics is not None:
+                diagnostics.record_backfill(unit=unit_label, start=sub_start, end=sub_end)
+            log.warning(
+                "transcribe: %s backfilled ~%.0fs at %.0fs-%.0fs with "
+                "low-confidence first-pass text instead of leaving a hole "
+                "(recheck never resolved this span)",
+                unit_label, sub_end - sub_start, sub_start, sub_end,
+            )
+    if not restored:
+        return working
+
+    # A sub-range this function restores may still hold its OWN untouched
+    # original content in ``working`` (e.g. recut_unavailable / budget-
+    # exhausted never spliced anything, so the raw — possibly still-
+    # looping — first-pass segments are still sitting there): drop
+    # anything overlapping a restored range before adding the collapsed +
+    # low_confidence replacement, or the raw duplicate run would coexist
+    # right alongside its own cleaned-up stand-in. A range whose splice
+    # already ran (decode_loop_again) has nothing left in ``working`` for
+    # this exact sub-range in the first place (that's WHY it's still a gap
+    # here), so this is a no-op for that case — never a double-removal.
+    def _overlaps_any_restored_range(seg: dict[str, Any]) -> bool:
+        s, e = _segment_start(seg), _segment_end(seg)
+        return any(s < r_end and e > r_start for r_start, r_end in restored_ranges)
+
+    pruned = [seg for seg in working if not _overlaps_any_restored_range(seg)]
+    combined = sorted(pruned + restored, key=_segment_start)
+    assert _is_monotonic_by_start(combined), (
+        "transcribe: Phase 6 backfill produced a non-monotonic segment "
+        "list — bug in _restore_unresolved_windows, not the transcript"
+    )
+    return combined
 
 
 # --- "did a re-checked window come back as CONFIRMED non-speech?" -----------
@@ -903,13 +1712,14 @@ def _clip_to_gap(
         end = _segment_end(seg)
         if end <= gap_start or start >= gap_end:
             continue  # entirely inside the backoff margin — drop, don't keep
-        clipped.append(
-            {
-                "start": max(start, gap_start),
-                "end": min(end, gap_end),
-                "text": seg["text"],
-            }
-        )
+        # dict(seg, ...) — NOT a fresh {"start"/"end"/"text"} literal —
+        # preserves any OTHER key the segment carries (e.g. Phase 6's
+        # low_confidence flag on a restored segment fed back through this
+        # function) instead of silently stripping it. Measured regression:
+        # the original {"start":...,"end":...,"text":...} literal here
+        # dropped low_confidence on every segment that passed through a
+        # coverage-recheck splice.
+        clipped.append(dict(seg, start=max(start, gap_start), end=min(end, gap_end)))
     clipped.sort(key=_segment_start)
     return clipped
 
@@ -932,6 +1742,9 @@ async def _ensure_coverage(
     source_path: Path,
     window_duration: float,
     per_job_lock: asyncio.Semaphore,
+    diagnostics: TranscribeDiagnostics | None = None,
+    unit_label: str = "whole",
+    language: str | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """Check ``segments`` (a LOCAL timeline starting at 0) against
     ``window_duration`` seconds of ``source_path``: re-transcribe every
@@ -940,11 +1753,19 @@ async def _ensure_coverage(
     what comes back, whether it was real speech, confirmed non-speech, or
     still unresolved.
 
+    ``language``, when given, is pinned on every recheck request this call
+    makes (see ``_call_whisper``/``_post_audio``) instead of letting each
+    recheck auto-detect independently on its own small, more ambiguous
+    slice — the caller already knows the language from the unit's own
+    first-pass request; see the module docstring's "Language is detected
+    once per call, then pinned" section.
+
     Returns ``(segments, missing_seconds)`` — the (possibly patched-up)
     segment list to use, and the summed length of every suspicious
-    interval that's STILL open once the budget (``_MAX_COVERAGE_RECHECKS``)
-    runs out, MINUS whatever length was CONFIRMED as non-speech along the
-    way (that doesn't count as missing — see ``_is_confirmed_silence``). A
+    interval that's STILL open once this call's budget
+    (``_coverage_recheck_budget(window_duration)``) runs out, MINUS
+    whatever length was CONFIRMED as non-speech along the way (that
+    doesn't count as missing — see ``_is_confirmed_silence``). A
     degenerate repeated run on a recheck is deliberately never subtracted
     this way — see the module docstring's regression writeup. Segments are
     returned UNCOLLAPSED (the caller's final ``collapse_repeated_segments``
@@ -953,12 +1774,15 @@ async def _ensure_coverage(
 
     There is deliberately no size-based correctness gate here anymore (see
     the module docstring): every interval above the cost cutoff gets
-    rechecked, in descending size order, up to the budget. A slice
-    already rechecked THIS call is never asked again (the ``checked`` set)
-    — a deterministic decoder given the exact same audio has no reason to
-    answer differently — which combined with the budget guarantees this
-    loop terminates regardless of how many distinct suspicious intervals —
-    or how large any one of them is — a pathological transcript produces.
+    rechecked, in descending size order, up to the budget. A slice that
+    overlaps one already rechecked THIS call beyond
+    ``_WINDOW_OVERLAP_DEDUP_FRACTION`` is never asked again (the
+    ``checked`` list, tested via ``_overlaps_checked`` — NOT exact-key
+    equality; see that constant's docstring for why) — a deterministic
+    decoder given the exact same audio has no reason to answer differently
+    — which combined with the budget guarantees this loop terminates
+    regardless of how many distinct suspicious intervals — or how large
+    any one of them is — a pathological transcript produces.
 
     Each recheck re-cuts ``source_path`` over a window that is ASYMMETRIC
     around the slice: ``_PREFIX_DISTRUST_SECONDS`` (30s) before
@@ -977,13 +1801,31 @@ async def _ensure_coverage(
     timestamps, so the prefix immediately before a gap can't be trusted
     just because it technically has no gap of its own.
 
+    When this call has a PINNED language (``language`` above), a
+    CONFIRMED-non-speech verdict is not trusted on its own first: the pin
+    itself can be the reason nothing usable came back — measured live
+    (job r56sj0_o1ihv, forced ``language="de"``): a stretch with real
+    dialogue decoded under the pin collapsed to bare punctuation, while an
+    auto-detected pass over the EXACT SAME audio recovered real text. So a
+    confirmed-silent verdict under a pin triggers ONE extra Whisper call —
+    the SAME cut, re-asked with ``language=None`` — before concluding
+    anything (owner ruling: "a wrong transcript beats a hole"). This is
+    not a new recheck slot (bounded by the SAME per-unit budget as every
+    other recheck, never a separate/unbounded pass) and is skipped
+    entirely when there's no pin to begin with (re-asking with the
+    identical language would just reproduce the identical request). See
+    ``TranscribeDiagnostics.record_recheck``'s docstring for the two
+    verdicts this can produce (``"recovered_unpinned"`` /
+    ``"confirmed_non_speech_both_ways"``).
+
     What comes back is classified three ways, not two:
 
     - CONFIRMED non-speech (``_is_confirmed_silence`` — empty, punctuation-
-      only, or entirely bracket/asterisk/paren annotations): nothing is
-      spliced, the interval is recorded as confirmed-silent so the final
-      ``missing_seconds`` accounting excludes it, logged as "not lost
-      content".
+      only, or entirely bracket/asterisk/paren annotations — under the
+      pinned language AND, if one was pinned, again under auto-detect):
+      nothing is spliced, the interval is recorded as confirmed-silent so
+      the final ``missing_seconds`` accounting excludes it, logged as "not
+      lost content".
     - A DEGENERATE REPEATED RUN within the recheck's OWN segments (reusing
       ``collapse_repeated_segments`` directly): this is NOT confirmed
       non-speech — it means the recheck reproduced the same kind of
@@ -1023,21 +1865,44 @@ async def _ensure_coverage(
         return segments, 0.0
 
     working = list(segments)
+    # Snapshot of what the FIRST PASS actually produced, before any recheck
+    # splice touches ``working`` — kept immutable for the rest of this call
+    # so the Phase 6 restoration pass at the end (``_restore_unresolved_windows``)
+    # can recover it even for a window whose splice already replaced the
+    # original content with a partial retry recovery (see that function's
+    # own docstring for why ``working`` alone isn't enough).
+    original_segments = list(segments)
     assert _is_monotonic_by_start(working), (
         "transcribe: input segments went backward in time by start "
         "(bug upstream of _ensure_coverage, not this function)"
     )
-    checked: set[tuple[float, float]] = set()
+    budget = _coverage_recheck_budget(window_duration)
+    checked: list[tuple[float, float]] = []
+    # Suppressed windows already reported to diagnostics THIS call — a
+    # window that keeps overlapping ``checked`` shows up in ``suppressed``
+    # on every outer-loop iteration until ``pending`` is empty (see
+    # _pending_slices), so this avoids logging the same suppression
+    # repeatedly while other, still-open windows keep the loop going.
+    logged_suppressions: set[tuple[float, float]] = set()
     confirmed_silent: list[tuple[float, float]] = []
     rechecks = 0
 
-    while rechecks < _MAX_COVERAGE_RECHECKS:
-        pending = _pending_slices(working, window_duration, checked)
+    while rechecks < budget:
+        pending, suppressed = _pending_slices(working, window_duration, checked)
+        if diagnostics is not None:
+            for s_start, s_end in suppressed:
+                key = _window_key(s_start, s_end)
+                if key in logged_suppressions:
+                    continue
+                logged_suppressions.add(key)
+                diagnostics.record_overlap_suppressed(
+                    unit=unit_label, start=s_start, end=s_end
+                )
         if not pending:
             break
 
         gap_start, gap_end, leading = max(pending, key=lambda w: w[1] - w[0])
-        checked.add(_window_key(gap_start, gap_end))
+        checked.append((gap_start, gap_end))
         rechecks += 1
 
         # The retry TARGET is wider than the slice itself on the leading
@@ -1064,6 +1929,11 @@ async def _ensure_coverage(
             # Nothing meaningful left to re-transcribe; leave it unresolved
             # (counted in the final accounting below) and move on to
             # whatever else is pending.
+            if diagnostics is not None:
+                diagnostics.record_recheck(
+                    unit=unit_label, index=rechecks, of=budget,
+                    start=gap_start, end=gap_end, verdict="skipped_too_small",
+                )
             continue
 
         cut_path = await asyncio.to_thread(
@@ -1073,8 +1943,13 @@ async def _ensure_coverage(
             log.warning(
                 "transcribe: coverage recheck %d/%d couldn't re-cut audio for "
                 "a ~%.0fs slice at %.0fs; leaving it unresolved",
-                rechecks, _MAX_COVERAGE_RECHECKS, gap_end - gap_start, gap_start,
+                rechecks, budget, gap_end - gap_start, gap_start,
             )
+            if diagnostics is not None:
+                diagnostics.record_recheck(
+                    unit=unit_label, index=rechecks, of=budget,
+                    start=gap_start, end=gap_end, verdict="recut_unavailable",
+                )
             continue
 
         try:
@@ -1082,22 +1957,61 @@ async def _ensure_coverage(
             # time — see _call_whisper's docstring for why this keeps the
             # per-job semaphore uncontended in practice while still holding
             # it explicitly on every call.
-            payload = await _call_whisper(per_job_lock, cut_path)
+            payload = await _call_whisper(per_job_lock, cut_path, language=language)
+            retry_result = _parse_payload(payload, total_duration=cut_duration)
+
+            # A PINNED language can itself cost us content: measured live
+            # (job r56sj0_o1ihv, forced language="de") — a stretch with
+            # real dialogue decoded under the pinned language collapsed to
+            # bare punctuation, which _is_confirmed_silence correctly read
+            # as "nothing here" for THAT decode, while an auto-detected
+            # pass over the EXACT SAME audio recovered real text. Owner
+            # ruling: "a wrong transcript beats a hole" — before concluding
+            # anything, retry this SAME cut once with auto-detect
+            # (language=None). Only when a language was actually pinned
+            # (retrying with the identical language would just reproduce
+            # the identical request) and only when the pinned attempt
+            # itself came back confirmed-silent (a normal recovery/
+            # decode-loop verdict below is not second-guessed — the pin
+            # already produced something usable). Reuses cut_path — the
+            # AUDIO is unaffected by the language parameter, only the
+            # DECODE differs, so this costs one extra Whisper call, never
+            # a second ffmpeg cut. Not a new recheck slot: it verifies
+            # THIS slot's verdict rather than opening a new suspicious
+            # window, so it is bounded by the SAME per-unit budget as
+            # every other recheck (at most one extra call per recheck that
+            # happens to land on confirmed-silence under a pin) — never an
+            # unbounded second pass.
+            used_unpinned_retry = False
+            if language and _is_confirmed_silence(retry_result.segments):
+                unpinned_payload = await _call_whisper(per_job_lock, cut_path, language=None)
+                unpinned_result = _parse_payload(unpinned_payload, total_duration=cut_duration)
+                if not _is_confirmed_silence(unpinned_result.segments):
+                    retry_result = unpinned_result
+                    used_unpinned_retry = True
+                # else: confirmed silent under BOTH the pinned AND the
+                # auto-detected decode — genuinely nothing there, not a
+                # language artifact of the pin.
         finally:
             cut_path.unlink(missing_ok=True)
             with contextlib.suppress(OSError):
                 cut_path.parent.rmdir()
 
-        retry_result = _parse_payload(payload, total_duration=cut_duration)
-
         if _is_confirmed_silence(retry_result.segments):
             confirmed_silent.append((gap_start, gap_end))
+            verdict = "confirmed_non_speech_both_ways" if language else "confirmed_non_speech"
             log.info(
                 "transcribe: coverage recheck %d/%d at %.0fs-%.0fs came back "
-                "confirmed non-speech (empty/punctuation/annotation) — not "
+                "confirmed non-speech (empty/punctuation/annotation)%s — not "
                 "lost content",
-                rechecks, _MAX_COVERAGE_RECHECKS, gap_start, gap_end,
+                rechecks, budget, gap_start, gap_end,
+                " even after an unpinned retry" if language else "",
             )
+            if diagnostics is not None:
+                diagnostics.record_recheck(
+                    unit=unit_label, index=rechecks, of=budget,
+                    start=gap_start, end=gap_end, verdict=verdict,
+                )
             continue
 
         # NOT confirmed silence. Check for a degenerate repeated run — a
@@ -1116,20 +2030,34 @@ async def _ensure_coverage(
             retry_result.segments
         )
         if retry_discarded:
+            verdict = "recovered_unpinned" if used_unpinned_retry else "decode_loop_again"
             log.warning(
                 "transcribe: coverage recheck %d/%d at %.0fs-%.0fs hit a "
-                "decode-loop again — kept the recognized portion up to the "
-                "loop; remainder stays unresolved, NOT confirmed silent",
-                rechecks, _MAX_COVERAGE_RECHECKS, gap_start, gap_end,
+                "decode-loop again%s — kept the recognized portion up to "
+                "the loop; remainder stays unresolved, NOT confirmed silent",
+                rechecks, budget, gap_start, gap_end,
+                " (via an unpinned retry)" if used_unpinned_retry else "",
             )
+            if diagnostics is not None:
+                diagnostics.record_recheck(
+                    unit=unit_label, index=rechecks, of=budget,
+                    start=gap_start, end=gap_end, verdict=verdict,
+                )
             retry_segments_source = collapsed_retry
         else:
             retry_segments_source = retry_result.segments
+            verdict = "recovered_unpinned" if used_unpinned_retry else "recovered_real_speech"
             log.info(
                 "transcribe: coverage recheck %d/%d recovered real speech at "
-                "%.0fs-%.0fs",
-                rechecks, _MAX_COVERAGE_RECHECKS, gap_start, gap_end,
+                "%.0fs-%.0fs%s",
+                rechecks, budget, gap_start, gap_end,
+                " (via an unpinned retry)" if used_unpinned_retry else "",
             )
+            if diagnostics is not None:
+                diagnostics.record_recheck(
+                    unit=unit_label, index=rechecks, of=budget,
+                    start=gap_start, end=gap_end, verdict=verdict,
+                )
 
         retried_segments_raw = [
             {
@@ -1178,6 +2106,20 @@ async def _ensure_coverage(
         for start, end in final_windows
         if (end - start) > _MIN_RECHECK_SECONDS
     )
+    # Phase 6 (owner ruling, 2026-08-28): "a wrong transcript beats a
+    # hole" — missing (above) is the internal uncertainty signal and is
+    # UNCHANGED by this step (computed from the exact same final_windows/
+    # confirmed_silent, before any restoration). What follows only changes
+    # which SEGMENTS get returned to the caller, never what still counts as
+    # uncertain — see _restore_unresolved_windows's own docstring.
+    working = _restore_unresolved_windows(
+        working,
+        original_segments,
+        final_windows,
+        confirmed_silent,
+        diagnostics=diagnostics,
+        unit_label=unit_label,
+    )
     return working, missing
 
 
@@ -1220,8 +2162,19 @@ def _cut_audio_segment(src_path: Path, start: float, duration: float) -> Path | 
     return out
 
 
-async def _post_audio(audio_path: Path) -> dict[str, Any]:
-    """POST one audio file to the transcription endpoint, return parsed JSON."""
+async def _post_audio(audio_path: Path, *, language: str | None = None) -> dict[str, Any]:
+    """POST one audio file to the transcription endpoint, return parsed JSON.
+
+    ``language`` (an ISO-639-1-ish code, e.g. ``"de"``) is sent as the
+    request's ``language`` form field when given, omitted entirely when
+    ``None`` (auto-detect). Confirmed empirically against the LocalAI/
+    whisper.cpp backend this project targets: the field is genuinely
+    CONSUMED for decoding, not just echoed back in the response — sending
+    an intentionally-garbage value measurably changed the transcribed
+    text, which a pure echo could not do. See the module docstring's
+    "Language is detected once per call, then pinned" section for why this
+    is only sent on requests AFTER the first one for a given call.
+    """
     cfg = get_config().whisper
     endpoint = f"{cfg.base_url.rstrip('/')}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {cfg.effective_api_key}"}
@@ -1229,6 +2182,8 @@ async def _post_audio(audio_path: Path) -> dict[str, Any]:
     with audio_path.open("rb") as fh:
         files = {"file": (audio_path.name, fh, "application/octet-stream")}
         data = {"model": cfg.model, "response_format": "verbose_json"}
+        if language:
+            data["language"] = language
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(endpoint, headers=headers, data=data, files=files)
             r.raise_for_status()
@@ -1439,6 +2394,8 @@ def _normalise_segments(raw: Any) -> list[dict[str, Any]]:
 
 __all__ = [
     "transcribe_audio",
+    "ChunkingDiagnostics",
+    "TranscribeDiagnostics",
     "TranscribeResult",
     "transcript_is_unusable",
     "probe_duration",

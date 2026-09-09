@@ -28,6 +28,9 @@ const filterStatus = /** @type {HTMLSelectElement} */ (
 const filterKind = /** @type {HTMLSelectElement} */ (
   document.getElementById("filter-kind")
 );
+const filterSearch = /** @type {HTMLInputElement | null} */ (
+  document.getElementById("filter-search")
+);
 /** @type {JobSummary[]} */
 let allJobs = [];
 // Total matching jobs on the daemon, from the last JobListResponse.total —
@@ -38,6 +41,19 @@ let lastTotal = 0;
 
 filterStatus.addEventListener("change", () => refetch());
 filterKind.addEventListener("change", () => refetch());
+
+// Debounce the search box — one refetch per pause in typing, not one per
+// keystroke. 300ms is short enough to feel live, long enough that a normal
+// typing cadence doesn't fire a request per character.
+const SEARCH_DEBOUNCE_MS = 300;
+let searchDebounceId = /** @type {number | null} */ (null);
+filterSearch?.addEventListener("input", () => {
+  if (searchDebounceId !== null) clearTimeout(searchDebounceId);
+  searchDebounceId = setTimeout(() => {
+    searchDebounceId = null;
+    refetch();
+  }, SEARCH_DEBOUNCE_MS);
+});
 
 // ---------------------------------------------------------------------------
 // Multi-select (export bundle) — selection is a Set of job ids kept here in
@@ -399,6 +415,10 @@ async function refetch() {
     const params = {
       status: statuses,
       kind: filterKind.value || undefined,
+      // Empty/whitespace box means "no filtering" — daemon-client.js's
+      // listJobs() also trims + drops empty, this is just the same intent
+      // expressed at the call site so `undefined` (not `""`) reaches it.
+      q: filterSearch?.value.trim() || undefined,
       limit: 500,
     };
     const resp = await daemon.listJobs(params);
@@ -528,7 +548,15 @@ function renderActions(j) {
     j.status === "failed"
       ? `<button data-action="retry" data-id="${escapeHtml(j.id)}">Retry</button>`
       : "";
-  return `${open}${retry}${del}`;
+  // Diagnostics are only ever recorded for a Whisper-transcribed job (see
+  // storage/migrations.py v10) — showing the button only there avoids an
+  // always-present control that just says "nothing recorded" for every
+  // page/PDF/YouTube-caption job in the library.
+  const diagnostics =
+    j.status === "done" && j.transcript_source === "whisper"
+      ? `<button data-action="diagnostics" data-id="${escapeHtml(j.id)}">Diagnostics</button>`
+      : "";
+  return `${open}${retry}${diagnostics}${del}`;
 }
 
 /**
@@ -556,6 +584,38 @@ async function handleAction(action, id) {
     } catch (err) {
       alert(`Retry failed: ${stringifyError(err)}`);
     }
+  } else if (action === "diagnostics") {
+    await downloadJobDiagnostics(id);
+  }
+}
+
+/**
+ * Fetch a job's persisted Whisper diagnostic record and trigger a download
+ * of the JSON — the library's equivalent of the options page's "Build
+ * diagnostics report" copy/save flow, just scoped to one job and download-
+ * only (no separate preview step). Safe to hand to someone else — same
+ * privacy posture as the daemon-wide diagnostics report (no cookies, no
+ * transcript text — see api/jobs.py's GET /jobs/{id}/diagnostics).
+ * @param {string} id
+ */
+async function downloadJobDiagnostics(id) {
+  try {
+    const report = await daemon.getJobDiagnostics(id);
+    if (!report.available) {
+      alert("No diagnostics were recorded for this job.");
+      return;
+    }
+    const blob = new Blob([JSON.stringify(report, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tldr-diagnostics-${id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert(`Failed to fetch diagnostics: ${stringifyError(err)}`);
   }
 }
 

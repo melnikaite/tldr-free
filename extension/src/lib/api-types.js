@@ -13,7 +13,7 @@
 
 /** @typedef {"queued" | "running" | "done" | "failed"} JobStatus */
 
-/** @typedef {"youtube_api" | "youtube_auto_captions" | "whisper" | "page_extract" | "trafilatura" | "pdf_text" | "pdf_vision"} TranscriptSource */
+/** @typedef {"youtube_api" | "youtube_auto_captions" | "site_captions" | "whisper" | "page_extract" | "trafilatura" | "pdf_text" | "pdf_vision"} TranscriptSource */
 
 // ---------------------------------------------------------------------------
 // Cookie (forwarded from chrome.cookies.getAll)
@@ -102,6 +102,12 @@
  */
 
 /**
+ * @typedef {object} LowConfidenceRange
+ * @property {number} start_seconds - original audio timeline, seconds
+ * @property {number} end_seconds   - original audio timeline, seconds
+ */
+
+/**
  * Response of GET /jobs/{id}/transcript?lang=…
  *
  * When ``is_pending`` is true, ``text`` is null and the UI should show a
@@ -124,10 +130,20 @@
  *   partial_summary: string | null,
  *   transcript_language: string | null,
  *   transcript_translations: TranscriptTranslationSummary[],
+ *   low_confidence_ranges: LowConfidenceRange[],
  *   alt_media_candidates: MediaCandidate[],
  *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
  *   whisper_queue_position?: number | null
  * }} JobDetails
+ *
+ * ``low_confidence_ranges`` are contiguous spans (original audio timeline,
+ * seconds) merged from Whisper segments the daemon flagged
+ * ``low_confidence`` (see daemon ``workers.transcribe._restore_unresolved_
+ * windows`` / ``api.jobs._derive_low_confidence_ranges``). Empty for
+ * legacy jobs, non-Whisper jobs, and fully-resolved Whisper transcripts.
+ * The transcript view marks any rendered cue whose timestamp falls inside
+ * one of these ranges — applies unchanged across every language since the
+ * ranges are time-based, not text-based.
  *
  * ``queued_reason`` mirrors daemon ``Job.queued_reason``. Only meaningful
  * when ``status === "queued"`` — explains why the transcript fast path
@@ -165,6 +181,63 @@
 /**
  * @typedef {object} JobDeleteResponse
  * @property {number} deleted
+ */
+
+// ---------------------------------------------------------------------------
+// GET /jobs/{id}/diagnostics — a persisted, per-job Whisper diagnostic
+// record, distinct from GET /diagnostics (DiagnosticsResponse below, a
+// daemon-wide health/config report). Answers "what happened during THIS
+// job's transcription" — chunking decision, every coverage-recheck window
+// with its verdict, backend/model, yt-dlp version — so a bad Whisper result
+// can be diagnosed without reading rotating logs by hand. Same privacy
+// posture as GET /diagnostics: never contains cookies or transcript text,
+// safe to hand to someone else.
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {object} JobDiagnosticsChunking
+ * @property {boolean} chunked
+ * @property {number | null} [audio_size_bytes]
+ * @property {number | null} [max_upload_bytes]
+ * @property {number | null} [num_chunks]
+ * @property {number | null} [chunk_seconds]
+ * @property {string} [reason]
+ */
+
+/**
+ * @typedef {"recovered_real_speech" | "confirmed_non_speech" | "decode_loop_again" | "recut_unavailable" | "skipped_too_small"} JobDiagnosticsVerdict
+ */
+
+/**
+ * One coverage-recheck window and its verdict. `unit` is `"whole"` for an
+ * unchunked transcription or `"chunk N/M"` for a chunked one.
+ * `window_start`/`window_end` are seconds into the original audio's
+ * timeline.
+ *
+ * @typedef {object} JobDiagnosticsCoverageRecheck
+ * @property {string} unit
+ * @property {number} index
+ * @property {number} of
+ * @property {number} window_start
+ * @property {number} window_end
+ * @property {JobDiagnosticsVerdict} verdict
+ */
+
+/**
+ * `available=false` (every other field null/empty) for a job that was
+ * never Whisper-transcribed, or was transcribed before this feature
+ * existed — both read as "nothing to show", not an error.
+ *
+ * @typedef {object} JobDiagnosticsResponse
+ * @property {string} job_id
+ * @property {boolean} available
+ * @property {JobDiagnosticsChunking | null} [chunking]
+ * @property {JobDiagnosticsCoverageRecheck[]} [coverage_rechecks]
+ * @property {number | null} [max_coverage_rechecks]
+ * @property {number | null} [final_missing_seconds]
+ * @property {string | null} [whisper_backend_base_url]
+ * @property {string | null} [whisper_model]
+ * @property {string | null} [yt_dlp_version]
  */
 
 // ---------------------------------------------------------------------------

@@ -83,7 +83,18 @@ def test_configure_logging_is_idempotent_no_handler_leak(tmp_path: Path) -> None
         assert len(managed) == 1, f"{name!r} accumulated {len(managed)} managed handlers"
 
 
-def test_configure_logging_native_detaches_stdio_stream_handlers(tmp_path: Path) -> None:
+def test_configure_logging_native_detaches_stdio_stream_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This test exercises the NATIVE branch specifically — it must force
+    # _is_container() to False the same way
+    # test_configure_logging_container_mode_keeps_stdio_handler forces it to
+    # True, since these tests run inside the daemon container where
+    # _is_container() genuinely returns True (paths.CONTAINER_DATA exists).
+    # Without this, the native branch never executes and the assertion below
+    # would pass for the wrong reason (or fail, depending on handler
+    # ordering) rather than actually verifying native-mode detachment.
+    monkeypatch.setattr(logging_setup, "_is_container", lambda: False)
     config = _cfg(tmp_path)
     root = logging.getLogger()
     stream_handler = logging.StreamHandler(sys.stderr)
@@ -109,7 +120,15 @@ def test_configure_logging_container_mode_keeps_stdio_handler(
         root.removeHandler(stream_handler)
 
 
-def test_truncate_legacy_launchd_logs_once(tmp_path: Path) -> None:
+def test_truncate_legacy_launchd_logs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same reasoning as test_configure_logging_native_detaches_stdio_stream_
+    # handlers above: this exercises the NATIVE-only truncation path, but
+    # runs inside the daemon container where _is_container() is True by
+    # default — force it False, symmetric with
+    # test_truncate_legacy_launchd_logs_noop_in_container forcing it True.
+    monkeypatch.setattr(logging_setup, "_is_container", lambda: False)
     config = _cfg(tmp_path)
     out_log = tmp_path / "daemon.out.log"
     err_log = tmp_path / "daemon.err.log"

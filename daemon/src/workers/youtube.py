@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -536,6 +537,15 @@ def _pick_subtitle_lang(
 ) -> str | None:
     """Choose the best caption language from what's available.
 
+    Shared by both callers of ``_download_subtitles_sync``: YouTube (many
+    machine-translated ``automatic_captions`` alongside real tracks) and
+    generic sites reached via the media pipeline (typically exactly one
+    manually-created track and no ``automatic_captions`` at all — ZDF, ARD,
+    Vimeo, TED, Coursera, …). Nothing here is YouTube-specific: it reasons
+    purely over the ``available``/``manual`` dicts yt-dlp hands back for any
+    extractor, so the generic case is just the priority chain's tail (steps
+    1-3 rarely match with a single foreign-language track; step 4 picks it).
+
     Priority order:
       1. original-language track (whatever language the video is in)
       2. user-configured preferences (``youtube.subtitle_lang_preferences``), in order
@@ -599,6 +609,89 @@ def _parse_subtitle_json3(path: Path) -> list[dict[str, Any]]:
 _NON_CAPTION_SUBTITLE_KEYS = frozenset({"live_chat"})
 
 
+_VTT_TIME_RE = re.compile(r"(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{1,3})")
+_VTT_CUE_TIMING_RE = re.compile(
+    r"^\s*((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})"
+)
+_VTT_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _vtt_timestamp_to_seconds(ts: str) -> float:
+    """Parse a WebVTT/SRT-style timestamp (``[HH:]MM:SS.mmm`` or ``,mmm``)."""
+    m = _VTT_TIME_RE.fullmatch(ts.strip())
+    if not m:
+        raise ValueError(f"unparseable subtitle timestamp: {ts!r}")
+    hours = int(m.group(1)) if m.group(1) else 0
+    minutes = int(m.group(2))
+    seconds = int(m.group(3))
+    millis = int(m.group(4).ljust(3, "0")[:3])
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
+
+
+def _parse_subtitle_vtt(path: Path) -> list[dict[str, Any]]:
+    """Parse a WebVTT caption file into our segment shape.
+
+    Non-YouTube sites (ZDF, ARD, Vimeo, TED, Coursera, …) publish subtitle
+    tracks yt-dlp can list and fetch, but they're WebVTT/SRT-shaped rather
+    than YouTube's json3 — this is the parser format negotiation
+    (``_download_subtitles_sync``'s ``subtitlesformat``) falls back to.
+
+    Strips cue identifiers, cue settings (``align:``/``position:``/…) and
+    inline markup (``<c>``, ``<00:00:01.360>``) down to plain text, and
+    returns the same shape ``_parse_subtitle_json3`` does:
+    ``[{"start": float, "duration": float, "text": str}, ...]``, so
+    downstream timecode handling (``timecodes.build_marked_text`` etc.)
+    needs no changes to consume either source.
+
+    Blocks that aren't a cue (the ``WEBVTT`` header, ``NOTE``/``STYLE``/
+    ``REGION`` blocks) have no ``-->`` timing line and are silently
+    skipped, as are cues with no text.
+    """
+    raw = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\n+", raw)
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        lines = block.split("\n")
+        timing_idx: int | None = None
+        timing_match: re.Match[str] | None = None
+        for i, line in enumerate(lines):
+            m = _VTT_CUE_TIMING_RE.match(line)
+            if m:
+                timing_idx = i
+                timing_match = m
+                break
+        if timing_match is None or timing_idx is None:
+            continue
+        try:
+            start = _vtt_timestamp_to_seconds(timing_match.group(1))
+            end = _vtt_timestamp_to_seconds(timing_match.group(2))
+        except ValueError:
+            continue
+        text_lines = lines[timing_idx + 1 :]
+        text = " ".join(_VTT_TAG_RE.sub("", line).strip() for line in text_lines)
+        text = " ".join(text.split())
+        if not text:
+            continue
+        out.append(
+            {"start": start, "duration": max(end - start, 0.0), "text": text}
+        )
+    return out
+
+
+# Preference order for ``--sub-format``: json3 first (YouTube's compact
+# format, unchanged behaviour for the YouTube path), WebVTT second (what
+# most non-YouTube sites actually serve). yt-dlp still downloads *something*
+# even when neither is available for a language (it falls back to the last
+# offered format — see ``YoutubeDL.process_subtitles``), so the parser
+# dispatch below keys off the actual downloaded file's extension rather than
+# assuming the preference was honoured.
+_SUBTITLE_FORMAT_PREFERENCE = "json3/vtt"
+_SUBTITLE_PARSERS: dict[str, Callable[[Path], list[dict[str, Any]]]] = {
+    "json3": _parse_subtitle_json3,
+    "vtt": _parse_subtitle_vtt,
+}
+
+
 def _download_subtitles_sync(
     *,
     url: str,
@@ -651,38 +744,57 @@ def _download_subtitles_sync(
             chosen, chosen in manual, chosen in auto, original, url,
         )
 
-        # Pass 2: download in json3 (compact + easy to parse).
+        # Pass 2: download, preferring json3 (YouTube) then falling back to
+        # WebVTT (most non-YouTube sites). yt-dlp still writes *some* format
+        # if neither is on offer for this language (see
+        # ``_SUBTITLE_FORMAT_PREFERENCE``'s docstring above), so the actual
+        # downloaded file's extension — not this preference string — decides
+        # which parser runs.
         out_template = str(dir / "%(id)s.%(ext)s")
         dl_opts = {
             **_ydl_base_opts(cookie_path),
             "skip_download": True,
             "writesubtitles": chosen in manual,
             "writeautomaticsub": chosen not in manual,
-            "subtitlesformat": "json3",
+            "subtitlesformat": _SUBTITLE_FORMAT_PREFERENCE,
             "subtitleslangs": [chosen],
             "outtmpl": out_template,
         }
         with YoutubeDL(dl_opts) as ydl:
             info2 = ydl.extract_info(url, download=True) or {}
 
-        # Locate the produced file. yt-dlp stores it as <id>.<lang>.json3.
+        # Locate the produced file. yt-dlp stores it as <id>.<lang>.<ext>.
         requested = info2.get("requested_subtitles") or {}
         sub_info = requested.get(chosen) or {}
         sub_path_str = sub_info.get("filepath")
         sub_path: Path | None = Path(sub_path_str) if sub_path_str else None
         if sub_path is None or not sub_path.exists():
-            # Fallback: try standard naming convention.
+            # Fallback: try the standard naming convention for each format we
+            # know how to parse, in preference order.
             video_id = info2.get("id")
             if video_id:
-                guess = dir / f"{video_id}.{chosen}.json3"
-                if guess.exists():
-                    sub_path = guess
+                for ext in _SUBTITLE_PARSERS:
+                    guess = dir / f"{video_id}.{chosen}.{ext}"
+                    if guess.exists():
+                        sub_path = guess
+                        break
         if sub_path is None or not sub_path.exists():
             log.warning("yt-dlp subtitles: file not found after download for %s", url)
             return None
 
+        ext = sub_path.suffix.lower().lstrip(".")
+        parser = _SUBTITLE_PARSERS.get(ext)
+        if parser is None:
+            log.info(
+                "yt-dlp subtitles: downloaded format %r for %s has no parser, skipping",
+                ext, url,
+            )
+            with contextlib.suppress(OSError):
+                sub_path.unlink()
+            return None
+
         try:
-            return _parse_subtitle_json3(sub_path)
+            return parser(sub_path)
         finally:
             with contextlib.suppress(OSError):
                 sub_path.unlink()
@@ -701,21 +813,38 @@ async def download_subtitles(
     output_language: str | None = None,
     max_attempts: int = 1,
     backoff_seconds: list[int] | None = None,
+    retry_on_no_track: bool = True,
 ) -> list[dict[str, Any]] | None:
-    """Retry-wrapped async caption fetch — probe, download json3, parse.
+    """Retry-wrapped async caption fetch — probe, download json3/vtt, parse.
 
     An empty/missing caption track, a missing downloaded file, and a parse
-    failure are all treated as retryable: YouTube intermittently
+    failure are all treated as retryable BY DEFAULT: YouTube intermittently
     throttles/bot-checks logged-in sessions (the same video that fails now
     routinely succeeds moments later, cookies unchanged), so a single miss
-    is not proof the video lacks captions.
+    is not proof the video lacks captions. ``retry_on_no_track`` (default
+    ``True``) preserves exactly this behaviour for YouTube's callers.
+
+    That reasoning does not transfer to a generic media page
+    (``pipeline._run_media``): "this URL simply has no subtitle track"
+    reproduces identically on every attempt, so retrying it just burns extra
+    ``extract_info`` probes and backoff sleeps on the common captionless
+    case — a straight latency regression on the majority path, and its own
+    rate-limiting hazard on top. Pass ``retry_on_no_track=False`` there:
+    a *clean* "no usable captions" result (``_download_subtitles_sync``
+    returning ``None`` without raising) is accepted as final after the
+    first attempt. Genuine transient failures — a raised exception, whether
+    from a yt-dlp/network error or a parse failure — are unaffected by this
+    flag and still retried up to ``max_attempts``, since those really can be
+    a one-off blip regardless of site. Do not "simplify" this by unifying
+    the two policies — see the docstring above for why they differ.
 
     The first attempt uses ``cookies`` as given; every subsequent attempt
     drops them, since a cookie-less request has been observed to succeed on
     exactly the videos a cookied one failed on. Between attempts, waits are
     taken from ``backoff_seconds`` (extended with the last value if needed).
 
-    Returns parsed segments, or ``None`` once every attempt is exhausted.
+    Returns parsed segments, or ``None`` once every attempt is exhausted (or
+    immediately, per ``retry_on_no_track``).
     """
     attempts = max(max_attempts, 1)
     waits = list(backoff_seconds or [])
@@ -723,6 +852,7 @@ async def download_subtitles(
     last_segments: list[dict[str, Any]] | None = None
     for attempt in range(1, attempts + 1):
         attempt_cookies = cookies if attempt == 1 else []
+        raised = False
         try:
             last_segments = await asyncio.to_thread(
                 _download_subtitles_sync,
@@ -738,6 +868,7 @@ async def download_subtitles(
                 attempt, attempts, url, bool(attempt_cookies),
             )
             last_segments = None
+            raised = True
 
         if last_segments:
             if attempt > 1:
@@ -751,6 +882,16 @@ async def download_subtitles(
             "yt-dlp subtitles attempt %d/%d: no usable captions for %s (cookies=%s)",
             attempt, attempts, url, bool(attempt_cookies),
         )
+
+        if not raised and not retry_on_no_track:
+            # A clean (non-exception) empty result and this caller has opted
+            # out of retrying that specific outcome — see docstring above.
+            log.info(
+                "yt-dlp subtitles: no track found for %s, not retrying "
+                "(retry_on_no_track=False)", url,
+            )
+            return None
+
         if attempt < attempts:
             wait = waits[min(attempt - 1, len(waits) - 1)] if waits else 1
             await asyncio.sleep(wait)

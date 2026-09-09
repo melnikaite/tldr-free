@@ -12,6 +12,7 @@
  *   JobCreateResponse,
  *   JobDeleteResponse,
  *   JobDetails,
+ *   JobDiagnosticsResponse,
  *   JobImportResponse,
  *   JobListResponse,
  *   JobStatus,
@@ -162,7 +163,7 @@ export const daemon = {
     }),
 
   /**
-   * @param {{ status?: JobStatus[], kind?: string, tag?: string, url?: string, limit?: number, offset?: number }} [params]
+   * @param {{ status?: JobStatus[], kind?: string, tag?: string, url?: string, q?: string, limit?: number, offset?: number }} [params]
    * @param {RequestInit} [init] standard fetch init — pass `{ signal }` for timeout/cancel
    * @returns {Promise<JobListResponse>}
    */
@@ -171,6 +172,9 @@ export const daemon = {
     if (params?.status?.length) qs.set("status", params.status.join(","));
     if (params?.kind) qs.set("kind", params.kind);
     if (params?.url) qs.set("url", params.url);
+    // Trimmed + only set when non-empty: an empty search box must mean "no
+    // filtering", not a literal `q=` sent to the daemon.
+    if (params?.q?.trim()) qs.set("q", params.q.trim());
     if (params?.limit !== undefined) qs.set("limit", String(params.limit));
     if (params?.offset !== undefined) qs.set("offset", String(params.offset));
     const q = qs.toString();
@@ -470,4 +474,18 @@ export const daemon = {
    */
   getDiagnostics: (jobId) =>
     request(`/diagnostics${jobId ? `?job_id=${encodeURIComponent(jobId)}` : ""}`),
+
+  /**
+   * Fetch the persisted, per-job Whisper diagnostic record — distinct from
+   * `getDiagnostics` above (that's the daemon-wide health report; this is
+   * "what happened during THIS job's transcription": chunking decision,
+   * every coverage-recheck window + verdict, backend/model, yt-dlp
+   * version). `available: false` in the response means the job was never
+   * Whisper-transcribed or predates this feature, not an error. Same
+   * privacy posture — safe to copy/save and hand to someone else.
+   *
+   * @param {string} jobId
+   * @returns {Promise<JobDiagnosticsResponse>}
+   */
+  getJobDiagnostics: (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/diagnostics`),
 };

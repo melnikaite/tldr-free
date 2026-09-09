@@ -107,6 +107,21 @@ whisper:
   # in flight, so whoever holds it keeps it until their own chunk finishes);
   # 2 is the minimum that lets a second job's request actually slip in.
   max_concurrent_requests: 2
+  # Bounds the DURATION of a first-pass chunk, not just its size (see
+  # max_upload_mb above). A chunk sized off the byte cap alone can still be
+  # many minutes long on well-compressed audio — measured live: a 19.2 MB /
+  # 24:56 episode split into 2 chunks of ~748s each purely by the byte cap,
+  # and BOTH collapsed into a Whisper hallucination loop. num_chunks becomes
+  # max(chunks implied by max_upload_mb, chunks implied by this cap).
+  max_chunk_seconds: 300
+  # Coverage-recheck budget per chunk/whole-file unit now SCALES with that
+  # unit's own duration instead of one fixed number for every unit — see
+  # workers/transcribe.py's _coverage_recheck_budget. factor multiplies "how
+  # many 90s recheck slices would it take to recheck this unit's entire
+  # window"; min/max bound the result so scaling never means unbounded.
+  coverage_recheck_budget_factor: 2.0
+  min_coverage_rechecks: 4
+  max_coverage_rechecks: 20
 
 # ---------------------------------------------------------------------------
 # Backend: Gemma 4 E4B (Ollama) — uncomment to switch back from the Qwen3-VL

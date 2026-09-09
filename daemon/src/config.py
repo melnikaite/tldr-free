@@ -197,6 +197,35 @@ class WhisperConfig(_ApiKeyConfigMixin):
     # multi-chunk sequence. 2 is the minimum that actually lets a second
     # job's request interleave with the first's.
     max_concurrent_requests: int = 2
+    # Bounds the DURATION of a first-pass chunk, not just its size (see
+    # max_upload_mb above). A chunk sized off the byte cap alone can still be
+    # many minutes long on well-compressed audio (opus/low-bitrate speech) —
+    # measured live: a 19.2 MB / 24:56 episode split into 2 chunks of ~748s
+    # each purely by the byte cap, and BOTH collapsed into a multi-minute
+    # Whisper hallucination loop. workers/transcribe.py already caps a
+    # COVERAGE-RECHECK's ask at 90s for exactly this reason (see
+    # _MAX_RECHECK_SLICE_SECONDS there); this is the same protection applied
+    # to the FIRST pass. num_chunks becomes
+    # max(chunks implied by max_upload_mb, chunks implied by this cap). 300s
+    # (5 min) sits comfortably below the measured 748s failure while staying
+    # long enough that ordinary well-behaved audio isn't needlessly
+    # over-chunked.
+    max_chunk_seconds: float = 300.0
+    # Multiplier applied to "how many _MAX_RECHECK_SLICE_SECONDS-sized
+    # slices would it take to recheck this UNIT's entire window" to get that
+    # unit's coverage-recheck budget — replaces a single fixed budget shared
+    # by every unit regardless of its own duration. See
+    # workers/transcribe.py's _coverage_recheck_budget for the full
+    # rationale and worked numbers.
+    coverage_recheck_budget_factor: float = 2.0
+    # Floor on the per-unit recheck budget the formula above can produce —
+    # keeps a short chunk from being left with an unusably small budget.
+    min_coverage_rechecks: int = 4
+    # Hard ceiling on the per-unit recheck budget regardless of the formula
+    # above — "scaled" must never mean "unbounded". Mirrors the role the old
+    # fixed value (12) used to play for every unit unconditionally; this is
+    # now only the worst case.
+    max_coverage_rechecks: int = 20
 
 
 # ISO 639-1 → English language name. Small enough to inline; covers the
