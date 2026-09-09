@@ -16,10 +16,130 @@
 //
 // marked + DOMPurify are vendored as classic <script> tags by the consuming
 // HTML page (sidepanel/library) and expose globals `marked` and `DOMPurify`.
+//
+// --- Trust boundary --------------------------------------------------
+// `md` here is never something we typed: it is `summary_md` / chat text
+// produced by an LLM whose context includes arbitrary page/video content
+// chosen by whoever controls that page. Treat every byte as attacker-
+// influenced. This function is the only thing standing between that text
+// and `innerHTML` at the call sites (sidepanel app.js/chat.js). Two
+// independent layers close the two distinct ways `marked` can hand us
+// live markup, and BOTH are required — dropping either one reopens a hole:
+//
+//   1. `markedInstance` overrides the `html` renderer so *raw HTML typed
+//      literally in the source text* (e.g. an article that contains a
+//      literal `<select>`) is escaped to visible text instead of parsed
+//      into a real element. Without this, marked's default behaviour is
+//      to pass raw HTML straight through untouched — DOMPurify would still
+//      strip the dangerous stuff, but incidentally: correctness (an
+//      unclosed `<select>` swallows following content per HTML parsing
+//      rules) breaks first, and it's needless surface area regardless.
+//   2. The explicit `ALLOWED_TAGS`/`ALLOWED_ATTR`/`ALLOWED_URI_REGEXP`
+//      passed to `DOMPurify.sanitize()` below is a fail-closed allowlist
+//      of exactly what *legitimate markdown syntax* (not raw HTML) can
+//      turn into, e.g. `![x](https://evil/beacon)` is real markdown that
+//      marked legitimately renders as `<img src="https://evil/beacon">` —
+//      layer 1 never sees this as "raw HTML" because marked itself
+//      generates the tag, so only a tight DOMPurify allowlist stops the
+//      beacon/overlay/phishing-form/media-autoplay vectors. `img`, all
+//      form controls, all media tags, and `style` (tag and attribute) are
+//      deliberately excluded here even though DOMPurify's default config
+//      would allow some of them.
+//
+// If you're touching this function: layer 1 without layer 2 still leaks
+// image/media beacons and full-panel overlays through legitimate markdown
+// syntax; layer 2 without layer 1 still lets raw HTML corrupt rendering
+// (dropped/misparsed tags, unclosed elements swallowing content) even
+// though DOMPurify keeps it from being unsafe. Keep both.
 
 import { resolveVideoId } from "./url.js";
+import { escapeHtml } from "./utils.js";
 
 /* global marked, DOMPurify */
+
+/**
+ * Dedicated marked instance (not the shared global `marked`) so the `html`
+ * renderer override below can't leak into some other, future consumer of
+ * the vendored bundle. `marked.Marked` is the class the UMD bundle exposes
+ * alongside the convenience singleton; in v15 a renderer is installed via
+ * the constructor (or `.use()`) — passing one to `.parse()` is no longer
+ * supported.
+ *
+ * Both the block-level and inline `html` token types route through this
+ * same `html(token)` method, so overriding it once covers e.g. a literal
+ * `<select>` sitting in the middle of a paragraph as well as one on its
+ * own line — both come out as escaped, visible text instead of a real
+ * element (see the trust-boundary comment above for why).
+ */
+const markedInstance = new marked.Marked({
+  renderer: {
+    html(token) {
+      return escapeHtml(token.text);
+    },
+  },
+});
+
+// Fail-closed allowlist for DOMPurify — see the trust-boundary comment
+// above. Only tags/attributes that markdown syntax (as marked v15 renders
+// it) legitimately produces. Notably absent: `img` (beacon vector via
+// `![]()`), all form controls and media tags, and `style` (both the tag
+// and the attribute — a `style` attribute is how a full-panel overlay
+// would be built). `align` is included because marked emits it (not
+// `style`) for table column alignment; it only ever holds
+// "left"/"center"/"right"/"justify".
+const ALLOWED_TAGS = [
+  "p",
+  "br",
+  "hr",
+  "strong",
+  "em",
+  "del",
+  "s",
+  "code",
+  "pre",
+  "blockquote",
+  "ul",
+  "ol",
+  "li",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "a",
+  "table",
+  "thead",
+  "tbody",
+  "tr",
+  "th",
+  "td",
+  "span",
+];
+const ALLOWED_ATTR = [
+  "href",
+  "title",
+  "class",
+  "colspan",
+  "rowspan",
+  "start",
+  "align",
+];
+// http/https/mailto only — closes `javascript:`/`data:` URI vectors on
+// links regardless of what DOMPurify's own default regexp would allow.
+const ALLOWED_URI_REGEXP = /^(?:https?|mailto):/i;
+
+// DOMPurify runs EVERY allowed attribute value through ALLOWED_URI_REGEXP
+// unless the attribute name is in its (small, hardcoded) URI-safe list —
+// not just conventional URI attributes like `href`. Its *default* regexp
+// has a catch-all branch that happens to pass through non-URI-looking
+// values (no scheme prefix), which is why this never shows up with the
+// default config; our intentionally strict regexp above has no such
+// escape hatch, so non-URI attribute values like `start="5"` or
+// `align="left"` would otherwise get silently stripped. Declaring them
+// here (not URI-bearing, so nothing to gain by exempting them) is the
+// documented way to opt them out of that check.
+const ADD_URI_SAFE_ATTR = ["colspan", "rowspan", "start", "align"];
 
 /**
  * @typedef {{ video_id?: string | null, url?: string | null, kind?: string | null }} TimecodeJob
@@ -31,7 +151,12 @@ import { resolveVideoId } from "./url.js";
  * @returns {string} sanitized HTML
  */
 export function renderMarkdown(md, job) {
-  const html = DOMPurify.sanitize(marked.parse(md ?? ""));
+  const html = DOMPurify.sanitize(markedInstance.parse(md ?? ""), {
+    ALLOWED_TAGS,
+    ALLOWED_ATTR,
+    ALLOWED_URI_REGEXP,
+    ADD_URI_SAFE_ATTR,
+  });
   if (!job) return html;
   const videoId = resolveVideoId(job);
   const mediaPageUrl =

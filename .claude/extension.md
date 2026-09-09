@@ -9,6 +9,17 @@ classic `<script>` tags exposing globals; `task install` populates
 For the tree itself: `ls extension/src/`. This doc covers what isn't
 obvious from filenames.
 
+**Rendering trust boundary:** everything that reaches `innerHTML` via
+`lib/markdown.js`'s `renderMarkdown()` (summary + chat bubbles) is
+attacker-influenced — it's LLM output whose context includes arbitrary
+page/video content. `renderMarkdown` defends in two independent layers:
+a dedicated `marked` instance whose `html` renderer escapes raw HTML
+tokens to text (so literal tags in the source material can't become live
+elements or corrupt parsing), plus a fail-closed `DOMPurify` allowlist
+(no `img`, no form/media tags, no `style`) that catches what *legitimate*
+markdown syntax like `![]()` can still turn into. Both layers are needed —
+see the header comment in `markdown.js` before changing either one.
+
 ## Surfaces and how they talk to the daemon
 
 | Surface | File | Daemon connection |
