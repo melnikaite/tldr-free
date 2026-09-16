@@ -53,6 +53,10 @@ _PROMPT_KWARGS: dict[str, dict[str, object]] = {
         "phrase": "watch this",
         "question": "What's the main point?",
     },
+    "summary_frames.txt": {
+        "output_language": "English",
+        "phrase": "watch this",
+    },
 }
 
 # Prompts that legitimately have no {output_language} (e.g. the planning prompt

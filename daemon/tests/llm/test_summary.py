@@ -211,3 +211,207 @@ async def test_hierarchical_reduce_folds_large_partials(
     assert len(intermediate_calls) >= 1
     # And the final join must now fit the budget.
     assert count_tokens("\n\n---\n\n".join(folded)) <= reduce_budget
+
+
+# ---------------------------------------------------------------------------
+# Visual findings no longer thread through this module as a separate
+# `visual_findings` parameter — a deployed job showed the model ignoring the
+# "weave, don't enumerate" instruction on a separately-appended block and
+# emitting one bullet per finding instead (see llm/summary.py's module
+# docstring). Findings now arrive pre-woven into `text` itself via
+# `workers.timecodes.inject_visual_findings`, as ordinary
+# `⟦PICTURE [MM:SS]: ...⟧` lines. These tests verify that, once woven in, an
+# annotation flows through `stream_summarize` exactly like any other
+# transcript line — reaching the single-pass prompt, AND (the bug this
+# design fixes) a per-chunk map call, which the old separate-block design
+# never reached on a long/chunked video.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_woven_in_annotation_reaches_single_pass_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.workers import timecodes
+
+    calls: list[str] = []
+
+    def fake_stream(prompt: str, **kwargs: object):
+        calls.append(prompt)
+        return _async_iter(["## Overview\n\n", "Summary."])
+
+    monkeypatch.setattr(llm_client, "stream_complete", fake_stream)
+
+    text = "[00:12] Короткий исходник для проверки.\n"
+    woven = timecodes.inject_visual_findings(
+        text,
+        [timecodes.VisualFinding(seconds=12.0, text="A red tub labeled 'ACME Cream 200ml'.")],
+    )
+
+    async for _ in summary_mod.stream_summarize(woven, title="T", output_language="English"):
+        pass
+
+    assert len(calls) == 1
+    assert "ACME Cream 200ml" in calls[0]
+    assert "⟦PICTURE [" in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_summarize_no_longer_accepts_visual_findings_kwarg() -> None:
+    """Regression guard: the old separate-block mechanism is fully gone, not
+    just unused — passing the old kwarg must fail loudly, not be silently
+    swallowed by **kwargs somewhere."""
+    with pytest.raises(TypeError):
+        async for _ in summary_mod.stream_summarize(
+            "text", title="T", output_language="English", visual_findings="x"  # type: ignore[call-arg]
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_woven_in_annotation_reaches_a_map_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug this design fixes: findings used to reach only the
+    single-pass/final-reduce prompts, never per-chunk map calls, so they
+    were invisible in a long (chunked) video's summary before reduce ever
+    combined anything. Weaving the annotation into the marked transcript
+    BEFORE chunking means it rides inside whichever chunk covers its own
+    timestamp, automatically — no separate per-chunk plumbing needed."""
+    from src import config as config_mod
+    from src.workers import timecodes
+
+    cfg = config_mod.get_config()
+    monkeypatch.setattr(cfg.llm, "single_pass_token_limit", 300)
+
+    map_calls: list[str] = []
+    stream_calls: list[str] = []
+
+    async def fake_complete(prompt: str, **kwargs: object) -> str:
+        map_calls.append(prompt)
+        return f"Partial summary #{len(map_calls)}"
+
+    def fake_stream(prompt: str, **kwargs: object):
+        stream_calls.append(prompt)
+        return _async_iter(["## Final ", "summary"])
+
+    monkeypatch.setattr(llm_client, "complete", fake_complete)
+    monkeypatch.setattr(llm_client, "stream_complete", fake_stream)
+
+    lines = [
+        f"[{i:02d}:00] Обычное предложение транскрипта номер {i}. " * 10
+        for i in range(60)
+    ]
+    text = "\n".join(lines) + "\n"
+
+    findings = [timecodes.VisualFinding(seconds=1500.0, text="A hand folding a paper crane.")]
+    woven = timecodes.inject_visual_findings(text, findings)
+    assert count_tokens(woven) > cfg.llm.single_pass_token_limit  # forces map-reduce
+
+    async for _ in summary_mod.stream_summarize(woven, title="Long", output_language="English"):
+        pass
+
+    assert len(map_calls) > 1  # actually chunked, not accidentally single-pass
+    assert any("paper crane" in p for p in map_calls)
+
+
+# ---------------------------------------------------------------------------
+# Source-dependent timestamp rule. The old per-prompt rule was unconditional
+# ("EVERY bullet MUST begin with the timestamp…") with only a parenthetical
+# escape for untimed sources, which measurably made a small local model
+# fabricate [0:00:00]-shaped markers on real page/PDF jobs. The rule now
+# lives inside `_source_note` (selected by `from_audio_transcript`, same
+# mechanism as the pre-existing recognition-error note) instead of being
+# duplicated across summary_single.txt / summary_chunk.txt /
+# summary_reduce.txt with its own escape hatch in each. These tests assert
+# on prompt TEXT only — no LLM involved.
+# ---------------------------------------------------------------------------
+
+
+def test_source_note_transcript_mandates_timestamps() -> None:
+    note = summary_mod._source_note(from_audio_transcript=True)
+    assert "MUST begin with a" in note
+    assert "timestamp" in note.lower()
+    # Must not carry the document-side prohibition.
+    assert "NEVER add a" not in note
+
+
+def test_source_note_document_forbids_timestamps() -> None:
+    note = summary_mod._source_note(from_audio_transcript=False)
+    assert "NEVER add a" in note
+    assert "no timeline" in note.lower()
+    # Must not carry the transcript-side mandate.
+    assert "MUST begin with a" not in note
+
+
+@pytest.mark.parametrize("from_audio_transcript", [True, False])
+def test_single_pass_prompt_carries_source_dependent_rule(
+    from_audio_transcript: bool,
+) -> None:
+    note = summary_mod._source_note(from_audio_transcript=from_audio_transcript)
+    prompt = summary_mod._build_single_pass_prompt(
+        "Some material.", title="T", output_language="English", source_note=note
+    )
+    assert note in prompt
+    # The prompt's own Rules list must defer to the note, not restate a
+    # separate (and possibly conflicting) timestamp rule of its own.
+    assert "Follow the timestamp rule given above" in prompt
+    if from_audio_transcript:
+        assert "MUST begin with a" in prompt
+    else:
+        assert "NEVER add a" in prompt
+        assert "MUST begin with a" not in prompt
+
+
+@pytest.mark.parametrize("from_audio_transcript", [True, False])
+def test_reduce_prompt_carries_source_dependent_rule(
+    from_audio_transcript: bool,
+) -> None:
+    note = summary_mod._source_note(from_audio_transcript=from_audio_transcript)
+    prompt = summary_mod._build_reduce_prompt(
+        ["Partial 1", "Partial 2"],
+        title="T",
+        output_language="English",
+        source_note=note,
+    )
+    assert note in prompt
+    assert "Follow the timestamp rule given above" in prompt
+    if from_audio_transcript:
+        assert "CARRY THOSE TIMESTAMPS THROUGH" in prompt
+    else:
+        assert "NEVER add a" in prompt
+        assert "MUST begin with a" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_audio_transcript", [True, False])
+async def test_chunk_prompt_carries_source_dependent_rule(
+    monkeypatch: pytest.MonkeyPatch, from_audio_transcript: bool
+) -> None:
+    captured: list[str] = []
+
+    async def fake_complete(prompt: str, **kwargs: object) -> str:
+        captured.append(prompt)
+        return "Partial."
+
+    monkeypatch.setattr(llm_client, "complete", fake_complete)
+
+    note = summary_mod._source_note(from_audio_transcript=from_audio_transcript)
+    await summary_mod._summarize_chunk(
+        "Chunk body.",
+        title="T",
+        output_language="English",
+        source_note=note,
+        n=1,
+        total=1,
+    )
+
+    assert len(captured) == 1
+    prompt = captured[0]
+    assert note in prompt
+    assert "Follow the timestamp rule given above" in prompt
+    if from_audio_transcript:
+        assert "MUST begin with a" in prompt
+    else:
+        assert "NEVER add a" in prompt
+        assert "MUST begin with a" not in prompt

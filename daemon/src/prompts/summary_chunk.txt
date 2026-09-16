@@ -7,7 +7,7 @@ Format:
 - A line wrapped like "⟦PICTURE [MM:SS]: ...⟧" is ground truth about what the video's picture shows at that moment. Blend its detail into the claim it belongs to, together with that claim's own timestamp, exactly as you would any other fact from the chunk — the timestamp rule above always applies in full, including to a claim built from one of these notes. It was never spoken aloud: never quote it as speech, never invent or embellish detail beyond what it says, and never list it as a claim of its own that just narrates the picture.
 - List the main claims and facts from this chunk
 - Preserve names, numbers, and dates exactly
-- If the source contains timestamps [MM:SS] or [HH:MM:SS] — always keep them next to the relevant claims, each in its own bracket ("[01:30] [04:30]"), never combined like "[01:30, 04:30]". If a claim has no timestamp in the source, omit the marker — NEVER write a placeholder like "[Not specified]", "[Не указано]", "[N/A]" or "[—]".
+- Follow the timestamp rule given above (before "Format") exactly — it differs depending on whether this material has a timeline.
 - Do not add anything not present in the text
 
 Material title: {title}

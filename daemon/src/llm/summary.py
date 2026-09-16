@@ -79,22 +79,42 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # Injected into the summary prompts when the source is a speech-to-text
 # transcript (Whisper / auto-captions). Gives the model licence to fix obvious
 # recognition errors instead of faithfully echoing garbled terms (e.g. a
-# German "GSM-R" heard as "ГСМР … геометрия").
+# German "GSM-R" heard as "ГСМР … геометрия"). Also carries the timestamp rule
+# for this source kind — see the module docstring / .claude/llm.md for why the
+# rule itself lives here rather than as separate wording duplicated across the
+# three prompt files: it must be exactly as mechanical/unconditional as the
+# measured fix requires, and it must never leak into the document case below,
+# so it travels with the same from_audio_transcript switch as the rest of the
+# note instead of being a parenthetical exception bolted onto one shared rule.
 _TRANSCRIPT_SOURCE_NOTE = (
     "The text below is an automatic speech-to-text transcription of audio. It "
     "may contain recognition errors — misheard proper names, foreign words, "
     "and acronyms (an acronym may be spelled phonetically or split apart). Use "
     "context and general knowledge to silently correct obvious such errors in "
-    "your summary; do not invent facts the text does not support."
+    "your summary; do not invent facts the text does not support.\n\n"
+    "Timestamp rule: EVERY key point/bullet you write MUST begin with a "
+    'timestamp in its own bracket (e.g. "[04:12] ..." or "[0:04:12] ..."), '
+    "copied verbatim from whichever timestamp markers already appear in the "
+    "material you were given below — never invented, never combined from "
+    "several markers into one bracket. A bullet with no leading timestamp is "
+    "invalid output."
 )
 
 # Injected when the source is a written document (web page / PDF), which has no
 # timestamps. Counters the prompt's "include timestamps" rule so a small local
 # model doesn't fabricate "[00:42]" markers next to key points (the pipeline
 # also strips any that slip through — see workers.timecodes.strip_all_timecodes).
+# The prohibition is unconditional, not "omit them if absent" — a small local
+# model measurably fabricates [0:00:00]-shaped markers (10 and 35 counted
+# across two real page/PDF jobs) when the only guard is a parenthetical
+# exception on an otherwise-mandatory rule; see .claude/llm.md.
 _DOCUMENT_SOURCE_NOTE = (
     "The text below is a written document (web page or PDF). It has NO "
-    "timestamps. Do NOT add any [MM:SS] or [HH:MM:SS] markers to your summary."
+    "timeline and NO timestamps.\n\n"
+    "Timestamp rule: NEVER add a [MM:SS] or [HH:MM:SS] marker, nor a "
+    'placeholder standing in for one (e.g. "[Not specified]", "[Не указано]", '
+    '"[N/A]", "[—]"), to any bullet — even if the material you were given '
+    "below appears to contain one. This document has no timeline to point to."
 )
 
 
