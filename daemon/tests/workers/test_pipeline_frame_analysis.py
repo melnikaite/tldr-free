@@ -86,6 +86,41 @@ async def test_no_candidates_is_a_true_noop(
 
 
 # ---------------------------------------------------------------------------
+# A media job with no stored media_url must degrade to a true no-op too —
+# end-to-end through the real llm.vision.fetch_moment_frames (only the
+# bottom-most workers.frames.fetch_frames is mocked), so this exercises the
+# actual resolve_frame_source_url call, not a stand-in for it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_media_job_without_stored_media_url_degrades_to_noop(
+    isolated_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before migration v12 every kind=media job has media_url=None. Frame
+    analysis for it must degrade to finding nothing — never fetch job.url
+    (the page, which has no video on it) and never raise out of
+    run_pipeline."""
+    job = repo.create_job(url="https://example.com/article", kind="media")
+    assert job.media_url is None
+
+    obj = _cand(10.0, DeixisCategory.OBJECT, "this cream")
+    monkeypatch.setattr(pipeline_mod.deixis, "candidates_for_job", lambda j: [obj])
+
+    async def boom_fetch_frames(**kwargs: Any) -> list[Path]:
+        raise AssertionError(
+            f"workers.frames.fetch_frames must not be called (got url={kwargs.get('url')!r})"
+        )
+
+    # Deliberately NOT mocking llm_vision.fetch_moment_frames itself — the
+    # point is to exercise the real resolve_frame_source_url call inside it.
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom_fetch_frames)
+
+    result = await pipeline_mod._run_frame_analysis(job.id, get_broker(), [])
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
 # EXTERNAL candidates are skipped entirely — no frame fetch for them
 # ---------------------------------------------------------------------------
 

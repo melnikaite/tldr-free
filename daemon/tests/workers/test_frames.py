@@ -911,3 +911,47 @@ def test_resolve_frame_path_rejects_absolute_path_escape(tmp_path: Path) -> None
     # An absolute rel_path would otherwise let Path(a) / Path(b) discard `a`
     # entirely (Python's pathlib semantics) and resolve straight to `b`.
     assert frames.resolve_frame_path("jobA", str(outside)) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_frame_source_url — the single place that decides url vs media_url
+# ---------------------------------------------------------------------------
+
+
+class _FakeJob:
+    def __init__(
+        self, *, kind: str, url: str | None = None, media_url: str | None = None
+    ) -> None:
+        self.kind = kind
+        self.url = url
+        self.media_url = media_url
+
+
+def test_resolve_frame_source_url_uses_media_url_for_media_job() -> None:
+    job = _FakeJob(
+        kind="media",
+        url="https://example.com/article",
+        media_url="https://cdn.example.com/signed/video.mp4?exp=1",
+    )
+    assert (
+        frames.resolve_frame_source_url(job)
+        == "https://cdn.example.com/signed/video.mp4?exp=1"
+    )
+
+
+def test_resolve_frame_source_url_media_job_without_media_url_returns_none() -> None:
+    """Every media job created before migration v12 (and any whose discovery
+    produced nothing) has media_url=None — this must return None, never fall
+    back to job.url (a page has no video on it)."""
+    job = _FakeJob(kind="media", url="https://example.com/article", media_url=None)
+    assert frames.resolve_frame_source_url(job) is None
+
+
+@pytest.mark.parametrize("kind", ["youtube", "page", "pdf"])
+def test_resolve_frame_source_url_uses_url_for_non_media_kinds(kind: str) -> None:
+    job = _FakeJob(
+        kind=kind,
+        url="https://example.com/original",
+        media_url="https://cdn.example.com/should-be-ignored.mp4",
+    )
+    assert frames.resolve_frame_source_url(job) == "https://example.com/original"

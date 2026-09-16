@@ -531,9 +531,18 @@ async def fetch_moment_frames(
     A cookie-gated video's frame fetch still fails like any other network
     error when no cookies are available (or the ones given aren't enough),
     degrading the same way at the caller either way.
+
+    The URL to fetch from is resolved via ``workers.frames.
+    resolve_frame_source_url`` — for a ``kind=media`` job that's
+    ``job.media_url`` (the actual video, separate from the page it's
+    embedded in), for everything else it's ``job.url``. A media job with no
+    stored ``media_url`` (every job created before migration v12) resolves
+    to ``None`` here and raises the same as a job missing its id — the
+    caller's degrade-to-``[]``/``[]``-findings behaviour applies uniformly,
+    never a silent fall back to the page URL.
     """
     job_id = getattr(job, "id", None)
-    url = getattr(job, "url", None)
+    url = _frames.resolve_frame_source_url(job)
     if not job_id or not url:
         raise FrameExtractionError("job is missing id/url; cannot fetch frames")
     max_height = _HEIGHT_BY_CATEGORY.get(candidate.category, _frames.SECTION_MAX_HEIGHT_PX)

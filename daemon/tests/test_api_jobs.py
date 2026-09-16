@@ -562,6 +562,54 @@ def test_post_jobs_persists_alt_media_candidates(client: TestClient) -> None:
         assert {a["label"] for a in alts} == {"Talk 2", "Talk 3"}
 
 
+def test_post_jobs_persists_media_url_on_the_row(client: TestClient) -> None:
+    """Job.media_url (migration v12) round-trips through create_job — the
+    fix for frame analysis sending yt-dlp at the page instead of the video
+    for kind=media jobs. Not exposed via the API (see api/schemas.py) —
+    checked directly against the stored row."""
+    from unittest.mock import patch
+
+    from src.storage import repo
+
+    media_url = "https://cdn.example.com/signed/video.mp4?exp=123"
+    with patch(
+        "src.workers.pipeline.run_pipeline",
+        new=lambda *a, **kw: __import__("asyncio").sleep(0),
+    ):
+        r = client.post(
+            "/jobs",
+            json={
+                "url": "https://example.com/article-with-embedded-video",
+                "kind": "media",
+                "media_url": media_url,
+            },
+        )
+        assert r.status_code == 202, r.text
+        job_id = r.json()["id"]
+
+    stored = repo.get_job(job_id)
+    assert stored is not None
+    assert stored.media_url == media_url
+
+
+def test_post_jobs_page_kind_never_gets_a_media_url(client: TestClient) -> None:
+    """A non-media job's row must have media_url=None even when nobody
+    passes one explicitly — the column reads as "nothing to use" for every
+    kind but media."""
+    from src.storage import repo
+
+    r = client.post(
+        "/jobs",
+        json={"url": "https://example.com/plain-page", "kind": "page", "page_text": "hi"},
+    )
+    job_id = r.json()["id"]
+    _wait_until_done(client, job_id)
+
+    stored = repo.get_job(job_id)
+    assert stored is not None
+    assert stored.media_url is None
+
+
 def test_get_job_returns_empty_alt_media_for_legacy_rows(client: TestClient) -> None:
     """Jobs created before v5 (or jobs from pages with a single source)
     must return an empty list — not null — so the sidepanel can rely on
@@ -1079,6 +1127,45 @@ def _make_audio_job(
     return job_id
 
 
+def _make_media_audio_job(
+    client: TestClient,
+    *,
+    media_url: str | None,
+    segments: list[dict[str, Any]] | None = None,
+    transcript_source: str = "whisper",
+    language: str = "en",
+    url: str = "https://example.com/article-with-embedded-video",
+) -> str:
+    """Same shape as ``_make_audio_job``, but for a ``kind=media`` job with
+    (or, when ``media_url=None``, deliberately without) a stored
+    ``Job.media_url`` — used to test that frame-fetching resolves to
+    ``media_url`` for this kind, per ``workers.frames.
+    resolve_frame_source_url``. The pipeline is skipped (patched to a no-op)
+    since only the persisted row matters here, not a real media run."""
+    from unittest.mock import patch
+
+    from src.storage import repo
+
+    with patch(
+        "src.workers.pipeline.run_pipeline",
+        new=lambda *a, **kw: __import__("asyncio").sleep(0),
+    ):
+        create = client.post(
+            "/jobs",
+            json={"url": url, "kind": "media", "media_url": media_url},
+        ).json()
+    job_id = create["id"]
+    repo.mark_done(
+        job_id,
+        raw_text="placeholder raw text",
+        summary_md="placeholder summary",
+        transcript_source=transcript_source,
+        transcript_language=language,
+        raw_segments_json=json.dumps(segments if segments is not None else _DEIXIS_SEGMENTS),
+    )
+    return job_id
+
+
 def test_list_moments_excludes_external_and_shapes_response(client: TestClient) -> None:
     job_id = _make_audio_job(client)
 
@@ -1311,6 +1398,53 @@ def test_fetch_moment_frames_download_failure_returns_502(
     r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
     assert r.status_code == 502
     assert "ffmpeg exited with code 8" in r.json()["detail"]
+
+
+def test_fetch_moment_frames_media_job_uses_stored_media_url(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A kind=media job's video lives at Job.media_url, not the page url it
+    was found on (Job.url) — the on-demand frame route must resolve the
+    same way llm.vision.fetch_moment_frames does (workers.frames.
+    resolve_frame_source_url), not read job.url directly."""
+    media_url = "https://cdn.example.com/signed/video.mp4?exp=123"
+    job_id = _make_media_audio_job(client, media_url=media_url)
+
+    frame_path = tmp_path / "frame_01.jpg"
+    frame_path.write_bytes(b"jpeg")
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.update(kwargs)
+        return [frame_path]
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
+    assert r.status_code == 200, r.text
+    assert captured["url"] == media_url
+
+
+def test_fetch_moment_frames_media_job_without_media_url_returns_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A media job created before migration v12 (media_url never stored)
+    must degrade to a clear 409, never silently fetch job.url (the page,
+    which has no video on it)."""
+    job_id = _make_media_audio_job(client, media_url=None)
+
+    async def boom(**kwargs: Any) -> list[Path]:
+        raise AssertionError("fetch_frames must not be called with the page url")
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom)
+
+    r = client.post(f"/jobs/{job_id}/frames", json={"seconds": _ACTION_SECONDS})
+    assert r.status_code == 409
+    assert "no source url" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

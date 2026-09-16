@@ -27,8 +27,19 @@ Bundle layout
 NOT included: ``id``, ``status``, ``error``, ``progress_stage``,
 ``audio_path``, ``audio_duration_seconds`` (host-local), ``added_at``
 (machine-local — "when this row appeared on THIS machine"; the importing
-machine sets its own, see ``repo.insert_imported_job``), and translations
-whose status isn't ``done`` (they carry no text worth shipping).
+machine sets its own, see ``repo.insert_imported_job``), ``queued_reason``
+(only ever non-null while status=="queued", and a status=="done" row can
+never have one), and translations whose status isn't ``done`` (they carry
+no text worth shipping).
+
+Also deliberately NOT included: ``media_url`` (migration v12). It is
+frequently a signed/expiring CDN URL — closer to a credential than to a
+public address — and this project already declines to persist request-time
+cookies for exactly that reason (see ``storage/cookies.py`` — cookies are
+only ever forwarded per-request, never written to a row). An imported
+job's ``media_url`` is always ``None`` regardless of what the exporting
+machine had (``repo.insert_imported_job`` never accepts it as a parameter)
+— same "nothing to use" reading as a pre-migration-v12 row.
 
 Frame nesting
 -------------

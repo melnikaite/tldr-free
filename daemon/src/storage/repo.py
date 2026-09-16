@@ -76,6 +76,7 @@ def create_job(
     title: str | None = None,
     progress_stage: str | None = None,
     alt_media_candidates_json: str | None = None,
+    media_url: str | None = None,
 ) -> Job:
     """Insert a fresh Job row in ``status='running'`` and return it.
 
@@ -83,6 +84,11 @@ def create_job(
     discovered by the extension's page scanner (see the column comment
     on ``Job.alt_media_candidates_json``). Persisted only at create time
     — we don't re-scan a page after the job exists.
+
+    ``media_url`` is the actual playable video URL for a ``kind=media``
+    job (see ``Job.media_url`` / migration v12) — ``None`` for every other
+    kind. Persisted only at create time, same as ``alt_media_candidates_json``
+    — never updated afterwards, never re-derived from a later request.
 
     Emits ``job_event("created", …)`` so the Library renders the row instantly
     without polling.
@@ -96,6 +102,7 @@ def create_job(
         title=title,
         progress_stage=progress_stage,
         alt_media_candidates_json=alt_media_candidates_json,
+        media_url=media_url,
         created_at=now,
         added_at=now,
         updated_at=now,

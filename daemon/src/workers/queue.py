@@ -47,12 +47,13 @@ class WhisperTask:
     url: str
     cookies: list[Cookie] = field(default_factory=list)
     # Extension-supplied page text, carried transiently for kind=media jobs
-    # only (mirrors how ``media_url`` itself lives only inside the in-flight
-    # task — see ``re_enqueue_pending``'s comment below). Used by
-    # ``runner._process_one`` as a fallback summary source when the media
-    # clip is too short to contain speech or Whisper returns an empty
-    # transcript. Lost on daemon restart, same as ``media_url`` — a restart
-    # already marks in-flight media jobs failed, so this adds no new gap.
+    # only — has no DB column of its own, unlike ``Job.media_url`` (see
+    # ``storage/db.py``, migration v12), which persists purely for later
+    # frame analysis, not for this. Used by ``runner._process_one`` as a
+    # fallback summary source when the media clip is too short to contain
+    # speech or Whisper returns an empty transcript. Lost on daemon restart
+    # — a restart already marks in-flight media jobs failed regardless (see
+    # ``re_enqueue_pending`` below), so this adds no new gap.
     page_text: str | None = None
 
 
@@ -174,7 +175,10 @@ async def re_enqueue_pending(queue: WhisperQueue, repo_module: object) -> int:
             # Page / media / pdf jobs left in queued/running can't be
             # resumed by the queue:
             #   - page: page_text from the request body is gone
-            #   - media: media_url lives only inside the in-flight WhisperTask
+            #   - media: an interrupted yt-dlp download / Whisper
+            #     transcription has no checkpoint to resume from —
+            #     Job.media_url (when stored, see migration v12) is used
+            #     only for later frame analysis, never read here
             #   - pdf:  pdf_bytes (file://) aren't persisted; http URLs
             #     survive but restart goes through the user clicking
             #     summarize again, not the queue
@@ -183,8 +187,8 @@ async def re_enqueue_pending(queue: WhisperQueue, repo_module: object) -> int:
             if mark_failed is not None:
                 reasons = {
                     "media": (
-                        "daemon restarted mid-stream; media url not persisted, "
-                        "please re-summarize from the extension"
+                        "daemon restarted mid-stream; media jobs aren't "
+                        "resumable, please re-summarize from the extension"
                     ),
                     "pdf": (
                         "daemon restarted mid-stream; PDF not resumable, "

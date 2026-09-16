@@ -407,6 +407,7 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             title=initial_title,
             progress_stage="extracting",
             alt_media_candidates_json=alt_candidates_json,
+            media_url=req.media_url,
         )
 
     # Spawn outside the lock — pipeline runs for minutes, holding the lock
@@ -956,7 +957,14 @@ async def fetch_moment_frames(job_id: str, req: FrameFetchRequest) -> FrameFetch
             "reference) — there is no frame to fetch for it",
         )
 
-    url = getattr(job, "url", None)
+    # Resolves to job.media_url for a MEDIA job (the actual video, not the
+    # page it's embedded in) and job.url for everything else — the same
+    # rule llm.vision.fetch_moment_frames applies for the summary-time and
+    # QA LOOK-step paths, kept in this one place so it can't drift between
+    # the two. A MEDIA job with no stored media_url (every job created
+    # before migration v12) resolves to None here — same 409 as any other
+    # job with nothing to fetch from, never a silent fall back to the page.
+    url = frames.resolve_frame_source_url(job)
     if not url:
         raise HTTPException(status.HTTP_409_CONFLICT, f"job {job_id} has no source url")
 
@@ -1063,7 +1071,9 @@ async def retry_job(job_id: str) -> JSONResponse:
             url=job.url,
             page_text=None,        # extension may no longer be on this page; trafilatura will refetch
             page_title=job.title,
-            media_url=None,        # not persisted; media retry path was rejected above
+            media_url=None,        # media retry path was rejected above (Job.media_url,
+                                    # when stored, is a discovery-time value that may
+                                    # already be stale/expired — see the 409 above)
             pdf_bytes=None,        # not persisted; file:// retry was rejected above
             cookies=[],            # cookies aren't persisted on the job row
         )

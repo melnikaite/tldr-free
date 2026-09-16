@@ -210,20 +210,28 @@ on any failure, caller (`whisper_worker`) calls `mark_failed`" contract
 handles it the same as any other failure; the fallback never calls
 `mark_failed` itself.
 
-`WhisperTask.page_text` follows the exact same ephemerality convention as
-`media_url` (see "Media and PDF jobs are ephemeral on restart" below): it
-rides along only inside the in-flight task, not a DB column, and is lost on
-daemon restart — a restart already marks in-flight media jobs failed via
-`re_enqueue_pending`, so this adds no new gap.
+`WhisperTask.page_text` has no DB column of its own: it rides along only
+inside the in-flight task and is lost on daemon restart — a restart
+already marks in-flight media jobs failed via `re_enqueue_pending`, so this
+adds no new gap. (`media_url` itself no longer works this way — see
+`Job.media_url` below — but the restart-recovery gap this paragraph is
+about is unaffected either way, since `re_enqueue_pending` never resumes a
+media job regardless of what's on the row.)
 
 ## Media and PDF jobs are ephemeral on restart
 
 YouTube jobs are recoverable: `Job.url` is the canonical URL and
 `re_enqueue_pending` resubmits them on daemon startup. Two kinds are NOT:
 
-- **MEDIA**: the actual `media_url` (a `<video src>` or iframe yt-dlp
-  will fetch) lives only in the in-flight `WhisperTask` and is never
-  written to the row.
+- **MEDIA**: the actual playable video URL (a `<video src>` or iframe
+  yt-dlp will fetch) is stored on the row as `Job.media_url` (migration
+  v12) — but that column exists ONLY so an already-finished job's later
+  frame analysis / on-demand "look" affordance (see "Video frames" below)
+  can resolve the right URL again, long after the original request is
+  gone. `re_enqueue_pending` does not read it and never resumes an
+  in-flight media job from it — a yt-dlp download / Whisper transcription
+  interrupted mid-stream still has no checkpoint to resume from, column or
+  not.
 - **PDF** with `file://` URL: the PDF bytes came in the POST body
   (`pdf_bytes_b64`) and aren't persisted. http(s) PDFs could in
   principle re-fetch on restart, but for simplicity restart goes
@@ -232,9 +240,14 @@ YouTube jobs are recoverable: `Job.url` is the canonical URL and
 On restart these are marked `failed` with an explanatory error; the user
 resubmits from the extension.
 
-Don't persist `media_url` or `pdf_bytes` to "fix" this. CDN URLs are
-signed and expire; PDF bytes can be megabytes per row. Keeping the
-inputs fresh at submit-time is the whole point.
+Don't persist `pdf_bytes` to "fix" PDF restart-resumability — bytes can be
+megabytes per row and the tradeoff isn't worth it. `media_url` IS now
+persisted (above), but deliberately not to fix THIS gap — see the bullet
+above and "Video frames" below for what it's actually for. It is also
+deliberately excluded from the export bundle (`storage/bundle.py`): a
+`media_url` is frequently a signed/expiring CDN URL, closer to a
+credential than a public address, the same reasoning that keeps cookies
+out of every persisted row in this project.
 
 ## Video frames: on-demand, budget-capped, ephemeral
 
@@ -254,6 +267,18 @@ in the module changes. Bare demonstratives ("this"/"это"/"das") are
 deliberately rejected as too common on their own — only a phrase pairing a
 deictic word with a visual/imperative cue ("this WAY", "вот ТАК", "hier
 SEHT ihr") counts as a candidate.
+
+Which URL a job's frames come from is resolved in exactly one place:
+`workers/frames.resolve_frame_source_url(job)` — `job.media_url` for a
+`kind=media` job (the actual video; see `Job.media_url` / migration v12),
+`job.url` for every other kind. Every caller that needs a video URL for a
+specific job (the summary-time step below, the QA LOOK step, and the
+on-demand `POST /jobs/{id}/frames` route) goes through this instead of
+reading `job.url`/`job.media_url` directly. A `kind=media` job with no
+stored `media_url` (every job created before migration v12) resolves to
+`None` — callers treat that as "nothing to fetch from" and stop, never
+fall back to `job.url` (a page has no video on it; sending yt-dlp there
+cannot work regardless of cookies).
 
 `workers/frames.py` turns a chosen candidate into JPEGs on disk. It
 downloads only a short `yt-dlp --download-sections` window around the
@@ -293,8 +318,8 @@ retries; the opt-in full-download fallback does not.
 Frames are ephemeral like MEDIA/PDF jobs above, but for a different
 reason — not "can't be recovered after a restart," but "not worth
 persisting at all." They live at
-`<data_dir>/frames/<job_id>/t<second>/frame_NN.jpg`, no DB column (same
-shape as `media_url` for MEDIA jobs). `repo.delete_job` and
+`<data_dir>/frames/<job_id>/t<second>/frame_NN.jpg`, no DB column of their
+own (unlike `Job.media_url` itself — see above). `repo.delete_job` and
 `repo.delete_jobs_older_than` each call `workers.frames.delete_job_frames`
 alongside the existing cached-audio cleanup, so a job's frame directory
 shares the audio file's lifecycle exactly — covered whether the user

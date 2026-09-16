@@ -332,8 +332,10 @@ sidepanel's language bar to re-queue all of them at once.
 
 ### Library shows jobs in "queued" forever after restart
 
-Expected for MEDIA jobs — they can't be resumed (`media_url` not
-persisted). Re-submit from the extension by clicking the toolbar button on
+Expected for MEDIA jobs — they can't be resumed (an interrupted yt-dlp
+download / Whisper transcription has no checkpoint to resume from; storing
+`Job.media_url` for later frame analysis doesn't change that). Re-submit
+from the extension by clicking the toolbar button on
 the source page again. YouTube jobs in queued/running are re-enqueued on
 startup automatically. Translations are also recoverable (see above).
 See [workers.md](workers.md).

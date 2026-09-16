@@ -151,6 +151,24 @@ class Job(SQLModel, table=True):
     # ``None`` for every pre-existing row and every job with no qualifying
     # candidates.
     moment_findings_json: str | None = None
+    # For a ``kind=media`` job, the actual playable video URL the extension
+    # discovered on the page (``JobCreateRequest.media_url``) — distinct
+    # from ``url`` above, which stays the human-visible PAGE the material
+    # was found on. Set once at job-creation time (``repo.create_job``,
+    # ``api/jobs.py``'s create_job route) and never updated afterwards.
+    # Exists purely so frame analysis (workers/pipeline.py's
+    # _run_frame_analysis, and the on-demand api/jobs.py POST
+    # /jobs/{id}/frames route) can point yt-dlp at the actual video instead
+    # of the page — see workers.frames.resolve_frame_source_url, the single
+    # place that picks between ``url``/``media_url`` per job. See migration
+    # v12 for the full rationale, including why this is NOT a reversal of
+    # "media jobs are ephemeral on restart" (an in-flight media job still
+    # can't be resumed from this column — re_enqueue_pending ignores it).
+    #
+    # ``None`` for every pre-existing row and for every non-media job — both
+    # read as "nothing to use". Deliberately excluded from the export
+    # bundle (storage/bundle.py) — see migration v12's docstring for why.
+    media_url: str | None = None
 
 
 class Message(SQLModel, table=True):

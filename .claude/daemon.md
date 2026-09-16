@@ -20,8 +20,10 @@ on shutdown):
    `workers.control.get_control()`.
 4. Re-enqueue persisted state: `repo.find_pending_for_restart()` pushes any
    YouTube job left in queued/running back onto the Whisper queue. Media
-   jobs from a prior run get marked failed (their `media_url` wasn't
-   persisted — see [workers.md](workers.md)).
+   jobs from a prior run get marked failed regardless — an interrupted
+   yt-dlp download / Whisper transcription has no checkpoint to resume
+   from, and `Job.media_url` (when stored) is used only for later frame
+   analysis, never for resuming this (see [workers.md](workers.md)).
 5. Spawn long-running coroutines: `whisper_worker` (single, sequential) and
    `retention_worker` (sleeps 6h between sweeps).
 6. Mount API routers: `api/{jobs,ai,events,workers,health,config}.py`.

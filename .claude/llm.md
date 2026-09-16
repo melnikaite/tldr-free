@@ -167,7 +167,9 @@ flavours depending on the job:
 - **YouTube** → `youtube.com/watch?v=ID&t=Ns`. Side panel click handler
   finds the open YouTube tab and seeks `<video>.currentTime` directly.
 - **Generic media** (`kind=media`) → `<page-url>#t=Ns` (the page that
-  contained the embedded media — `media_url` itself isn't persisted).
+  contained the embedded media — the daemon does store `Job.media_url`
+  internally as of migration v12, but never returns it to the client, so
+  the extension only ever has the page URL to seek).
   Click handler tries to focus that page's tab and seek the first
   `<video>/<audio>` via `executeScript`; falls back to opening the URL.
   Iframe-embedded players (Vimeo etc.) won't seek — they're a separate

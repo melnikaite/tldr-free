@@ -31,6 +31,8 @@ from src.workers.errors import FrameExtractionError
 class _FakeJob:
     id: str | None
     url: str | None
+    kind: str = "youtube"
+    media_url: str | None = None
 
 
 def _vision_tool_completion(finding: str, relevant: Any, best_frame_index: Any) -> Any:
@@ -154,6 +156,94 @@ async def test_fetch_moment_frames_propagates_download_failure(
     cand = DeixisCandidate(
         timestamp=12.0, phrase="this cream", category=DeixisCategory.OBJECT, confidence=0.7
     )
+    with pytest.raises(FrameExtractionError):
+        await vision_mod.fetch_moment_frames(job=job, candidate=cand)
+
+
+@pytest.mark.asyncio
+async def test_fetch_moment_frames_uses_media_url_for_media_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kind=media job's video lives at media_url, not the page url — see
+    workers.frames.resolve_frame_source_url, which fetch_moment_frames goes
+    through instead of reading job.url directly."""
+    captured: list[dict[str, Any]] = []
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.append(kwargs)
+        return [Path("/tmp/frame_01.jpg")]
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+    job = _FakeJob(
+        id="job1",
+        url="https://example.com/article-with-embedded-video",
+        kind="media",
+        media_url="https://cdn.example.com/signed/video.mp4?exp=123",
+    )
+    cand = DeixisCandidate(
+        timestamp=12.0, phrase="this cream", category=DeixisCategory.OBJECT, confidence=0.7
+    )
+
+    await vision_mod.fetch_moment_frames(job=job, candidate=cand)
+
+    assert captured[-1]["url"] == "https://cdn.example.com/signed/video.mp4?exp=123"
+
+
+@pytest.mark.asyncio
+async def test_fetch_moment_frames_uses_page_url_for_non_media_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-media job (youtube/page/pdf) has no url/media_url split — the
+    job's own url is always the fetch target, even if media_url happened to
+    be set (it shouldn't be, for a non-media kind, but the rule keys off
+    kind, not "is media_url truthy")."""
+    captured: list[dict[str, Any]] = []
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.append(kwargs)
+        return [Path("/tmp/frame_01.jpg")]
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+    job = _FakeJob(
+        id="job1",
+        url="https://youtube.com/watch?v=abc",
+        kind="youtube",
+        media_url="https://cdn.example.com/should-be-ignored.mp4",
+    )
+    cand = DeixisCandidate(
+        timestamp=12.0, phrase="this cream", category=DeixisCategory.OBJECT, confidence=0.7
+    )
+
+    await vision_mod.fetch_moment_frames(job=job, candidate=cand)
+
+    assert captured[-1]["url"] == "https://youtube.com/watch?v=abc"
+
+
+@pytest.mark.asyncio
+async def test_fetch_moment_frames_media_job_without_stored_media_url_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A media job created before migration v12 (or whose discovery genuinely
+    produced nothing) has media_url=None — resolve_frame_source_url must
+    return None rather than falling back to job.url, and fetch_moment_frames
+    must raise (not silently fetch the page) so the caller's existing
+    degrade-to-nothing path (workers.pipeline._fetch_moment_frames_safe /
+    llm.qa's inspect_moment) is what decides what happens next."""
+
+    async def boom(**kwargs: Any) -> list[Path]:
+        raise AssertionError("fetch_frames must not be called with the page url")
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom)
+    job = _FakeJob(
+        id="job1",
+        url="https://example.com/article-with-embedded-video",
+        kind="media",
+        media_url=None,
+    )
+    cand = DeixisCandidate(
+        timestamp=12.0, phrase="this cream", category=DeixisCategory.OBJECT, confidence=0.7
+    )
+
     with pytest.raises(FrameExtractionError):
         await vision_mod.fetch_moment_frames(job=job, candidate=cand)
 

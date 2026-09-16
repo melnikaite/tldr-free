@@ -26,13 +26,20 @@ Public surface:
         RETENTION HOOK. See its docstring — wired in from both
         ``storage/repo.py`` delete paths (explicit delete + retention sweep).
 
-Not wired into the pipeline itself — only the QA LOOK step
-(``llm/vision.py``'s ``inspect_moment``) and the on-demand "look" affordance
-(``api/jobs.py``'s ``POST /jobs/{id}/frames``) call ``fetch_frames``. This
-module only produces JPEG files on disk and hands back their paths; those
-callers are responsible for what happens to them next (feeding them to the
-multimodal LLM as ``image_url`` content, or serving them straight to the
-user via ``GET /jobs/{id}/frames/{rel_path}``).
+    resolve_frame_source_url(job) -> str | None
+        The one place that decides which of a job's ``url``/``media_url``
+        a frame fetch should use — see its own docstring.
+
+Three callers reach ``fetch_frames``, all through ``resolve_frame_source_url``
+first: the summary-time frame-analysis step (``workers/pipeline.py``'s
+``_run_frame_analysis``, via ``llm/vision.py``'s ``fetch_moment_frames``),
+the QA LOOK step (``llm/vision.py``'s ``inspect_moment``, same
+``fetch_moment_frames``), and the on-demand "look" affordance
+(``api/jobs.py``'s ``POST /jobs/{id}/frames``). This module only produces
+JPEG files on disk and hands back their paths; those callers are
+responsible for what happens to them next (feeding them to the multimodal
+LLM as ``image_url`` content, or serving them straight to the user via
+``GET /jobs/{id}/frames/{rel_path}``).
 
 Why sections, not the whole file
 ---------------------------------
@@ -97,10 +104,10 @@ Storage and retention
 Frames for a job live under ``<data_dir>/frames/<job_id>/t<second>/``,
 alongside how ``workers/youtube.download_audio`` places a job's audio under
 ``<data_dir>/audio`` (see ``runner._audio_dir``) and ``Job.audio_path``
-tracks it for cleanup. Frames have no DB column — like ``media_url`` for
-MEDIA jobs (see ``.claude/workers.md``, "Media and PDF jobs are ephemeral on
-restart"), there is nothing here that's safe or worth persisting across a
-restart, so this module doesn't try. That means the ``retention.py`` sweep
+tracks it for cleanup. Frames themselves have no DB column — unlike
+``Job.media_url`` (migration v12), there is nothing here that's safe or
+worth persisting across a restart, so this module doesn't try. That means
+the ``retention.py`` sweep
 (keyed off ``Job.created_at`` / row deletion in the DB) has no way to find
 these directories on its own — see ``delete_job_frames`` below for the
 hook ``storage/repo.py`` calls to close that gap for jobs it deletes
@@ -162,7 +169,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from src.api.schemas import Cookie
+from src.api.schemas import Cookie, JobKind
 from src.config import get_config
 from src.storage.cookies import write_netscape_cookie_file
 from src.workers.errors import FrameExtractionError
@@ -640,6 +647,36 @@ async def _extract_frames(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def resolve_frame_source_url(job: Any) -> str | None:
+    """Decide which URL a job's frame fetch should point yt-dlp at.
+
+    The single place that rule lives — both callers that need a video URL
+    for a specific job (``llm.vision.fetch_moment_frames``, used by both the
+    summary-time frame-analysis step and the QA LOOK step, and ``api.jobs``'s
+    on-demand ``POST /jobs/{id}/frames`` route) call this instead of reading
+    ``job.url``/``job.media_url`` directly, so the rule can't drift between
+    the two.
+
+    For a ``kind=media`` job, the material and its playable location are
+    NOT the same page: ``job.url`` is the page the extension found the video
+    embedded in, while the video itself lives at ``job.media_url`` (see
+    ``Job.media_url`` / migration v12). Every other kind has no such split —
+    ``job.url`` IS the thing to fetch from (a YouTube watch page, a page
+    whose caption track was used, …).
+
+    Returns ``None`` for a ``kind=media`` job with no stored ``media_url`` —
+    every job created before migration v12, and any media job whose
+    discovery genuinely produced nothing worth keeping. Callers MUST treat
+    ``None`` as "nothing to fetch from" and stop there, never fall back to
+    ``job.url`` themselves — falling back would silently resurrect the
+    original bug this function exists to fix (yt-dlp probing a page with no
+    video on it, which cannot work regardless of cookies).
+    """
+    if getattr(job, "kind", None) == JobKind.MEDIA.value:
+        return getattr(job, "media_url", None)
+    return getattr(job, "url", None)
 
 
 async def fetch_frames(

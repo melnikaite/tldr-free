@@ -467,6 +467,67 @@ def _migration_v11(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v12 — Job.media_url
+# ---------------------------------------------------------------------------
+# For a ``kind=media`` job the actual playable video lives at a URL the
+# extension discovered ON the page (``JobCreateRequest.media_url``) —
+# separate from ``Job.url``, which stays the human-visible PAGE the
+# material was found on (library dedup, display, "open source" link).
+# Summary-time frame analysis (workers/pipeline.py's _run_frame_analysis ->
+# llm/vision.py's fetch_moment_frames -> workers/frames.fetch_frames) and
+# the on-demand "look" affordance (api/jobs.py's POST /jobs/{id}/frames)
+# both need a video URL to point yt-dlp at, and before this column existed
+# both silently reached for ``job.url`` instead for a media job — sending
+# yt-dlp at a page with no video on it, which cannot work regardless of
+# cookies.
+#
+# This column persists that discovery so those two call sites can resolve
+# the right URL long after the request that carried it is gone. Both are
+# now expected to go through ``workers.frames.resolve_frame_source_url``,
+# the one place that decides which of ``url``/``media_url`` a job's frame
+# fetch should use, rather than re-deriving the rule at each call site.
+#
+# This does NOT reverse "media jobs are ephemeral on restart" (see
+# .claude/workers.md): an in-flight media job still cannot be resumed after
+# a daemon restart — ``workers/queue.py``'s ``re_enqueue_pending`` still
+# marks it failed unconditionally, untouched by this column. This column
+# only ever helps an ALREADY-FINISHED job's later frame analysis / on-demand
+# frame fetch, which needs the same URL again well after the job reached
+# "done" — a different problem from resuming an interrupted download.
+#
+# Null for every pre-existing row (no way to retroactively recover a
+# per-request URL that was never stored) and for every non-media job
+# (``repo.create_job`` only ever receives one from ``api/jobs.py``'s
+# create_job route when the extension found a media candidate, which is
+# precisely when ``kind`` becomes MEDIA) — both read as "nothing to use",
+# the same convention every optional column since v7 has followed. A media
+# job with a null ``media_url`` must make frame analysis degrade to doing
+# nothing, never fall back to ``job.url`` (see
+# ``resolve_frame_source_url``'s docstring for why that fallback would just
+# silently resurrect the original bug).
+#
+# Deliberately excluded from the export bundle (storage/bundle.py): a
+# media_url is frequently a signed/expiring CDN URL — closer to a
+# credential than a public address — and this project already declines to
+# persist cookies for exactly that reason. An imported job's media_url is
+# always None regardless of what the exporting machine had (see
+# bundle._write_job_entry / repo.insert_imported_job).
+
+_V12_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN media_url TEXT",
+)
+
+
+def _migration_v12(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V12_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -483,6 +544,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (9, _migration_v9),
     (10, _migration_v10),
     (11, _migration_v11),
+    (12, _migration_v12),
 ]
 
 

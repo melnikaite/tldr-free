@@ -51,7 +51,7 @@ def _trigger_names(engine) -> set[str]:
 def test_migrations_create_core_tables(fresh_engine) -> None:
     """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
     tables = _table_names(fresh_engine)
     for required in ("job", "message", "transcript_translation", "_migrations"):
@@ -88,12 +88,14 @@ def test_migrations_create_core_tables(fresh_engine) -> None:
     assert "diagnostics_json" in job_cols
     # v11 added job.moment_findings_json
     assert "moment_findings_json" in job_cols
+    # v12 added job.media_url
+    assert "media_url" in job_cols
 
 
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     assert second == []  # nothing new to apply
 
     tables = _table_names(fresh_engine)
@@ -120,7 +122,7 @@ def test_migration_runner_is_idempotent(fresh_engine) -> None:
 def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
     v5 (as if this code predated v6), then upgrade — v6 and every migration
-    added since (v7, v8, v9, v10, v11 — there's nothing between them to stop at)
+    added since (v7, v8, v9, v10, v11, v12 — there's nothing between them to stop at)
     should apply, and frame_refs_json must land without touching anything
     else."""
     v1_through_v5 = [m for m in MIGRATIONS if m[0] <= 5]
@@ -149,9 +151,9 @@ def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
         raw.close()
     assert "frame_refs_json" not in cols_before
 
-    # The upgrade: v6 through v11 are all new from this v5 baseline.
+    # The upgrade: v6 through v12 are all new from this v5 baseline.
     applied = run_migrations(fresh_engine)
-    assert applied == [6, 7, 8, 9, 10, 11]
+    assert applied == [6, 7, 8, 9, 10, 11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -201,7 +203,7 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
     """Simulates every real pre-existing daemon install: stop the runner at
     v6 (as if this code predated v7), insert several rows with DIFFERENT
     created_at values using only the v1-v6 schema (no added_at column exists
-    yet), then upgrade — v7 and every migration added since (v8, v9, v10, v11)
+    yet), then upgrade — v7 and every migration added since (v8, v9, v10, v11, v12)
     should apply, and every row's added_at must equal ITS OWN created_at,
     not a single backfill-time value."""
     v1_through_v6 = [m for m in MIGRATIONS if m[0] <= 6]
@@ -248,7 +250,7 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
     assert "added_at" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [7, 8, 9, 10, 11]
+    assert applied == [7, 8, 9, 10, 11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -279,7 +281,7 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
 
 def test_v8_applies_alone_on_a_db_already_at_v7(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
-    v7, then upgrade — v8 and every migration added since (v9, v10, v11) should
+    v7, then upgrade — v8 and every migration added since (v9, v10, v11, v12) should
     apply, and transcript_missing_seconds must land without touching
     anything else."""
     v1_through_v7 = [m for m in MIGRATIONS if m[0] <= 7]
@@ -307,7 +309,7 @@ def test_v8_applies_alone_on_a_db_already_at_v7(fresh_engine) -> None:
     assert "transcript_missing_seconds" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [8, 9, 10, 11]
+    assert applied == [8, 9, 10, 11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -355,7 +357,7 @@ def test_v8_applies_alone_on_a_db_already_at_v7(fresh_engine) -> None:
 
 def test_v9_applies_alone_on_a_db_already_at_v8(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
-    v8, then upgrade — v9 and every migration added since (v10, v11) should
+    v8, then upgrade — v9 and every migration added since (v10, v11, v12) should
     apply, and queued_reason must land without touching anything else."""
     v1_through_v8 = [m for m in MIGRATIONS if m[0] <= 8]
     assert [v for v, _ in v1_through_v8] == [1, 2, 3, 4, 5, 6, 7, 8]
@@ -382,7 +384,7 @@ def test_v9_applies_alone_on_a_db_already_at_v8(fresh_engine) -> None:
     assert "queued_reason" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [9, 10, 11]
+    assert applied == [9, 10, 11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -428,7 +430,7 @@ def test_v9_applies_alone_on_a_db_already_at_v8(fresh_engine) -> None:
 
 def test_v10_applies_alone_on_a_db_already_at_v9(fresh_engine) -> None:
     """Simulates every real pre-existing daemon install: stop the runner at
-    v9, then upgrade — v10 and every migration added since (v11) should
+    v9, then upgrade — v10 and every migration added since (v11, v12) should
     apply, and diagnostics_json must land without touching anything else."""
     v1_through_v9 = [m for m in MIGRATIONS if m[0] <= 9]
     assert [v for v, _ in v1_through_v9] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -455,7 +457,7 @@ def test_v10_applies_alone_on_a_db_already_at_v9(fresh_engine) -> None:
     assert "diagnostics_json" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [10, 11]
+    assert applied == [10, 11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -529,7 +531,7 @@ def test_v11_applies_alone_on_a_db_already_at_v10(fresh_engine) -> None:
     assert "moment_findings_json" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [11]
+    assert applied == [11, 12]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -563,6 +565,90 @@ def test_v11_applies_alone_on_a_db_already_at_v10(fresh_engine) -> None:
     reloaded = repo.get_job(job.id)
     assert reloaded is not None
     assert reloaded.moment_findings_json is None
+
+
+# ---------------------------------------------------------------------------
+# v12 regression — same class of bug the v6-v11 tests above guard against: a
+# DB that already ran v1-v11 (every real pre-existing install as of the
+# media-frame-source feature) must pick up ONLY v12 on the next start, and
+# the actual write path (repo.create_job persisting media_url) must work
+# against the freshly-upgraded schema.
+# ---------------------------------------------------------------------------
+
+
+def test_v12_applies_alone_on_a_db_already_at_v11(fresh_engine) -> None:
+    """Simulates every real pre-existing daemon install: stop the runner at
+    v11, then upgrade — only v12 should apply, and media_url must land
+    without touching anything else. Every pre-existing row gets
+    media_url=NULL (no ALTER TABLE ... DEFAULT, just NULL — same as every
+    other nullable column added since v3)."""
+    v1_through_v11 = [m for m in MIGRATIONS if m[0] <= 11]
+    assert [v for v, _ in v1_through_v11] == list(range(1, 12))
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(_MIGRATIONS_TABLE_DDL)
+        cur.close()
+        for version, migration in v1_through_v11:
+            migration(raw)
+            _record_applied(raw, version)
+        raw.commit()
+
+        # Seed a pre-existing row the way v1 would have (before media_url
+        # existed at all) so we can assert it reads back as NULL, not an
+        # error, after the upgrade.
+        cur = raw.cursor()
+        cur.execute(
+            "INSERT INTO job (id, url, kind, status, created_at, updated_at) "
+            "VALUES ('legacy1', 'https://example.com/page', 'media', 'done', "
+            "'2024-01-01T00:00:00', '2024-01-01T00:00:00')"
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_before = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "media_url" not in cols_before
+
+    applied = run_migrations(fresh_engine)
+    assert applied == [12]
+
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA table_info(job)")
+        cols_after = {row[1] for row in cur.fetchall()}
+    finally:
+        raw.close()
+    assert "media_url" in cols_after
+
+    legacy = repo.get_job("legacy1")
+    assert legacy is not None
+    assert legacy.media_url is None
+
+    # End-to-end: the actual write path this column exists for.
+    job = repo.create_job(
+        url="https://example.com/article",
+        kind="media",
+        media_url="https://cdn.example.com/signed/video.mp4?exp=123",
+    )
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.media_url == "https://cdn.example.com/signed/video.mp4?exp=123"
+
+    # Non-media jobs never get one, even if nobody passes it explicitly —
+    # the default is None, which reads identically to "nothing to use".
+    page_job = repo.create_job(url="https://example.com/other", kind="page")
+    reloaded_page = repo.get_job(page_job.id)
+    assert reloaded_page is not None
+    assert reloaded_page.media_url is None
 
 
 def test_pragmas_are_applied(fresh_engine) -> None:
