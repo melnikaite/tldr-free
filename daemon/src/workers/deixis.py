@@ -1,11 +1,13 @@
 """Find moments where a video's SPEECH points at its PICTURE.
 
-Feeds the (not-yet-wired) video-frame-understanding feature: when a speaker
-says "do it like this" / "this cream here" / "the article number is in the
-description", the transcript alone can't answer a follow-up question about
-what's on screen at that moment. Fetching frames costs a download (and,
-downstream, an LLM vision call), so we want to look ONLY where the speech
-actually gestures at the picture — not at every sentence containing "this".
+Feeds the video-frame-understanding LOOK step — wired into Q&A today
+(`llm/qa.py`'s `stream_answer`, via `llm/vision.py`'s `inspect_moment`),
+with summarization-time use planned next: when a speaker says "do it like
+this" / "this cream here" / "the article number is in the description",
+the transcript alone can't answer a follow-up question about what's on
+screen at that moment. Fetching frames costs a download (and, downstream,
+an LLM vision call), so we want to look ONLY where the speech actually
+gestures at the picture — not at every sentence containing "this".
 
 This module is PURE TEXT ANALYSIS: no network, no LLM, no frame fetching.
 Given the segment list already persisted on the job

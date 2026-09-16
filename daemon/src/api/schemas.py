@@ -434,7 +434,7 @@ class FrameRef(BaseModel):
     - The QA LOOK step (``llm/qa.py``) — at most one ``FrameRef`` per
       inspected deixis moment, and ONLY when the vision model reported the
       frames as genuinely relevant to the question (see
-      ``llm.qa.VisionResult`` / ``qa_frames.txt``). A moment that was
+      ``llm.vision.VisionResult`` / ``qa_frames.txt``). A moment that was
       looked at but found irrelevant contributes its finding text to the
       synthesis prompt same as before, but never produces a ``FrameRef`` —
       no thumbnail for "we checked and there was nothing to see".

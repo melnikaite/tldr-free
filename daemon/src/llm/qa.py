@@ -27,12 +27,13 @@ Public surface:
              see `_plan_tool` / `_plan_messages`.
           2. LOOK — for every index the model picked, fetch that moment's
              frames (`workers.frames.fetch_frames`) at a resolution driven by
-             the candidate's `DeixisCategory` (`_HEIGHT_BY_CATEGORY`) and ask
-             the multimodal LLM the narrow `qa_frames.txt` question via a
-             FORCED `report_frame_findings` tool call — a structured
-             `VisionResult` (finding text, relevant: bool, best_frame_index),
-             not free prose, so relevance is never guessed by regex/keyword
-             matching (see `_parse_vision_result`). A moment the model rates
+             the candidate's `DeixisCategory` (`llm.vision._HEIGHT_BY_CATEGORY`)
+             and ask the multimodal LLM the narrow `qa_frames.txt` question via
+             a FORCED `report_frame_findings` tool call — a structured
+             `llm.vision.VisionResult` (finding text, relevant: bool,
+             best_frame_index), not free prose, so relevance is never guessed
+             by regex/keyword matching (see `llm.vision._parse_vision_result`
+             / `llm.vision.inspect_moment`). A moment the model rates
              `relevant=True` also contributes a `FrameRef` — daemon-side, an
              actual thumbnail the client can show — collected into one
              `{"type": "frames", "items": [...]}` event yielded once after
@@ -71,26 +72,23 @@ Called from api/ai.py POST /ai/qa.
 
 from __future__ import annotations
 
-import base64
 import copy
 import json
 import logging
 import re
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from src.config import get_config
 from src.llm import client as llm_client
+from src.llm import vision as _vision
 from src.llm.tokens import count_tokens
 from src.workers import deixis as _deixis
-from src.workers import frames as _frames
 from src.workers import search as _search
 from src.workers import timecodes as _timecodes
 from src.workers.deixis import DeixisCandidate, DeixisCategory
-from src.workers.errors import FrameExtractionError
 
 log = logging.getLogger(__name__)
 
@@ -142,16 +140,6 @@ _PLAN_TOOL: dict[str, Any] = {
 # vision LLM call, so the budget is small and non-negotiable in code, not
 # left to the model's judgment.
 _MAX_LOOK_AT_MOMENTS = 2
-
-# Category -> section download resolution (workers/frames.py constants).
-# OBJECT candidates are worth reading a label off, ACTION candidates only
-# need to be seen. EXTERNAL is deliberately absent: it must never reach
-# fetch_frames at all (see the LOOK loop in stream_answer), so there is no
-# resolution to pick for it.
-_HEIGHT_BY_CATEGORY: dict[DeixisCategory, int] = {
-    DeixisCategory.OBJECT: _frames.SECTION_MAX_HEIGHT_READABLE_PX,
-    DeixisCategory.ACTION: _frames.SECTION_MAX_HEIGHT_PX,
-}
 
 _LOOK_AT_INDICES_PROPERTY: dict[str, Any] = {
     "type": "array",
@@ -413,178 +401,6 @@ def _parse_look_at_indices(raw: Any, num_candidates: int) -> list[int]:
     return indices
 
 
-
-# Forced single tool for the LOOK step's vision call — same technique as
-# `_PLAN_TOOL`/`_parse_plan` above: the model must fill in structured fields
-# rather than free prose, so `stream_answer` can decide WITHOUT any
-# regex/keyword guessing whether a frame actually contributed (see
-# `VisionResult`/`_parse_vision_result`).
-_VISION_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "report_frame_findings",
-        "description": (
-            "Report what the frames show, and whether any of them actually "
-            "help answer the question."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "finding": {
-                    "type": "string",
-                    "description": (
-                        "Your full answer per the instructions above: what's "
-                        "on screen, any readable text, any demonstrated "
-                        "action, and the one closing sentence on how it "
-                        "bears on the question (or that nothing relevant is "
-                        "visible). If the question names something you "
-                        "cannot actually see, say so plainly instead of "
-                        "describing it — writing this field is not evidence "
-                        "that the thing exists."
-                    ),
-                },
-                "relevant": {
-                    "type": "boolean",
-                    "description": (
-                        "true ONLY if the closing sentence you just wrote "
-                        "genuinely bears on the question — false for the "
-                        "'no information relevant to the question' case."
-                    ),
-                },
-                "best_frame_index": {
-                    "type": "integer",
-                    "description": (
-                        "The number, from the frame numbering you were "
-                        "given, of the single frame to SHOW A PERSON as "
-                        "evidence. Judge it on two things, in this order: "
-                        "(1) it must actually show the thing — the object, "
-                        "the readable text, the moment of the action; "
-                        "(2) among those, pick the well-captured one — not "
-                        "a mid-blink, eyes shut, head turned away, mouth "
-                        "open mid-word, awkward halfway pose, motion-smeared "
-                        "frame, or one where the thing shown is cut off by "
-                        "the frame edge. If none passes (2), still pick the "
-                        "one that shows the thing best. Give your best guess "
-                        "even when relevant is false."
-                    ),
-                },
-            },
-            "required": ["finding", "relevant", "best_frame_index"],
-        },
-    },
-}
-
-
-@dataclass(frozen=True)
-class VisionResult:
-    """Structured outcome of one LOOK-step vision call over a moment's frames.
-
-    ``relevant`` gates whether the client gets shown a thumbnail at all (see
-    `stream_answer`'s LOOK loop) — `finding` still goes into the synthesis
-    prompt's VISUAL FINDINGS either way, since "we checked and there was
-    nothing to see" is useful context for the answer even when
-    ``relevant`` is false.
-
-    ``best_frame_index`` is 1-based into the frame list the model was
-    actually shown, in the order it was given them (matching the numbering
-    `qa_frames.txt` tells the model about) — or ``None`` when nothing
-    usable came back (missing, non-numeric, or out of range). ``None``
-    means no thumbnail even when ``relevant`` is true, since there is
-    nothing valid to point a thumbnail at.
-    """
-
-    finding: str
-    relevant: bool
-    best_frame_index: int | None
-
-
-def _parse_best_frame_index(raw: Any, num_frames: int) -> int | None:
-    """Validate the model's chosen frame index into ``[1, num_frames]``.
-    Anything else (missing, non-numeric, out of range) is dropped rather
-    than failing the whole parse — mirrors `_parse_look_at_indices`'s
-    "drop rather than reject" spirit."""
-    try:
-        idx = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return idx if 1 <= idx <= num_frames else None
-
-
-def _parse_vision_result(
-    response: Any,
-    num_frames: int,
-    *,
-    job_id: Any = None,
-    timestamp: float | None = None,
-) -> VisionResult:
-    """Extract a `VisionResult` from the forced `report_frame_findings` tool
-    call. Mirrors `_parse_plan`'s defensive shape exactly: ANY malformed or
-    missing call degrades to ``VisionResult(finding="", relevant=False,
-    best_frame_index=None)`` — never raises. `_inspect_moment` already
-    promises to degrade to "no contribution" on any failure; this is what
-    keeps that promise even when the tool call itself comes back garbled.
-
-    Every degrade path below logs a warning — job id + moment timestamp,
-    same context the neighbouring log calls in `_inspect_moment` use — so
-    "the user got no thumbnail and no finding" leaves a trace instead of
-    vanishing silently. ``job_id``/``timestamp`` are optional (default
-    ``None``) purely for callers that don't have them (e.g. the harness
-    scripts in scratch dirs that call this directly); real QA turns always
-    pass both via `_ask_vision_about_frames`.
-    """
-    ts_label = f"{timestamp:.1f}s" if isinstance(timestamp, (int, float)) else "?"
-    try:
-        tool_calls = response.choices[0].message.tool_calls or []
-    except (AttributeError, IndexError):
-        log.warning(
-            "QA LOOK step: vision response had no tool_calls at all "
-            "(job %s at %s)", job_id, ts_label,
-        )
-        return VisionResult("", False, None)
-    for tc in tool_calls:
-        if tc.function.name != "report_frame_findings":
-            continue
-        try:
-            args = json.loads(tc.function.arguments)
-        except (json.JSONDecodeError, TypeError):
-            log.warning(
-                "QA LOOK step: vision tool call arguments failed to parse "
-                "as JSON — possibly truncated by max_tokens (job %s at %s)",
-                job_id, ts_label,
-            )
-            return VisionResult("", False, None)
-        finding = str(args.get("finding") or "").strip()
-        # Strict: only an explicit boolean True counts as relevant — same
-        # bar `_parse_plan` holds `material_sufficient` to.
-        relevant = args.get("relevant") is True
-        best_frame_index = _parse_best_frame_index(args.get("best_frame_index"), num_frames)
-        return VisionResult(finding, relevant, best_frame_index)
-    log.warning(
-        "QA LOOK step: vision response's tool call wasn't "
-        "'report_frame_findings' (job %s at %s)", job_id, ts_label,
-    )
-    return VisionResult("", False, None)
-
-
-@dataclass(frozen=True)
-class MomentInspection:
-    """What `_inspect_moment` learned about one LOOK-step moment — everything
-    `stream_answer` needs to both extend the synthesis prompt's VISUAL
-    FINDINGS and, when warranted, hand the client a `FrameRef`.
-
-    ``finding`` is ``""`` when nothing usable came back at all (any of the
-    degrade points in `_inspect_moment`'s docstring) — the caller skips
-    contributing it to VISUAL FINDINGS in that case, same as before this
-    feature. ``frame_path`` is the single frame the vision model singled
-    out as most informative, and is only ever set when the model reported
-    ``relevant=True`` AND a valid ``best_frame_index`` came back — that
-    combination is what decides whether a thumbnail is shown at all.
-    """
-
-    finding: str
-    frame_path: Path | None
-
-
 # Deixis candidates for the LOOK step, or ``[]`` when this job doesn't
 # qualify — which also keeps the PLAN tool/prompt byte-identical to before
 # the feature existed (see ``_plan_tool`` / ``_plan_messages``). Shared with
@@ -592,169 +408,6 @@ class MomentInspection:
 # affordance next to a summary line) via ``workers.deixis.candidates_for_job``
 # — see that function's docstring for the exact qualification rule.
 _deixis_candidates_for_job = _deixis.candidates_for_job
-
-
-def _frame_to_data_uri(path: Path) -> str:
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-
-# Budget for the vision call's generated tokens. Before the LOOK step's
-# vision output became a forced tool call, this only had to cover the
-# finding prose itself; now the finding text has to fit INSIDE the tool
-# call's JSON arguments alongside the field names/punctuation, and a
-# truncated arguments string is invalid JSON — under `_parse_vision_result`
-# that drops the WHOLE moment (thumbnail AND finding), where truncated free
-# prose used to just cut a sentence short. Measured against three real
-# findings this feature's harness produced for a Russian `output_language`
-# (Cyrillic costs noticeably more cl100k_base tokens per word than English):
-# finding text alone ranged 193-301 tokens, the full `{"finding": ...,
-# "relevant": ..., "best_frame_index": ...}` JSON 210-318 tokens. 900 keeps
-# roughly 3x headroom over the longest of those while staying well short of
-# runaway generation.
-_VISION_MAX_TOKENS = 900
-
-
-async def _ask_vision_about_frames(
-    frame_paths: Sequence[Path],
-    *,
-    candidate: DeixisCandidate,
-    question: str,
-    output_language: str,
-    job_id: Any = None,
-) -> VisionResult:
-    """Ask the multimodal LLM the narrow ``qa_frames.txt`` question about
-    ALL of one moment's frames in a SINGLE call — deliberately unlike
-    ``workers/pdf.py._ocr_one_page``, which sends exactly one image per call.
-
-    That difference is deliberate, not an oversight: pdf.py's pages are
-    independent documents-within-a-document (page N+1 has no bearing on
-    page N), so it isolates failures and spends tokens per page, one at a
-    time, by design. Here every frame in ``frame_paths`` is a ~1-frame/s
-    sample of the SAME few-second moment ``workers.frames.fetch_frames``
-    windowed around one deixis candidate — so cross-frame reasoning ("the
-    hand moves from A to B across these frames") is exactly what the
-    ACTION category exists to capture, and splitting them into separate
-    calls would throw that continuity away for no benefit. The token cost
-    stays bounded regardless: at most ``MAX_FRAMES_PER_CALL`` frames exist
-    per moment, and ``stream_answer`` inspects at most
-    ``_MAX_LOOK_AT_MOMENTS`` (2) moments per QA turn.
-
-    ``job_id`` is optional and used only to give `_parse_vision_result`'s
-    warning logs the same job context `_inspect_moment`'s neighbouring log
-    calls already carry — it plays no role in the call itself.
-    """
-    prompt = _load_prompt("qa_frames.txt").format(
-        output_language=output_language,
-        phrase=candidate.phrase,
-        question=question,
-    )
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for path in frame_paths:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": _frame_to_data_uri(path)},
-            }
-        )
-    resp = await llm_client.complete_with_messages(
-        [{"role": "user", "content": content}],
-        tools=[_VISION_TOOL],
-        tool_choice={"type": "function", "function": {"name": "report_frame_findings"}},
-        max_tokens=_VISION_MAX_TOKENS,
-        temperature=0.0,
-    )
-    return _parse_vision_result(
-        resp, len(frame_paths), job_id=job_id, timestamp=candidate.timestamp
-    )
-
-
-async def _inspect_moment(
-    *,
-    job: Any,
-    candidate: DeixisCandidate,
-    question: str,
-    output_language: str,
-) -> MomentInspection:
-    """Fetch frames for one chosen deixis candidate and ask the vision model
-    about them. Returns ``MomentInspection("", None)`` — never raises — on
-    ANY failure: ``FrameExtractionError``, an empty frame list (the job's
-    per-job frame budget is spent, see ``workers.frames.MAX_FRAMES_PER_JOB``),
-    or the vision call itself erroring (including a malformed tool-call
-    response — see `_parse_vision_result`). Each is logged as a warning and
-    just means this one moment contributes nothing to the synthesis prompt
-    and no thumbnail — the exact "degrade, don't break" spirit the rest of
-    this module already applies to a failed PLAN call (falls back to
-    search) or a failed web search (answers without it).
-
-    Callers must never pass an EXTERNAL candidate here — see the guard in
-    ``stream_answer``'s LOOK loop, which is this module's OWN enforcement
-    that EXTERNAL never triggers a frame fetch, independent of whether the
-    model honoured the plan prompt's instruction not to pick one.
-    """
-    job_id = getattr(job, "id", None)
-    url = getattr(job, "url", None)
-    if not job_id or not url:
-        return MomentInspection("", None)
-
-    max_height = _HEIGHT_BY_CATEGORY.get(candidate.category, _frames.SECTION_MAX_HEIGHT_PX)
-    try:
-        frame_paths = await _frames.fetch_frames(
-            job_id=job_id,
-            url=url,
-            timestamp_seconds=candidate.timestamp,
-            # No cookies: cookies only ever arrive on the original job-creation
-            # request (api.schemas.CreateJobRequest.cookies) and are never
-            # persisted on Job (see storage/db.py) — by QA time, long after
-            # ingestion, there is nothing stored to forward. A cookie-gated
-            # video's frame fetch just fails like any other network error
-            # below, degrading the same way.
-            cookies=None,
-            max_height_px=max_height,
-        )
-    except FrameExtractionError:
-        log.warning(
-            "QA LOOK step: frame fetch failed for job %s at %.1fs",
-            job_id, candidate.timestamp, exc_info=True,
-        )
-        return MomentInspection("", None)
-    except Exception:
-        log.warning(
-            "QA LOOK step: frame fetch raised unexpectedly for job %s at %.1fs",
-            job_id, candidate.timestamp, exc_info=True,
-        )
-        return MomentInspection("", None)
-
-    if not frame_paths:
-        log.warning(
-            "QA LOOK step: no frames returned for job %s at %.1fs "
-            "(per-job frame budget likely spent)",
-            job_id, candidate.timestamp,
-        )
-        return MomentInspection("", None)
-
-    try:
-        result = await _ask_vision_about_frames(
-            frame_paths,
-            candidate=candidate,
-            question=question,
-            output_language=output_language,
-            job_id=job_id,
-        )
-    except Exception:
-        log.warning(
-            "QA LOOK step: vision call failed for job %s at %.1fs",
-            job_id, candidate.timestamp, exc_info=True,
-        )
-        return MomentInspection("", None)
-
-    frame_path = (
-        frame_paths[result.best_frame_index - 1]
-        if result.relevant and result.best_frame_index is not None
-        else None
-    )
-    return MomentInspection(result.finding, frame_path)
 
 
 async def stream_answer(
@@ -803,14 +456,15 @@ async def stream_answer(
 
     # Step 2: LOOK — inspect the moments the plan named, if any. Each
     # inspection degrades to "no contribution" rather than raising (see
-    # `_inspect_moment`'s docstring), so a bad frame fetch or vision call
-    # never breaks the rest of the QA turn.
+    # `llm.vision.inspect_moment`'s docstring), so a bad frame fetch or
+    # vision call never breaks the rest of the QA turn.
     frame_findings: list[str] = []
     # One entry per moment the vision model reported as actually relevant —
-    # never "just because we fetched something" (see MomentInspection /
-    # VisionResult). Emitted as a single `frames` event below, after the
-    # loop, and forwarded by api/ai.py to be persisted on the assistant
-    # message so history reload renders the identical thumbnail.
+    # never "just because we fetched something" (see
+    # llm.vision.MomentInspection / llm.vision.VisionResult). Emitted as a
+    # single `frames` event below, after the loop, and forwarded by
+    # api/ai.py to be persisted on the assistant message so history reload
+    # renders the identical thumbnail.
     frame_refs: list[dict[str, Any]] = []
     job_id_for_frames = getattr(job, "id", None)
     for idx in look_at_indices:
@@ -832,7 +486,7 @@ async def stream_answer(
             "stage": "looking",
             "detail": f"{timecode} — {candidate.phrase}",
         }
-        inspection = await _inspect_moment(
+        inspection = await _vision.inspect_moment(
             job=job,
             candidate=candidate,
             question=question,

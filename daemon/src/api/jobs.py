@@ -858,7 +858,7 @@ def list_moments(job_id: str) -> MomentsListResponse:
 # Small enough (2 entries) that it isn't worth sharing across modules — see
 # workers/frames.py's own module docstring: mapping a deixis category to a
 # resolution is deliberately the CALLER's job, not that module's. Mirrors
-# llm/qa.py's `_HEIGHT_BY_CATEGORY` (OBJECT is worth reading a label off;
+# llm/vision.py's `_HEIGHT_BY_CATEGORY` (OBJECT is worth reading a label off;
 # ACTION only needs to be seen; EXTERNAL is absent on purpose — it can never
 # reach here, see the guard in `fetch_moment_frames` below).
 _MOMENT_HEIGHT_BY_CATEGORY: dict[DeixisCategory, int] = {

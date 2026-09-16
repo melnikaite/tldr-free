@@ -27,7 +27,7 @@ Public surface:
         ``storage/repo.py`` delete paths (explicit delete + retention sweep).
 
 Not wired into the pipeline itself — only the QA LOOK step
-(``llm/qa.py``'s ``_inspect_moment``) and the on-demand "look" affordance
+(``llm/vision.py``'s ``inspect_moment``) and the on-demand "look" affordance
 (``api/jobs.py``'s ``POST /jobs/{id}/frames``) call ``fetch_frames``. This
 module only produces JPEG files on disk and hands back their paths; those
 callers are responsible for what happens to them next (feeding them to the

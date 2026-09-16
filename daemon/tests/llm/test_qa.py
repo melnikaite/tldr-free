@@ -31,6 +31,7 @@ import pytest
 
 from src.llm import client as llm_client
 from src.llm import qa as qa_mod
+from src.llm import vision as vision_mod
 from src.workers import frames as frames_mod
 from src.workers.deixis import DeixisCandidate, DeixisCategory
 from src.workers.errors import FrameExtractionError
@@ -568,7 +569,7 @@ def _vision_tool_completion(
 ) -> Any:
     """ChatCompletion mock carrying a `report_frame_findings` tool call —
     the shape the LOOK step's vision call returns once frames were sent
-    (see `qa_mod._VISION_TOOL` / `qa_mod._parse_vision_result`)."""
+    (see `vision_mod._VISION_TOOL` / `vision_mod._parse_vision_result`)."""
     args = json.dumps(
         {
             "finding": finding,
@@ -622,7 +623,7 @@ async def test_candidates_offered_to_plan_and_only_chosen_fetched(
     monkeypatch.setattr(
         qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT, _CAND_ACTION]
     )
-    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+    monkeypatch.setattr(vision_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
 
     fetch_calls: list[dict[str, Any]] = []
 
@@ -630,7 +631,7 @@ async def test_candidates_offered_to_plan_and_only_chosen_fetched(
         fetch_calls.append(kwargs)
         return [Path("/tmp/frame_01.jpg")]
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
 
     plan_tools_seen: list[list[dict[str, Any]]] = []
     plan_prompts_seen: list[str] = []
@@ -704,7 +705,7 @@ async def test_action_category_uses_lower_resolution(
     monkeypatch.setattr(
         qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_ACTION]
     )
-    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+    monkeypatch.setattr(vision_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
 
     fetch_calls: list[dict[str, Any]] = []
 
@@ -712,7 +713,7 @@ async def test_action_category_uses_lower_resolution(
         fetch_calls.append(kwargs)
         return [Path("/tmp/frame_01.jpg")]
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         if _is_plan_call(kwargs):
@@ -749,7 +750,7 @@ async def test_external_candidate_never_fetches_even_if_named(
     async def boom_fetch(**kwargs: Any) -> list[Path]:
         raise AssertionError("fetch_frames must never be called for an EXTERNAL candidate")
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", boom_fetch)
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom_fetch)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         if kwargs.get("tools"):
@@ -789,7 +790,7 @@ async def test_frame_extraction_error_degrades_gracefully(
     async def boom_fetch(**kwargs: Any) -> list[Path]:
         raise FrameExtractionError("section download failed")
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", boom_fetch)
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom_fetch)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         return _plan_completion_with_indices(True, "q", [1])
@@ -827,7 +828,7 @@ async def test_empty_frame_list_degrades_gracefully(
     async def empty_fetch(**kwargs: Any) -> list[Path]:
         return []
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", empty_fetch)
+    monkeypatch.setattr(frames_mod, "fetch_frames", empty_fetch)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         return _plan_completion_with_indices(True, "q", [1])
@@ -856,12 +857,12 @@ async def test_vision_call_error_degrades_gracefully(
     monkeypatch.setattr(
         qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT]
     )
-    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+    monkeypatch.setattr(vision_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
 
     async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
         return [Path("/tmp/frame_01.jpg")]
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         if _is_plan_call(kwargs):
@@ -905,7 +906,7 @@ async def test_no_candidates_keeps_plan_byte_identical(
     def boom_fetch(**kwargs: Any) -> Any:
         raise AssertionError("fetch_frames must not run with no candidates")
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", boom_fetch)
+    monkeypatch.setattr(frames_mod, "fetch_frames", boom_fetch)
 
     seen_tools: list[list[dict[str, Any]]] = []
     seen_prompts: list[str] = []
@@ -982,8 +983,8 @@ async def test_audio_job_without_segments_also_takes_unchanged_path(
 
 def test_parse_vision_result_valid_relevant() -> None:
     resp = _vision_tool_completion("A red tub on the desk.", True, 2)
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
-    assert result == qa_mod.VisionResult("A red tub on the desk.", True, 2)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
+    assert result == vision_mod.VisionResult("A red tub on the desk.", True, 2)
 
 
 def test_parse_vision_result_relevant_false_keeps_finding() -> None:
@@ -993,7 +994,7 @@ def test_parse_vision_result_relevant_false_keeps_finding() -> None:
     resp = _vision_tool_completion(
         "The frames show no information relevant to the question.", False, 1
     )
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
     assert result.relevant is False
     assert result.finding == "The frames show no information relevant to the question."
 
@@ -1002,8 +1003,8 @@ def test_parse_vision_result_malformed_tool_call_degrades() -> None:
     """No tool call at all (backend ignored tool_choice, or errored) ->
     degrade to relevant=False, no frame, empty finding — never raise."""
     resp = _vision_completion("some free-text the model wrote instead")
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
-    assert result == qa_mod.VisionResult("", False, None)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
+    assert result == vision_mod.VisionResult("", False, None)
 
 
 def test_parse_vision_result_bad_json_degrades() -> None:
@@ -1011,8 +1012,8 @@ def test_parse_vision_result_bad_json_degrades() -> None:
     tc = types.SimpleNamespace(id="call_vision", type="function", function=func)
     msg = types.SimpleNamespace(content=None, tool_calls=[tc])
     resp = types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
-    assert result == qa_mod.VisionResult("", False, None)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
+    assert result == vision_mod.VisionResult("", False, None)
 
 
 def test_parse_vision_result_out_of_range_frame_index_drops_index_only() -> None:
@@ -1020,7 +1021,7 @@ def test_parse_vision_result_out_of_range_frame_index_drops_index_only() -> None
     but the rest of the parse (finding, relevant) is still honoured —
     mirrors _parse_look_at_indices's "drop rather than fail everything"."""
     resp = _vision_tool_completion("A demonstrated action.", True, 99)
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
     assert result.best_frame_index is None
     assert result.relevant is True
     assert result.finding == "A demonstrated action."
@@ -1028,14 +1029,14 @@ def test_parse_vision_result_out_of_range_frame_index_drops_index_only() -> None
 
 def test_parse_vision_result_non_numeric_frame_index_drops_index_only() -> None:
     resp = _vision_tool_completion("Something visible.", True, "two")
-    result = qa_mod._parse_vision_result(resp, num_frames=3)
+    result = vision_mod._parse_vision_result(resp, num_frames=3)
     assert result.best_frame_index is None
 
 
 def test_parse_vision_result_truthy_non_bool_relevant_is_not_relevant() -> None:
     """Same strict-boolean bar _parse_plan holds material_sufficient to."""
     resp = _vision_tool_completion("Something visible.", 1, 1)
-    result = qa_mod._parse_vision_result(resp, num_frames=1)
+    result = vision_mod._parse_vision_result(resp, num_frames=1)
     assert result.relevant is False
 
 
@@ -1049,12 +1050,12 @@ async def test_relevant_moment_emits_frames_event(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT]
     )
-    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+    monkeypatch.setattr(vision_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
 
     async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
         return [Path("/tmp/t12/frame_01.jpg"), Path("/tmp/t12/frame_02.jpg")]
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         if _is_plan_call(kwargs):
@@ -1100,12 +1101,12 @@ async def test_irrelevant_moment_skips_frames_event_but_keeps_finding(
     monkeypatch.setattr(
         qa_mod._deixis, "find_deixis_candidates", lambda *a, **k: [_CAND_OBJECT]
     )
-    monkeypatch.setattr(qa_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
+    monkeypatch.setattr(vision_mod, "_frame_to_data_uri", lambda p: f"data:fake:{p}")
 
     async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
         return [Path("/tmp/t12/frame_01.jpg")]
 
-    monkeypatch.setattr(qa_mod._frames, "fetch_frames", fake_fetch_frames)
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
 
     async def fake_complete(messages: list[dict], **kwargs: Any) -> Any:
         if _is_plan_call(kwargs):
