@@ -29,6 +29,7 @@
 //   chrome.storage.session.activeUrl    → URL the panel is following
 
 import { daemon } from "../lib/daemon-client.js";
+import { getCookiesForDomain, getCookiesForUrl } from "../lib/cookies.js";
 import { classifyError, describeQueuedDetail, isDaemonUnreachable } from "../lib/error-hints.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { buildFrameRow } from "../lib/frame-thumbnails.js";
@@ -37,6 +38,7 @@ import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
   setActiveJob as _chatSetActiveJob,
   getActiveJob,
+  peekActiveJob,
   renderHistory,
   clearChat,
 } from "./chat.js";
@@ -1088,6 +1090,30 @@ function _insertLookAffordance(anchor, job, moment) {
 }
 
 /**
+ * Cookies to send along with a "look" frame fetch, mirroring
+ * background.js's own per-job-kind cookie collection at job creation:
+ * domain-scoped `.youtube.com` for YouTube jobs (broad — YouTube auth
+ * cookies aren't reliably scoped to the watch-page URL itself), URL-scoped
+ * on the job's own URL otherwise (narrower — avoids leaking unrelated
+ * cookies from sibling subdomains when a concrete URL is known). A failure
+ * to read cookies must never block the fetch — log and continue with an
+ * empty list, same as background.js does.
+ *
+ * @param {import("../lib/api-types.js").JobDetails} job
+ * @returns {Promise<import("../lib/api-types.js").Cookie[]>}
+ */
+async function _collectLookCookies(job) {
+  try {
+    return job.kind === "youtube"
+      ? await getCookiesForDomain(".youtube.com")
+      : await getCookiesForUrl(job.url);
+  } catch (err) {
+    console.warn("[TLDR] cookies.getAll failed", err);
+    return [];
+  }
+}
+
+/**
  * @param {HTMLButtonElement} btn
  * @param {HTMLAnchorElement} anchor
  * @param {import("../lib/api-types.js").JobDetails} job
@@ -1099,7 +1125,8 @@ async function _handleLookClick(btn, anchor, job, moment) {
   btn.disabled = true;
   btn.classList.add("look-affordance--pending");
   try {
-    const { items } = await daemon.fetchMomentFrames(job.id, moment.seconds);
+    const cookies = await _collectLookCookies(job);
+    const { items } = await daemon.fetchMomentFrames(job.id, moment.seconds, cookies);
     const base = await daemon.baseUrl();
     const chosen = _pickRepresentativeFrames(items, moment.category);
     const row = buildFrameRow(job, chosen, base);
@@ -1125,8 +1152,49 @@ async function _handleLookClick(btn, anchor, job, moment) {
   } catch (err) {
     btn.disabled = false;
     btn.classList.remove("look-affordance--pending");
-    _showLookError(btn, stringifyError(err));
+    const raw = stringifyError(err);
+    _showLookError(btn, _describeLookError(raw), raw);
   }
+}
+
+/**
+ * Map a `POST /jobs/{id}/frames` failure to a short, actionable sentence.
+ * `raw` is `daemon-client.js`'s `request()`-built error message
+ * (`"<status> <statusText>: <body>"`, where `<body>` is the daemon's raw
+ * response text — usually `{"detail": "..."}`) — see the cases the route
+ * actually raises in `daemon/src/api/jobs.py`'s `fetch_moment_frames`:
+ * 404 (no matching moment / job not found), 400 (EXTERNAL moment — not
+ * reachable from the UI since `GET /moments` never offers one), 409 (no
+ * source url, or the per-job frame budget already spent), 502 (the section
+ * download itself failed, wrapping whatever yt-dlp said).
+ *
+ * The sign-in case isn't its own HTTP status — it's yt-dlp's own "Please
+ * sign in." text arriving inside a 502 (see workers/frames.py). Checked
+ * first since after cookie-forwarding (frame-fetch cookies are no longer
+ * always `None`) this is squarely the user's own YouTube session, not a
+ * bug — so it gets its own, actionable message rather than falling into
+ * the generic 502 fallback.
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+function _describeLookError(raw) {
+  if (/sign[\s-]?in/i.test(raw)) {
+    // Report what happened, not why: yt-dlp's "Please sign in." shows up
+    // both when YouTube genuinely rejects the session and when the
+    // cookies simply never reached yt-dlp — we can't tell which from here,
+    // so no diagnosis, and no instruction the user may not be able to act on.
+    return "Couldn't fetch the frame — YouTube blocked the download for this video.";
+  }
+  const statusMatch = raw.match(/^(\d{3})\b/);
+  const statusCode = statusMatch ? Number(statusMatch[1]) : null;
+  if (statusCode === 409) {
+    return "This job's frame budget is already used up — no more frames can be fetched for it.";
+  }
+  if (statusCode === 404) {
+    return "That moment could not be found for this job.";
+  }
+  return "Could not fetch the video frame.";
 }
 
 /** @param {HTMLButtonElement} btn */
@@ -1137,13 +1205,16 @@ function _clearLookError(btn) {
 
 /**
  * @param {HTMLButtonElement} btn
- * @param {string} message
+ * @param {string} message     - short, human-readable sentence shown inline
+ * @param {string} [rawDetail] - full original error text, kept reachable via
+ *   `title` for debugging (never discarded, just not rendered inline)
  */
-function _showLookError(btn, message) {
+function _showLookError(btn, message, rawDetail) {
   _clearLookError(btn);
   const span = document.createElement("span");
   span.className = "look-affordance-error";
   span.textContent = message;
+  if (rawDetail) span.title = rawDetail;
   btn.insertAdjacentElement("afterend", span);
 }
 
@@ -1380,30 +1451,39 @@ function _attachStreamSubscription(job) {
       cancelRender();
       streamAccCache.delete(job.id);
       const content = ev.content || acc;
+      // Render from the freshest known job state, not the `job` parameter
+      // captured when this subscription started — that closure still
+      // carries whatever title/fields were true at subscribe time, and for
+      // YouTube specifically that's the seeded video-id title (see
+      // patchActiveJobIfMatches, which patches the DOM directly but never
+      // touched this closure). `peekActiveJob()` is a synchronous read of
+      // the same in-memory cache patchActiveJobIfMatches keeps current, so
+      // this can't race a later event the way an async re-fetch could.
+      const cur = peekActiveJob();
+      const stillActive = cur?.id === job.id;
+      const freshJob = stillActive ? { ...cur, status: "done", summary_md: content } : { ...job, status: "done", summary_md: content };
       // Persist summary_md into the in-memory active-job cache: a later
       // renderFromJob(active) (window restore, tab switch back) would
       // otherwise see status="done" with summary_md=null (the daemon's
       // job_event publishes JobSummary without summary_md) and fall
-      // through to the streaming placeholder. Merge into the *current*
-      // active so mid-stream patches (yt-dlp title, etc.) aren't lost.
-      getActiveJob().then((cur) => {
-        if (cur?.id === job.id) {
-          setActiveJob({ ...cur, status: "done", summary_md: content });
-        }
-      });
-      renderState({ mode: "done", job, content });
+      // through to the streaming placeholder. Only touch the shared cache
+      // when this subscription's job is still the active one — otherwise
+      // the panel has since switched to a different job and writing here
+      // would clobber ITS state.
+      if (stillActive) setActiveJob(freshJob);
+      renderState({ mode: "done", job: freshJob, content });
     } else if (ev.type === "error") {
       cancelRender();
       streamAccCache.delete(job.id);
       const error = ev.error || "Error";
-      // Same reasoning as the "done" branch — mirror status/error into the
-      // cache so the failed-state render branch is taken on later renders.
-      getActiveJob().then((cur) => {
-        if (cur?.id === job.id) {
-          setActiveJob({ ...cur, status: "failed", error });
-        }
-      });
-      renderState({ mode: "error", message: error, job });
+      // Same reasoning as the "done" branch — render from the freshest
+      // known job state (mid-stream patches like the yt-dlp title fill
+      // must not be lost) rather than the closure-captured `job`.
+      const cur = peekActiveJob();
+      const stillActive = cur?.id === job.id;
+      const freshJob = stillActive ? { ...cur, status: "failed", error } : { ...job, status: "failed", error };
+      if (stillActive) setActiveJob(freshJob);
+      renderState({ mode: "error", message: error, job: freshJob });
     }
   });
 }

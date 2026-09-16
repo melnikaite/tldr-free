@@ -345,6 +345,7 @@
  *
  * @typedef {object} FrameFetchRequest
  * @property {number} seconds
+ * @property {Cookie[]} [cookies]   - forwarded for this request only, never persisted; makes sign-in-gated videos work
  */
 
 /**

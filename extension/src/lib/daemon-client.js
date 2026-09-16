@@ -355,14 +355,19 @@ export const daemon = {
    * non-2xx response — 404 (unknown job/moment), 400 (EXTERNAL moment),
    * 409 (per-job frame budget spent), 502 (download failed after retries).
    *
+   * `cookies` are forwarded for this request only — never persisted on
+   * the job (see schemas.py's `FrameFetchRequest`) — so a sign-in-gated
+   * source video can be fetched the same way job creation forwards cookies.
+   *
    * @param {string} id
    * @param {number} seconds
+   * @param {import("./api-types.js").Cookie[]} [cookies]
    * @returns {Promise<FrameFetchResponse>}
    */
-  fetchMomentFrames: (id, seconds) =>
+  fetchMomentFrames: (id, seconds, cookies) =>
     request(`/jobs/${id}/frames`, {
       method: "POST",
-      body: JSON.stringify({ seconds }),
+      body: JSON.stringify({ seconds, cookies: cookies || [] }),
     }),
 
   /**

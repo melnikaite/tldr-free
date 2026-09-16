@@ -63,6 +63,20 @@ export async function getActiveJob() {
   }
 }
 
+/**
+ * Synchronous read of the in-memory active job — `null` only when nothing
+ * has been loaded yet in this panel session (unlike `getActiveJob()`, this
+ * never falls back to `chrome.storage.session` + a `daemon.getJob` fetch).
+ * For callers that need the freshest already-known job state (e.g. a live
+ * mid-stream title patch) without introducing an async gap a later event
+ * could race past — see app.js's stream "done"/"error" handling.
+ *
+ * @returns {JobDetails | null}
+ */
+export function peekActiveJob() {
+  return activeJob;
+}
+
 const form = /** @type {HTMLFormElement | null} */ (document.getElementById("chat-form"));
 const input = /** @type {HTMLTextAreaElement | null} */ (document.getElementById("chat-input"));
 const messages = /** @type {HTMLElement | null} */ (document.getElementById("chat-messages"));

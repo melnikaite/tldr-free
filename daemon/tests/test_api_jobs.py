@@ -1184,6 +1184,51 @@ def test_fetch_moment_frames_happy_path(
     assert captured["max_height_px"] == frames_mod.SECTION_MAX_HEIGHT_PX
     assert captured["reuse_existing"] is True
     assert captured["timestamp_seconds"] == _ACTION_SECONDS
+    # No cookies were sent on this request — forwarded as an empty list,
+    # never None (fetch_frames's own default), so the route always passes
+    # something JSON-serializable through.
+    assert captured["cookies"] == []
+
+
+def test_fetch_moment_frames_forwards_cookies(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unlike the original job-creation cookies, these are never persisted —
+    they only ever exist for the lifetime of this one request. Regression
+    test for the sign-in-gated-video 502: the route must hand whatever
+    cookies the caller sent this request straight to `fetch_frames`."""
+    job_id = _make_audio_job(client)
+    frame_path = tmp_path / "frame_01.jpg"
+    frame_path.write_bytes(b"jpeg")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch_frames(**kwargs: Any) -> list[Path]:
+        captured.update(kwargs)
+        return [frame_path]
+
+    from src.workers import frames as frames_mod
+
+    monkeypatch.setattr(frames_mod, "fetch_frames", fake_fetch_frames)
+
+    cookie = {
+        "name": "SID",
+        "value": "abc123",
+        "domain": ".youtube.com",
+        "path": "/",
+        "secure": True,
+        "http_only": True,
+        "expires": None,
+    }
+    r = client.post(
+        f"/jobs/{job_id}/frames",
+        json={"seconds": _ACTION_SECONDS, "cookies": [cookie]},
+    )
+    assert r.status_code == 200, r.text
+    assert len(captured["cookies"]) == 1
+    assert captured["cookies"][0].name == "SID"
+    assert captured["cookies"][0].value == "abc123"
+    assert captured["cookies"][0].domain == ".youtube.com"
 
 
 def test_fetch_moment_frames_uses_readable_height_for_object_category(

@@ -937,11 +937,14 @@ async def fetch_moment_frames(job_id: str, req: FrameFetchRequest) -> FrameFetch
             url=url,
             timestamp_seconds=match.timestamp,
             max_height_px=max_height,
-            # No cookies: cookies only ever arrive on the original
-            # job-creation request and are never persisted on Job (see
-            # llm/qa.py's `_inspect_moment` — same story here, long after
-            # ingestion there is nothing stored to forward).
-            cookies=None,
+            # Forwarded from this request's own body, never persisted on
+            # Job — the rule that cookies don't survive the request that
+            # carried them is unchanged; this route just stopped being the
+            # one place with nothing to forward. This is what makes a
+            # sign-in-gated video work: the side panel reads the browser's
+            # own cookies fresh on each "look" click and sends them along,
+            # exactly as background.js does on job creation.
+            cookies=list(req.cookies or []),
             reuse_existing=True,
         )
     except FrameExtractionError as exc:

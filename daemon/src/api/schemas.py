@@ -498,6 +498,12 @@ class FrameFetchRequest(BaseModel):
     back exactly what it was given).
     """
     seconds: float
+    # Forwarded straight through to ``workers.frames.fetch_frames`` for THIS
+    # request only, never persisted anywhere (see the route). Needed for a
+    # sign-in-gated source video: without them yt-dlp gets the same
+    # anonymous view a logged-out browser tab would, which fails with
+    # "Please sign in." for a gated video.
+    cookies: list[Cookie] = []
 
 
 class FrameFetchResponse(BaseModel):
