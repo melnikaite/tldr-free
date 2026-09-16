@@ -21,6 +21,33 @@ Every LLM call in this module (streaming and non-streaming, map and reduce)
 is guarded against a repetition-loop degeneration by ``llm.repetition`` —
 see that module's docstring for the measured incident and threshold
 rationale.
+
+The timestamp rule is source-dependent, threaded the same way as the
+recognition-error note: ``_TRANSCRIPT_SOURCE_NOTE`` carries a mechanical
+"every bullet MUST start with a copied-verbatim timestamp" rule,
+``_DOCUMENT_SOURCE_NOTE`` carries the opposite — an unconditional
+prohibition, since a document has no timeline at all and a small local model
+measurably fabricates timestamps when the only guard is a parenthetical
+exception on an otherwise-mandatory rule. Both live inside ``{source_note}``
+in all three prompts (single/chunk/reduce) rather than as a rule duplicated
+three times with its own escape hatch — one selection point
+(``_source_note``), same as everywhere else this note is used.
+
+This module has no notion of "visual findings" as a separate input anymore.
+Summary-time frame-analysis findings (``workers.pipeline``'s
+``_run_frame_analysis`` / ``llm/vision.py``) are woven directly into the
+transcript TEXT before it ever reaches this module, via
+``workers.timecodes.inject_visual_findings`` — each finding becomes its own
+``⟦PICTURE [MM:SS]: ...⟧`` line at its own position in the
+material, not a separate labelled block appended after it. See that
+function's docstring for why: a prior design appended findings as a
+separate list with an explicit "weave, don't enumerate" instruction, and a
+real deployed run showed the model ignoring that instruction and emitting
+one bullet per finding anyway — the fix changes the SHAPE of the input, not
+the wording. Because the findings now travel inside the material itself,
+they automatically reach every pass that sees the material — single-pass,
+AND the per-chunk map calls that a purely single-pass/reduce placement used
+to miss on a long video.
 """
 
 from __future__ import annotations
@@ -87,7 +114,11 @@ def _source_note(*, from_audio_transcript: bool) -> str:
 
 
 def _build_single_pass_prompt(
-    text: str, *, title: str | None, output_language: str, source_note: str
+    text: str,
+    *,
+    title: str | None,
+    output_language: str,
+    source_note: str,
 ) -> str:
     template = _load_prompt("summary_single.txt")
     return template.format(
@@ -106,7 +137,10 @@ async def _stream_single_pass(
     source_note: str,
 ) -> AsyncIterator[str]:
     prompt = _build_single_pass_prompt(
-        text, title=title, output_language=output_language, source_note=source_note
+        text,
+        title=title,
+        output_language=output_language,
+        source_note=source_note,
     )
     # abort_on_repeated_lines guards against a small local model locking
     # into a repetition loop and burning the whole max_tokens budget on one
@@ -145,7 +179,11 @@ async def _summarize_chunk(
 
 
 def _build_reduce_prompt(
-    partials: list[str], *, title: str | None, output_language: str, source_note: str
+    partials: list[str],
+    *,
+    title: str | None,
+    output_language: str,
+    source_note: str,
 ) -> str:
     combined = "\n\n---\n\n".join(partials)
     template = _load_prompt("summary_reduce.txt")
@@ -165,7 +203,10 @@ async def _stream_reduce(
     source_note: str,
 ) -> AsyncIterator[str]:
     prompt = _build_reduce_prompt(
-        partials, title=title, output_language=output_language, source_note=source_note
+        partials,
+        title=title,
+        output_language=output_language,
+        source_note=source_note,
     )
     async for delta in abort_on_repeated_lines(
         llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3)
@@ -262,6 +303,16 @@ async def stream_summarize(
 
     ``from_audio_transcript`` adds a note telling the model the source is a
     speech-to-text transcript that may contain recognition errors to correct.
+
+    This function has no notion of "visual findings" — any summary-time
+    on-screen findings are expected to already be woven into ``text`` by the
+    caller (``workers.timecodes.inject_visual_findings``) before it ever
+    reaches here. See the module docstring for why: they now travel as
+    ordinary ``[MM:SS] ⟦PICTURE: ...⟧`` lines inside the material,
+    so whatever this function does with ``text`` — single-pass, or split
+    into map-phase chunks — carries them along automatically, including into
+    per-chunk map calls, which the previous separate-block design never
+    reached on a long video.
     """
     if not text or not text.strip():
         return
@@ -270,7 +321,10 @@ async def stream_summarize(
     threshold = get_config().llm.single_pass_token_limit
     if count_tokens(text) < threshold:
         async for delta in _stream_single_pass(
-            text, title=title, output_language=output_language, source_note=note
+            text,
+            title=title,
+            output_language=output_language,
+            source_note=note,
         ):
             yield delta
         return
@@ -323,7 +377,10 @@ async def stream_summarize(
         budget=threshold,
     )
     async for delta in _stream_reduce(
-        partials, title=title, output_language=output_language, source_note=note
+        partials,
+        title=title,
+        output_language=output_language,
+        source_note=note,
     ):
         yield delta
 

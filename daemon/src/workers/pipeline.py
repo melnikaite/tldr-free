@@ -26,8 +26,10 @@ Stage names are coordinated with the schema's AIStageEvent docs:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -41,8 +43,10 @@ from src.api.schemas import (
 from src.config import get_config
 from src.llm import languages
 from src.llm import summary as llm_summary
+from src.llm import vision as llm_vision
 from src.storage import repo
-from src.workers import page, timecodes, youtube
+from src.workers import deixis, page, timecodes, youtube
+from src.workers import frames as frames_mod
 from src.workers import pdf as pdf_worker
 from src.workers.broker import (
     delta_event,
@@ -52,6 +56,7 @@ from src.workers.broker import (
     stage_event,
 )
 from src.workers.control import get_control
+from src.workers.deixis import DeixisCandidate, DeixisCategory
 from src.workers.errors import (
     ExhaustedRetriesError,
     PermanentTranscriptError,
@@ -120,7 +125,13 @@ async def run_pipeline(
     token = set_job_id(job_id)
     try:
         if kind == JobKind.PAGE:
-            await _run_page(job_id, url=url, page_text=page_text, page_title=page_title)
+            await _run_page(
+                job_id,
+                url=url,
+                page_text=page_text,
+                page_title=page_title,
+                cookies=cookies,
+            )
         elif kind == JobKind.MEDIA:
             if not media_url:
                 # Defensive: api/jobs validates this upstream, but the
@@ -168,6 +179,7 @@ async def _run_page(
     url: str,
     page_text: str | None,
     page_title: str | None,
+    cookies: list[Any],
 ) -> None:
     broker = get_broker()
     cfg = get_config()
@@ -220,6 +232,7 @@ async def _run_page(
         transcript_source=transcript_source,
         video_id=None,
         cfg=cfg,
+        cookies=cookies,
     )
 
 
@@ -424,6 +437,7 @@ async def _finish_caption_fast_path(
         transcript_language=transcript_language,
         raw_segments_json=raw_segments_json,
         cfg=cfg,
+        cookies=cookies,
     )
 
 
@@ -587,6 +601,7 @@ async def _run_pdf(
         transcript_source=transcript_source,
         video_id=None,
         cfg=cfg,
+        cookies=cookies,
     )
 
 
@@ -623,6 +638,192 @@ def _persist_extracted(
     )
 
 
+# ---------------------------------------------------------------------------
+# Summary-time frame analysis — runs BEFORE summarization for jobs with a
+# timestamped speech transcript, so the summary prompt can say what the
+# video's picture actually shows instead of only what the words say.
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_moment_frames_safe(
+    job: Any, candidate: DeixisCandidate, job_id: str, cookies: list[Any]
+) -> list[Path]:
+    """`llm.vision.fetch_moment_frames`, degraded: any failure (download
+    error, budget spent) logs a warning and returns ``[]`` rather than
+    raising — this step must never fail the job over one bad moment. Kept
+    as its own function (rather than inlined in the conveyor loop below) so
+    it can be handed to ``asyncio.create_task`` for the prefetch.
+
+    ``cookies`` is the ingestion-time cookie list still in scope via
+    ``run_pipeline`` → ``_summarize_and_finish`` → ``_run_frame_analysis``
+    — see ``llm.vision.fetch_moment_frames``'s docstring for why this step
+    (unlike the QA LOOK step) has cookies to forward at all.
+    """
+    try:
+        return await llm_vision.fetch_moment_frames(job=job, candidate=candidate, cookies=cookies)
+    except Exception:
+        log.warning(
+            "frame analysis: frame fetch failed for job %s at %.1fs",
+            job_id, candidate.timestamp, exc_info=True,
+        )
+        return []
+
+
+async def _run_frame_analysis(
+    job_id: str, broker: Any, cookies: list[Any]
+) -> list[dict[str, Any]]:
+    """Summary-time counterpart to the QA LOOK step: inspect a handful of
+    moments where the transcript's speech points at the video's picture,
+    and return the ones a vision model judged as actually adding something
+    (see ``llm.vision.analyze_summary_frames`` / ``prompts/summary_frames.
+    txt``). Never raises — any failure anywhere in this function degrades
+    to ``[]``, and the caller (``_summarize_and_finish``) proceeds to
+    summarize normally either way.
+
+    No-op (returns ``[]`` immediately) for a job that doesn't qualify for
+    deixis candidates at all — ``workers.deixis.candidates_for_job``
+    already encodes that rule (pages/PDFs/caption-less jobs), so it isn't
+    re-derived here.
+
+    EXTERNAL candidates are dropped up front: there is no frame to fetch
+    for a "look in the description" reference (see ``DeixisCategory``).
+
+    Selection is CHRONOLOGICAL, FIRST-FIT: walk the surviving candidates in
+    transcript order and keep taking moments until the next one would push
+    the per-job frame budget (``workers.frames.MAX_FRAMES_PER_JOB``) over
+    the edge — roughly 4 moments at ``DEFAULT_NUM_FRAMES`` (5) frames each.
+    This is deliberately different from the QA LOOK step, which ranks
+    candidates by what the model's PLAN call picked as relevant to a
+    specific question — there is no question here to rank moments
+    against, so "first N in the video" is the only ordering that doesn't
+    require guessing which moments matter most.
+
+    Conveyor: while awaiting moment i's (slow) vision call, moment i+1's
+    frames are already downloading — prefetch depth exactly 1 (never more,
+    to keep disk usage and yt-dlp concurrency bounded). A prefetch task
+    that ends up never consumed (an unexpected early exit from the loop —
+    a bug, cancellation, or a raised exception that escapes the per-moment
+    guards below) is always awaited-or-cancelled in the ``finally`` block,
+    never left dangling.
+
+    ``cookies`` is the SAME list ``run_pipeline`` received on the original
+    job-creation request, threaded down through ``_summarize_and_finish``
+    — forwarded to every frame fetch below so a cookie-gated video's frames
+    can actually be downloaded here, unlike the QA LOOK step which has none
+    left to forward by the time a question is asked (see
+    ``llm.vision.fetch_moment_frames``'s docstring).
+    """
+    try:
+        job = repo.get_job(job_id)
+    except Exception:
+        log.warning("frame analysis: failed to load job %s; skipping", job_id, exc_info=True)
+        return []
+    if job is None:
+        return []
+
+    candidates = [
+        c for c in deixis.candidates_for_job(job) if c.category != DeixisCategory.EXTERNAL
+    ]
+    if not candidates:
+        return []
+
+    selected: list[DeixisCandidate] = []
+    frames_budget_used = 0
+    for candidate in candidates:
+        if frames_budget_used + frames_mod.DEFAULT_NUM_FRAMES > frames_mod.MAX_FRAMES_PER_JOB:
+            break
+        selected.append(candidate)
+        frames_budget_used += frames_mod.DEFAULT_NUM_FRAMES
+    if not selected:
+        return []
+
+    await _checkpoint_pause(job_id, broker, "analyzing_frames")
+
+    output_language = get_config().output.language_name
+    findings: list[dict[str, Any]] = []
+    prefetch_task: asyncio.Task[list[Path]] | None = None
+    try:
+        for i, candidate in enumerate(selected):
+            frame_paths = (
+                await prefetch_task if prefetch_task is not None
+                else await _fetch_moment_frames_safe(job, candidate, job_id, cookies)
+            )
+            prefetch_task = None
+
+            # Kick off the NEXT moment's download now, before this moment's
+            # (slow) vision call below — that overlap is the whole point of
+            # the conveyor.
+            if i + 1 < len(selected):
+                prefetch_task = asyncio.create_task(
+                    _fetch_moment_frames_safe(job, selected[i + 1], job_id, cookies)
+                )
+
+            if not frame_paths:
+                continue
+
+            timecode = timecodes.format_timecode(candidate.timestamp)
+            broker.publish(
+                job_id,
+                stage_event(
+                    "analyzing_frames", detail=f"{timecode} — {candidate.phrase}"
+                ),
+            )
+            try:
+                result = await llm_vision.analyze_summary_frames(
+                    frame_paths,
+                    candidate=candidate,
+                    output_language=output_language,
+                    job_id=job_id,
+                )
+            except Exception:
+                log.warning(
+                    "frame analysis: vision call failed for job %s at %.1fs",
+                    job_id, candidate.timestamp, exc_info=True,
+                )
+                continue
+
+            # Only relevant:true moments are worth storing — a generic shot
+            # with nothing to add would just clutter the summary prompt and
+            # the client's thumbnail row for no benefit (see
+            # prompts/summary_frames.txt's meaning of `relevant` here).
+            if not result.relevant:
+                continue
+
+            frame_path = (
+                frame_paths[result.best_frame_index - 1]
+                if result.best_frame_index is not None
+                else None
+            )
+            findings.append(
+                {
+                    "seconds": candidate.timestamp,
+                    "timecode": timecode,
+                    "phrase": candidate.phrase,
+                    "category": candidate.category.value,
+                    "finding": result.finding,
+                    "frame_url": (
+                        f"/jobs/{job_id}/frames/{frame_path.parent.name}/{frame_path.name}"
+                        if frame_path is not None
+                        else None
+                    ),
+                }
+            )
+    finally:
+        # A prefetch task nobody consumed (budget exhausted mid-loop is
+        # impossible here since `selected` is pre-sized, but an unexpected
+        # early exit — cancellation, a bug escaping the guards above — can
+        # still leave one pending). Cancel and await it rather than
+        # abandoning it, so its yt-dlp subprocess/ffmpeg call always winds
+        # down cleanly instead of outliving this function.
+        if prefetch_task is not None and not prefetch_task.done():
+            prefetch_task.cancel()
+        if prefetch_task is not None:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await prefetch_task
+
+    return findings
+
+
 async def _summarize_and_finish(
     job_id: str,
     *,
@@ -633,6 +834,7 @@ async def _summarize_and_finish(
     transcript_language: str | None = None,
     raw_segments_json: str | None = None,
     cfg: Any,
+    cookies: list[Any],
 ) -> None:
     """Run streaming summarization and mark the job done.
 
@@ -642,8 +844,43 @@ async def _summarize_and_finish(
     Honours the global pause flag before kicking off the LLM call so a
     paused user doesn't pay a fresh ML burst on a fresh job. In-flight
     streaming completes normally — pause is checkpoint-based, not preemptive.
+
+    ``cookies`` is the same list ``run_pipeline`` received on the original
+    job-creation request, still in scope this deep because ingestion hasn't
+    finished yet — passed straight through to ``_run_frame_analysis`` (see
+    its docstring). All three callers below have it in scope; page/PDF jobs
+    pass it too for consistency even though frame analysis is a no-op for
+    them (``deixis.candidates_for_job`` returns ``[]`` for non-transcript
+    kinds), so nothing behavioural changes there.
     """
     broker = get_broker()
+
+    # Summary-time frame analysis, BEFORE the summarization call — see
+    # _run_frame_analysis's docstring. Degrades to [] on any failure and
+    # never raises, so this can never fail the job. Persisted immediately
+    # (rather than only at mark_done) so the record survives even if the
+    # summary call that follows fails partway through — same reasoning as
+    # diagnostics_json being written at set_extracted time.
+    visual_findings: list[timecodes.VisualFinding] = []
+    try:
+        moment_findings = await _run_frame_analysis(job_id, broker, cookies)
+    except Exception:
+        log.warning("frame analysis step failed for job %s; continuing", job_id, exc_info=True)
+        moment_findings = []
+    if moment_findings:
+        try:
+            repo.set_moment_findings(
+                job_id,
+                moment_findings_json=json.dumps(moment_findings, ensure_ascii=False),
+            )
+        except Exception:
+            log.warning(
+                "failed to persist moment findings for job %s", job_id, exc_info=True,
+            )
+        visual_findings = [
+            timecodes.VisualFinding(seconds=m["seconds"], text=m["finding"])
+            for m in moment_findings
+        ]
 
     # Park here while the user has the global queue paused.
     await _checkpoint_pause(job_id, broker, "summarizing")
@@ -675,6 +912,12 @@ async def _summarize_and_finish(
     # ASR errors. The stored transcript (`text` → mark_done) is untouched.
     from_audio = transcript_source in AUDIO_TRANSCRIPT_SOURCES
     summary_input = timecodes.strip_transcript_tail_noise(text) if from_audio else text
+    # Weave any summary-time on-screen findings into the material itself —
+    # see timecodes.inject_visual_findings for why this replaced a separate
+    # appended VISUAL FINDINGS block. `text` (-> mark_done's stored raw_text)
+    # is never touched by this; only this local, LLM-facing copy is.
+    if visual_findings:
+        summary_input = timecodes.inject_visual_findings(summary_input, visual_findings)
 
     try:
         # cap_markers_in_stream holds text back only long enough to resolve a

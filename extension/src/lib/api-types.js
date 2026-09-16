@@ -133,7 +133,8 @@
  *   low_confidence_ranges: LowConfidenceRange[],
  *   alt_media_candidates: MediaCandidate[],
  *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
- *   whisper_queue_position?: number | null
+ *   whisper_queue_position?: number | null,
+ *   moment_findings?: MomentFinding[]
  * }} JobDetails
  *
  * ``low_confidence_ranges`` are contiguous spans (original audio timeline,
@@ -157,6 +158,13 @@
  * not where it currently sits in line. ``null``/absent when the job isn't
  * currently waiting there (not a Whisper job, already picked up by a pool
  * worker, or done/failed).
+ *
+ * ``moment_findings`` is the summary-time visual-frame analysis step's
+ * output (daemon ``workers.pipeline._run_frame_analysis``, driven by
+ * ``llm.vision.analyze_summary_frames`` before summarization runs) — see
+ * ``MomentFinding`` below. Empty for pages/PDFs, jobs with no timestamped
+ * transcript, jobs whose moments were all judged not relevant, and every
+ * job that predates this feature.
  */
 
 /**
@@ -317,6 +325,28 @@
  * @property {string} timecode      - "[MM:SS]"-style label, pre-formatted, no brackets
  * @property {string} phrase        - the deixis phrase that triggered this moment
  * @property {string} frame_url
+ */
+
+/**
+ * One summary-time visual finding — a deixis moment the pre-summarization
+ * frame-analysis step judged as adding something the transcript alone
+ * doesn't (daemon ``workers.pipeline._run_frame_analysis`` /
+ * ``llm.vision.analyze_summary_frames``, persisted on
+ * ``Job.moment_findings_json``, migration v11). Shares seconds/timecode/
+ * phrase/frame_url with FrameRef on purpose — one thumbnail renderer
+ * serves both — plus `category` (same shape as DeixisMoment.category) and
+ * `finding`, the vision model's own descriptive text (this doesn't ride
+ * alongside a chat answer the way a QA FrameRef does, so the prose itself
+ * needs to be here). Only moments judged relevant ever appear here — a
+ * moment that added nothing is dropped, not included with an empty finding.
+ *
+ * @typedef {object} MomentFinding
+ * @property {number} seconds
+ * @property {string} timecode      - "[MM:SS]"-style label, pre-formatted, no brackets
+ * @property {string} phrase        - the deixis phrase that triggered this moment
+ * @property {"action" | "object"} category
+ * @property {string} finding       - the vision model's description of what's on screen
+ * @property {string | null} [frame_url]
  */
 
 /**

@@ -497,6 +497,38 @@ def set_audio(
         session.add(job)
 
 
+def set_moment_findings(job_id: str, *, moment_findings_json: str | None) -> None:
+    """Persist the summary-time frame-analysis step's visual findings (see
+    ``Job.moment_findings_json`` / migration v11).
+
+    Called by ``workers/pipeline.py`` once the step finishes, BEFORE the
+    summarization call itself — so the record survives even if the summary
+    call that follows fails partway through, same reasoning as
+    ``diagnostics_json`` being written at ``set_extracted`` time rather than
+    only at ``mark_done``.
+
+    Unlike ``diagnostics_json`` (only ever written when not ``None``, so a
+    caller that didn't compute one never clobbers a previous value),
+    ``moment_findings_json`` is written unconditionally, including
+    ``None`` — a job re-processed from scratch (retry) that this time found
+    no relevant moments (or none at all) must be able to clear out a
+    previous run's stale findings, not have them linger forever.
+
+    Emits ``job_event("updated", …)`` so a client watching the Library
+    picks up the findings without a page reload once ``GET /jobs/{id}``
+    is re-fetched.
+    """
+    now = datetime.utcnow()
+    with session_scope() as session:
+        job = session.get(Job, job_id)
+        if job is None:
+            raise KeyError(f"Job {job_id} not found")
+        job.moment_findings_json = moment_findings_json
+        job.updated_at = now
+        session.add(job)
+    _emit_updated(job_id)
+
+
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------

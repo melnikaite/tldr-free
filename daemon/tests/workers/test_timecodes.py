@@ -9,11 +9,13 @@ import pytest
 
 from src.workers.timecodes import (
     DiscardedRun,
+    VisualFinding,
     build_marked_text,
     cap_markers_in_stream,
     cap_markers_per_line,
     collapse_repeated_segments,
     format_segments_as_marked_text,
+    inject_visual_findings,
     strip_all_timecodes,
     strip_bare_timecode_lines,
     strip_timecode_placeholders,
@@ -682,3 +684,108 @@ async def test_stream_matches_per_line_for_any_chunking(
 ) -> None:
     published = await _collect(_chunk(text, chunk_size))
     assert "".join(published) == cap_markers_per_line(text)
+
+
+# ---------------------------------------------------------------------------
+# inject_visual_findings — weaving summary-time on-screen findings into the
+# marked transcript at their own position (replaces the old separate
+# "VISUAL FINDINGS" block appended after the material — see the function's
+# own docstring and llm/summary.py's module docstring for why).
+# ---------------------------------------------------------------------------
+
+
+def test_inject_visual_findings_lands_right_after_its_matching_line() -> None:
+    text = "[00:05] First sentence.\n[00:12] Second sentence.\n[00:20] Third sentence.\n"
+    findings = [VisualFinding(seconds=12.0, text="A red tub labeled 'ACME Cream 200ml'.")]
+
+    out = inject_visual_findings(text, findings)
+
+    assert out == (
+        "[00:05] First sentence.\n"
+        "[00:12] Second sentence.\n"
+        "⟦PICTURE [00:12]: A red tub labeled 'ACME Cream 200ml'.⟧\n"
+        "[00:20] Third sentence.\n"
+    )
+
+
+def test_inject_visual_findings_uses_nearest_line_not_exact_match() -> None:
+    # A finding's timestamp comes from independent frame-timing analysis, not
+    # from the transcript's own sentence boundaries, so it almost never lands
+    # exactly on a line's marker — 17s is closer to the 20s line than the 5s
+    # or 12s ones, so it's inserted right after that line. The annotation's
+    # OWN bracket still carries the finding's real timestamp (17s), not the
+    # anchor line's (20s) — insertion POSITION is "nearest line" for reading
+    # flow, but the marker itself stays accurate for seeking.
+    text = "[00:05] First sentence.\n[00:12] Second sentence.\n[00:20] Third sentence.\n"
+    findings = [VisualFinding(seconds=17.0, text="A whiteboard with notes on it.")]
+
+    out = inject_visual_findings(text, findings)
+
+    lines = out.split("\n")
+    assert lines[2] == "[00:20] Third sentence."
+    assert lines[3] == "⟦PICTURE [00:17]: A whiteboard with notes on it.⟧"
+
+
+def test_inject_visual_findings_annotation_never_read_as_a_quote() -> None:
+    # The wrapper must be unambiguous: distinct from [MM:SS] markers,
+    # markdown links, and placeholder brackets already in play elsewhere in
+    # this module — a model must never attribute what's inside to the
+    # speaker.
+    text = "[00:05] Something was said.\n"
+    out = inject_visual_findings(
+        text, [VisualFinding(seconds=5.0, text="A demonstrated action.")]
+    )
+    assert "⟦PICTURE [00:05]: A demonstrated action.⟧" in out
+    # Not fenced in ordinary quotation marks or a bare bracket that could be
+    # confused with a timecode or a markdown link.
+    assert '"A demonstrated action."' not in out
+
+
+def test_inject_visual_findings_with_no_markers_appends_at_end() -> None:
+    # Guard for a finding whose timecode "matches no transcript line" in the
+    # strongest sense: the material has no markers at all to be nearest to.
+    # Must not be silently dropped.
+    text = "Just plain document text with no timecodes at all.\n"
+    findings = [VisualFinding(seconds=42.0, text="A chart on screen.")]
+
+    out = inject_visual_findings(text, findings)
+
+    assert out == (
+        "Just plain document text with no timecodes at all.\n"
+        "\n"
+        "⟦PICTURE [00:42]: A chart on screen.⟧"
+    )
+
+
+def test_inject_visual_findings_no_findings_is_a_noop() -> None:
+    text = "[00:05] First sentence.\n"
+    assert inject_visual_findings(text, []) == text
+
+
+def test_inject_visual_findings_empty_text_is_a_noop() -> None:
+    assert inject_visual_findings("", [VisualFinding(seconds=1.0, text="x")]) == ""
+
+
+def test_inject_visual_findings_multiple_findings_preserve_chronology() -> None:
+    text = "[00:05] First.\n[00:30] Second.\n[01:00] Third.\n"
+    findings = [
+        VisualFinding(seconds=6.0, text="Near the first line."),
+        VisualFinding(seconds=58.0, text="Near the third line."),
+    ]
+
+    out = inject_visual_findings(text, findings)
+    lines = out.split("\n")
+
+    assert lines[1] == "⟦PICTURE [00:06]: Near the first line.⟧"
+    assert lines[4] == "⟦PICTURE [00:58]: Near the third line.⟧"
+
+
+def test_inject_visual_findings_matches_transcript_hour_format() -> None:
+    # A transcript past the hour mark renders H:MM:SS throughout
+    # (build_marked_text) — the injected annotation's own marker should
+    # match that, not fall back to bare MM:SS.
+    text = "[1:00:00] Long into the video.\n"
+    out = inject_visual_findings(
+        text, [VisualFinding(seconds=3605.0, text="Something shown late.")]
+    )
+    assert "⟦PICTURE [1:00:05]: Something shown late.⟧" in out

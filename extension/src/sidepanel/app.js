@@ -32,7 +32,10 @@ import { daemon } from "../lib/daemon-client.js";
 import { getCookiesForDomain, getCookiesForUrl } from "../lib/cookies.js";
 import { classifyError, describeQueuedDetail, isDaemonUnreachable } from "../lib/error-hints.js";
 import { openEventStream } from "../lib/event-stream.js";
-import { buildFrameRow } from "../lib/frame-thumbnails.js";
+import {
+  buildFrameRow,
+  MOMENT_MATCH_TOLERANCE_SECONDS,
+} from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
@@ -918,41 +921,31 @@ function _stateKey(state) {
 // Only FEW summary lines should ever earn this — see
 // MOMENT_MATCH_TOLERANCE_SECONDS below for why 10s, with the measured
 // counts that justify it.
+//
+// A marker can ALSO land on a moment the pre-summarization frame-analysis
+// step already looked at and judged relevant — JobDetails.moment_findings
+// (see api-types.js's MomentFinding). Those frames are rendered
+// automatically, no click needed, using the exact same matching (same
+// tolerance, same nearest-neighbor pick — see _nearestMoment) that decides
+// whether a marker earns a "look" button at all. A marker matched to a
+// stored finding does NOT also get a button: the frame is already on
+// screen, so offering to fetch it again would be redundant. See
+// _attachMomentAffordances.
 // ---------------------------------------------------------------------------
 
-// A rendered [MM:SS] marker and the deixis moment it was drawn from rarely
-// land on the exact same second (the summary LLM cites the transcript
-// marker of whichever sentence/line it drew the fact from, which can start
-// a few seconds before or after the exact phrase workers/deixis.py
-// detected). This constant is how far apart the two are allowed to be and
-// still count as "the same moment" for showing the affordance.
-//
-// MEASURED against 8 real video jobs in the owner's SQLite DB (real
-// summary_md + real raw_segments_json), counting how many [MM:SS]-marked
-// summary lines would get the affordance at each candidate window,
-// out of every marked line that had ANY deixis moment on the job at all:
-//
-//   window(s):    3     5     8    10    15    20    30
-//   hits/92:      2     3     4     5     7    11    14
-//   percentage: 2.2%  3.3%  4.3%  5.4%  7.6% 12.0% 15.2%
-//
-// 10s keeps the overall rate low (5.4% — genuinely "few lines", matching
-// the owner's "не пихать лишь бы пихать" rule) while still catching real
-// matches in most measured jobs. 15s already pushes the worst single job
-// to 3 of its 8 marked lines (38%) — i.e. "most" of that job's lines,
-// which is exactly the noise threshold the rule rejects; 10s tops out at
-// 2 of 8 (25%) for that same job. Segments in this DB run 1-5s apart and
-// workers/deixis.py's own COLLAPSE_WINDOW_SECONDS (3s) already merges a
-// gesture spanning consecutive segments into one moment, so 10s comfortably
-// covers "summary cited the sentence's start, not the exact phrase" slack
-// without reaching into unrelated nearby timestamps.
-const MOMENT_MATCH_TOLERANCE_SECONDS = 10;
 
 /**
  * Attach a "look" button next to every `[MM:SS]` timecode link in the
  * rendered summary that lands within `MOMENT_MATCH_TOLERANCE_SECONDS` of
  * one of this job's own deixis moments. Cheap no-op for jobs that can
  * never have moments (page/PDF) — skips the network call entirely.
+ *
+ * Before any of that: markers that match an already-stored
+ * `JobDetails.moment_findings` entry get that finding's frame rendered
+ * automatically (no click, no fetch — the daemon already ran the vision
+ * step and persisted the result) and are excluded from the button pass
+ * below, so the same moment never gets both a rendered frame AND a
+ * redundant "fetch this for me" button.
  *
  * @param {import("../lib/api-types.js").JobDetails} job
  */
@@ -965,6 +958,27 @@ async function _attachMomentAffordances(job) {
   );
   if (anchors.length === 0) return;
 
+  // Findings without a usable frame_url (the schema's documented
+  // defence-in-depth null case) can't be rendered — treat them as if no
+  // finding existed for this moment, so the marker still falls through to
+  // the on-demand "look" button below instead of silently showing nothing.
+  const findings = (job.moment_findings || []).filter((f) => f.frame_url);
+  const claimed = new Set();
+  if (findings.length > 0) {
+    const base = await daemon.baseUrl();
+    for (const a of anchors) {
+      const seconds = Number(a.dataset.tldrSeconds);
+      if (!Number.isFinite(seconds)) continue;
+      const finding = _nearestMoment(findings, seconds);
+      if (!finding) continue;
+      _renderStoredFinding(a, job, finding, base);
+      claimed.add(a);
+    }
+  }
+
+  const remaining = anchors.filter((a) => !claimed.has(a));
+  if (remaining.length === 0) return;
+
   /** @type {import("../lib/api-types.js").DeixisMoment[]} */
   let moments;
   try {
@@ -975,7 +989,7 @@ async function _attachMomentAffordances(job) {
   }
   if (!moments || moments.length === 0) return;
 
-  for (const a of anchors) {
+  for (const a of remaining) {
     const seconds = Number(a.dataset.tldrSeconds);
     if (!Number.isFinite(seconds)) continue;
     const match = _nearestMoment(moments, seconds);
@@ -984,14 +998,21 @@ async function _attachMomentAffordances(job) {
 }
 
 /**
- * @param {import("../lib/api-types.js").DeixisMoment[]} moments
+ * Nearest item in `items` (by `.seconds`) to `seconds`, within
+ * `MOMENT_MATCH_TOLERANCE_SECONDS` — shared by both the DeixisMoment list
+ * (drives which markers earn a "look" button) and the MomentFinding list
+ * (drives which markers get a frame rendered automatically). One
+ * tolerance, one nearest-neighbor rule, for both call sites.
+ *
+ * @template {{ seconds: number }} T
+ * @param {T[]} items
  * @param {number} seconds
- * @returns {import("../lib/api-types.js").DeixisMoment | null}
+ * @returns {T | null}
  */
-function _nearestMoment(moments, seconds) {
+function _nearestMoment(items, seconds) {
   let best = null;
   let bestDist = Infinity;
-  for (const m of moments) {
+  for (const m of items) {
     const dist = Math.abs(m.seconds - seconds);
     if (dist <= MOMENT_MATCH_TOLERANCE_SECONDS && dist < bestDist) {
       best = m;
@@ -999,6 +1020,42 @@ function _nearestMoment(moments, seconds) {
     }
   }
   return best;
+}
+
+/**
+ * Render a stored `MomentFinding`'s frame under the bullet/paragraph whose
+ * `[MM:SS]` marker matched it — no fetch, no click; `frame_url` is already
+ * known from `JobDetails.moment_findings`. Reuses `buildFrameRow` (the
+ * same renderer the on-demand "look" affordance and QA frames use)
+ * instead of a second one. The finding's own prose (`finding`) is
+ * deliberately never printed into the page — the summary text was already
+ * written with it in its prompt — it only goes on the image's `alt`/
+ * `title` so it stays available to screen readers and on hover.
+ *
+ * @param {HTMLAnchorElement} anchor
+ * @param {import("../lib/api-types.js").JobDetails} job
+ * @param {import("../lib/api-types.js").MomentFinding} finding
+ * @param {string} baseUrl
+ */
+function _renderStoredFinding(anchor, job, finding, baseUrl) {
+  const ref = {
+    seconds: finding.seconds,
+    timecode: finding.timecode,
+    phrase: finding.phrase,
+    frame_url: /** @type {string} */ (finding.frame_url),
+  };
+  const row = buildFrameRow(job, [ref], baseUrl);
+  row.classList.add("look-frame-row");
+  const img = row.querySelector("img");
+  if (img) {
+    img.alt = finding.finding;
+    img.title = finding.finding;
+  }
+  // Same placement rule as the on-demand row (see _handleLookClick):
+  // under the WHOLE bullet/paragraph, not mid-sentence right after the
+  // marker.
+  const block = anchor.closest("li, p") || anchor.parentElement || anchor;
+  block.insertAdjacentElement("afterend", row);
 }
 
 // Small camera-ish glyph (a well-worn open-source icon shape, redrawn here

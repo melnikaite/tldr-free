@@ -275,6 +275,13 @@ class JobDetails(JobSummary):
     # ``None`` when the job isn't currently waiting there — not a Whisper
     # job, already picked up by a pool worker, or done/failed.
     whisper_queue_position: int | None = None
+    # Summary-time visual findings (see MomentFinding / migration v11) —
+    # empty for every job that doesn't qualify for deixis candidates at all
+    # (page/PDF, no transcript), every job whose moments were all judged
+    # not relevant, and every job that predates this feature. Populated by
+    # workers/pipeline.py's frame-analysis step BEFORE summarization, so
+    # it's already present by the time the job reaches "done".
+    moment_findings: list[MomentFinding] = []
 
 
 class JobListResponse(BaseModel):
@@ -462,6 +469,38 @@ class FrameRef(BaseModel):
     frame_url: str
 
 
+class MomentFinding(BaseModel):
+    """One summary-time visual finding — a deixis moment the pre-
+    summarization frame-analysis step (``workers/pipeline.py``'s
+    ``_run_frame_analysis``, driven by ``llm/vision.py``'s
+    ``analyze_summary_frames``) judged as adding something the transcript
+    alone doesn't. Persisted on ``Job.moment_findings_json`` (migration
+    v11) and surfaced on ``JobDetails`` so the client can render thumbnails
+    without redoing any of the vision work.
+
+    Shares ``seconds``/``timecode``/``phrase``/``frame_url`` with
+    ``FrameRef`` on purpose — one client-side thumbnail renderer serves
+    both this and the QA LOOK step's frames — plus ``category`` (same
+    shape as ``DeixisMoment.category`` below) and ``finding``, the vision
+    model's own text, since a client showing this outside of a chat bubble
+    needs the prose, unlike a QA ``FrameRef`` which rides alongside an
+    answer that already contains it.
+
+    Only ``relevant: true`` moments are ever turned into one of these (see
+    ``_run_frame_analysis``) — a moment judged not to add anything is
+    dropped entirely, not stored with an empty/negative finding.
+    ``frame_url`` is optional purely as defence-in-depth against a
+    malformed vision response that reported relevant without a usable
+    frame index; in practice it is always set.
+    """
+    seconds: float
+    timecode: str
+    phrase: str
+    category: Literal["action", "object"]
+    finding: str
+    frame_url: str | None = None
+
+
 class DeixisMoment(BaseModel):
     """One moment where this job's transcript speech points at the video's
     picture (see ``workers.deixis.DeixisCandidate``) — offered to the
@@ -558,6 +597,10 @@ class AIStageEvent(BaseModel):
     - "extracting"   pulling page text or YouTube transcript
     - "transcribing" Whisper running (slow)
     - "ready"        extraction complete, summary about to start
+    - "analyzing_frames" summary-time visual-frame analysis (jobs with a
+                     timestamped transcript only) — detail is
+                     "<timecode> — <phrase>" per moment inspected, same
+                     phrasing the QA LOOK step's "looking" stage uses
     - "summarizing"  LLM call in progress for summary (deltas follow)
     - "thinking"     LLM call in progress for QA (deltas follow)
     """

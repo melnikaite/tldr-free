@@ -421,6 +421,52 @@ def _migration_v10(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v11 — Job.moment_findings_json
+# ---------------------------------------------------------------------------
+# A persisted record of the summary-time frame-analysis step's visual
+# findings: for a job with a timestamped speech transcript
+# (workers.deixis.candidates_for_job), workers/pipeline.py walks a handful of
+# moments where the speech points at the video's picture, asks a multimodal
+# LLM what's actually shown (llm/vision.py's analyze_summary_frames, via the
+# summary-anchored prompts/summary_frames.txt — a sibling of the QA-anchored
+# prompts/qa_frames.txt), and keeps only the moments the model judged to add
+# something the transcript alone doesn't (relevant=true). This column is
+# where those survivors are written so (a) the client can render thumbnails
+# for them later without redoing any vision work, and (b) re-opening a job
+# doesn't re-run the (slow) analysis.
+#
+# Shape: JSON list of {"seconds": float, "timecode": str, "phrase": str,
+# "category": "action"|"object", "finding": str, "frame_url": str|None} —
+# the same seconds/timecode/phrase/frame_url shape api.schemas.FrameRef
+# already uses (see that class's docstring) plus category/finding, so one
+# client-side renderer can serve both this and the QA LOOK-step thumbnails.
+# EXTERNAL candidates never reach this step (no frame to fetch for them —
+# see workers.deixis.DeixisCategory) and a moment judged NOT relevant is
+# dropped entirely, not stored with an empty finding — only genuinely
+# additive visual context is worth persisting.
+#
+# Only ever populated for jobs that qualify for deixis candidates in the
+# first place (a timestamped, speech-derived transcript — PAGE/PDF jobs
+# never touch this) and null for every pre-existing row (no way to
+# retroactively analyse a video already summarised) — both read as "nothing
+# to show", the same convention diagnostics_json (v10) and
+# transcript_missing_seconds established before it.
+
+_V11_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN moment_findings_json TEXT",
+)
+
+
+def _migration_v11(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V11_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -436,6 +482,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (8, _migration_v8),
     (9, _migration_v9),
     (10, _migration_v10),
+    (11, _migration_v11),
 ]
 
 

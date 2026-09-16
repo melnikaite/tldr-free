@@ -15,6 +15,10 @@ same reason strip_transcript_tail_noise lives here):
                                                              # Whisper repetition-loop collapse
     cap_markers_per_line(text, max_markers=1) -> str        # cap markers per summary line
     cap_markers_in_stream(stream, max_markers=1) -> AsyncIterator[str]  # streaming wrapper for the above
+    inject_visual_findings(text, findings) -> str           # weave on-screen findings into the marked
+                                                             # transcript at their own position — see
+                                                             # its own docstring below for why this
+                                                             # replaced a separate appended block.
 
 A ``Segment`` is a plain dict with ``start`` and ``text`` (we don't use
 ``duration``/``end`` except to decide HH:MM:SS vs MM:SS):
@@ -229,6 +233,179 @@ def format_segments_as_marked_text(segments: list[dict[str, Any]]) -> str:
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Visual-findings injection — weave summary-time on-screen findings into the
+# marked transcript at their own position, instead of appending them as a
+# separate enumerable block.
+# ---------------------------------------------------------------------------
+#
+# The prior design (``llm/summary.py``'s ``_visual_findings_block``) appended
+# every finding as one labelled block after the transcript, with explicit
+# instructions to WEAVE each one into the point it belonged to rather than
+# emit it as its own bullet. Deployed and measured on a real job: the model
+# ignored the instruction and produced one bullet per finding, pasted nearly
+# verbatim, including a fabricated timecode paraphrasing a nearby real one.
+# The diagnosis: handing a model a separate list of N items pulls it toward
+# producing N items back, no matter how firmly worded the "don't" is — the
+# fix has to change the SHAPE of the input, not the wording. Injecting each
+# finding into the transcript at its own timeline position means the
+# summarizer meets it as one more detail flowing past, not as a list to
+# enumerate.
+
+# Wraps an injected finding so it reads unambiguously as a note about the
+# PICTURE, never as something the speaker said — the summarizer must not
+# attribute it to the speaker as a quote. Chosen deliberately over an English
+# phrase like "ON SCREEN:" because it must read the same regardless of
+# ``output_language`` (a Cyrillic/CJK/etc. summary target shouldn't see an
+# English-only tag), and it must be visually unmistakable from every other
+# bracket convention already in play here ([MM:SS] markers, markdown links,
+# placeholder brackets like "[N/A]") so a model skimming the material has no
+# reason to confuse it with one of those. U+27E6/U+27E7 (mathematical
+# white square brackets) are not used anywhere else in this codebase's
+# prompts or transcript formatting.
+#
+# The marker lives INSIDE the wrapper (``⟦PICTURE [MM:SS]: text⟧``), not as a
+# separate leading ``[MM:SS] `` before it — a regression fix. The first
+# shipped version prefixed the whole line with a bare marker exactly like an
+# ordinary transcript line (``[MM:SS] ⟦PICTURE: text⟧``), and a measured
+# real-video run showed the model emitting ZERO ``[MM:SS]`` markers anywhere
+# in the summary afterward, twice in a row — not just suppressing markers
+# near picture notes. One plausible contributor: every injected line then
+# started with the exact same bracket shape as every real transcript line,
+# so a model applying the new rule's cluster of prohibitions ("never quote
+# it", "never invent", "never its own bullet") had a visual reason to
+# generalize that caution to markers in general, not just to picture
+# content. Moving the marker inside the picture wrapper keeps it exactly as
+# accurate and extractable (still the finding's real timestamp, still
+# literally "[MM:SS]" digits a model can copy into a woven key point) while
+# no longer pattern-matching the "[MM:SS] <sentence>" shape of a real
+# transcript line at the start of the line.
+_ANNOTATION_OPEN = "⟦PICTURE "
+_ANNOTATION_CLOSE = "⟧"
+
+
+@dataclass(frozen=True)
+class VisualFinding:
+    """One summary-time on-screen finding, ready to be woven into a marked
+    transcript by ``inject_visual_findings``.
+
+    ``seconds`` is the finding's own timestamp (a deixis candidate's
+    timestamp, e.g. ``workers.pipeline``'s ``candidate.timestamp``) — NOT
+    necessarily the timecode of any transcript line, since it comes from
+    independent frame-timing analysis rather than the transcript's own
+    sentence splits. ``text`` is the vision model's finding prose, unwrapped
+    (``inject_visual_findings`` adds the picture-annotation wrapper itself).
+    """
+
+    seconds: float
+    text: str
+
+
+def _seconds_from_marker(marker: str) -> float:
+    """Invert ``_format_marker``: parse an already-matched ``[MM:SS]`` /
+    ``[HH:MM:SS]`` marker (as recognized by ``_TIMECODE_MARKER``, the single
+    marker-recognizing pattern in this module) back into seconds.
+
+    Deliberately not a new marker-recognizing regex — the caller only ever
+    passes a string ``_TIMECODE_MARKER`` already matched, so this is just the
+    arithmetic ``_format_marker`` never needed to do in the other direction.
+    """
+    body = marker.strip("[]")
+    parts = [int(p) for p in body.split(":")]
+    if len(parts) == 3:
+        h, m, s = parts
+        return float(h * 3600 + m * 60 + s)
+    m, s = parts
+    return float(m * 60 + s)
+
+
+def _format_annotation(finding: VisualFinding, *, use_hours: bool) -> str:
+    seconds = int(round(max(finding.seconds, 0.0)))
+    marker = _format_marker(seconds, use_hours=use_hours)
+    return f"{_ANNOTATION_OPEN}[{marker}]: {finding.text.strip()}{_ANNOTATION_CLOSE}"
+
+
+def inject_visual_findings(text: str, findings: list[VisualFinding]) -> str:
+    """Weave summary-time on-screen ``findings`` into ``text`` (a marked
+    transcript — see ``build_marked_text``) at their own position in the
+    timeline, instead of appending them as a separate block.
+
+    Each finding becomes its own line — ``⟦PICTURE [MM:SS]: <finding
+    text>⟧`` — inserted immediately AFTER the transcript line whose own
+    marker is CLOSEST (by absolute seconds, not exact match) to the
+    finding's timestamp. Exact equality is not the expected case: a
+    finding's timestamp comes from ``workers.deixis``'s independent analysis
+    of where speech points at the picture, not from the transcript's own
+    sentence boundaries, so "nearest line" is the normal path, not a
+    fallback for something rare. This is also how a finding whose timecode
+    matches no transcript line is handled without being silently dropped —
+    it always has a nearest line as long as ``text`` carries at least one
+    marker.
+
+    The annotation's own ``[MM:SS]`` always carries the finding's REAL
+    timestamp (``finding.seconds``), never the anchor line's — "nearest
+    line" only decides where in the flow of text to insert it for
+    readability. The marker lives INSIDE the ``⟦PICTURE ...⟧`` wrapper,
+    not as a bare leading marker the way a real transcript line has one —
+    see the comment above ``_ANNOTATION_OPEN`` for why (a measured
+    regression when it was a bare leading marker). It still stays fully
+    accurate and copyable: if the summarizer weaves this finding's detail
+    into a key point, it can carry this same ``[MM:SS]`` into that point's
+    own timestamp, since the picture was genuinely captured at its own
+    moment, which can differ from the nearby spoken line's moment by a
+    couple of seconds.
+
+    If ``text`` carries NO markers at all (should not happen for a real
+    transcript job — findings only exist when ``workers.deixis`` found
+    candidates, which itself requires a marked transcript — but guarded
+    here rather than assumed), every finding is appended at the end instead
+    of being dropped.
+
+    Because each injected line is one whole line with no embedded blank
+    lines, it flows through ``llm.chunking``'s paragraph/sentence/line
+    waterfall exactly like any other transcript line — chunking never
+    splits a line, so an injected annotation always lands whole inside
+    whichever chunk covers its neighbourhood, never torn across two. This is
+    also what closes the gap in the previous design, where findings were
+    threaded into the single-pass and final-reduce prompts only and were
+    invisible to a per-chunk map call on a long video: injected into the
+    material itself, a finding now rides inside whichever chunk covers its
+    own timestamp, automatically, with no separate per-chunk plumbing
+    needed.
+
+    Pure: does not mutate ``text``. Returns ``text`` unchanged when either
+    argument is empty.
+    """
+    if not text or not findings:
+        return text
+
+    lines = text.split("\n")
+    line_seconds: list[tuple[int, float]] = []
+    for idx, line in enumerate(lines):
+        m = _TIMECODE_MARKER.match(line)
+        if m:
+            line_seconds.append((idx, _seconds_from_marker(m.group())))
+
+    use_hours = any(sec >= 3600.0 for _, sec in line_seconds)
+
+    insert_after: dict[int, list[str]] = {}
+    trailing: list[str] = []
+    for finding in findings:
+        annotation = _format_annotation(finding, use_hours=use_hours)
+        if not line_seconds:
+            trailing.append(annotation)
+            continue
+        best_idx, _ = min(line_seconds, key=lambda pair: abs(pair[1] - finding.seconds))
+        insert_after.setdefault(best_idx, []).append(annotation)
+
+    out: list[str] = []
+    for idx, line in enumerate(lines):
+        out.append(line)
+        out.extend(insert_after.get(idx, ()))
+    out.extend(trailing)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -843,12 +1020,14 @@ async def cap_markers_in_stream(
 
 __all__ = [
     "DiscardedRun",
+    "VisualFinding",
     "build_marked_text",
     "cap_markers_in_stream",
     "cap_markers_per_line",
     "collapse_repeated_segments",
     "format_segments_as_marked_text",
     "format_timecode",
+    "inject_visual_findings",
     "strip_all_timecodes",
     "strip_bare_timecode_lines",
     "strip_timecode_placeholders",

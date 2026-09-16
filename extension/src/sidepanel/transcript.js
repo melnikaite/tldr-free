@@ -21,6 +21,10 @@
 
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
+import {
+  buildFrameRow,
+  MOMENT_MATCH_TOLERANCE_SECONDS,
+} from "../lib/frame-thumbnails.js";
 import { resolveVideoId } from "../lib/url.js";
 import { stringifyError } from "../lib/utils.js";
 
@@ -396,6 +400,12 @@ async function _showLanguage(lang) {
 
   _renderLines(data.text);
   _syncExportButton();
+  // Fire-and-forget, same pattern as app.js's _attachMomentAffordances:
+  // never blocks the text render, and _cues-identity guard inside makes a
+  // stale in-flight call from a since-superseded render a no-op.
+  _renderMomentFindings().catch((err) =>
+    console.warn("[TLDR] moment finding render failed:", err),
+  );
   _injectCaptionsIntoTab(data).catch((err) =>
     console.warn("[TLDR] caption injection failed:", err),
   );
@@ -416,6 +426,84 @@ function _isLowConfidence(sec) {
   const ranges = _job?.low_confidence_ranges;
   if (!ranges || !ranges.length) return false;
   return ranges.some((r) => sec >= r.start_seconds && sec <= r.end_seconds);
+}
+
+// ---------------------------------------------------------------------------
+// Moment findings (JobDetails.moment_findings) — the same summary-time
+// visual findings the Summary tab renders (see app.js's
+// _attachMomentAffordances). Time-based like low_confidence_ranges above,
+// so they apply unchanged whatever language _renderLines is currently
+// showing — same reasoning, same "just re-check on every render" approach
+// rather than a one-off render tied to a specific language.
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach each stored `MomentFinding`'s frame (see api-types.js) under the
+ * transcript line whose timestamp is nearest it, within
+ * `MOMENT_MATCH_TOLERANCE_SECONDS`. Reuses `buildFrameRow` — the same
+ * renderer the Summary tab and QA frames use — instead of a second one.
+ * No-op for jobs without findings or before `_cues` has been built.
+ *
+ * Called fresh every time `_renderLines` rebuilds the body (job switch,
+ * language switch, lazy first activation) — there's nothing to tear down
+ * on its own: the next `_renderLines` call wipes `bodyEl.innerHTML` (and
+ * reassigns `_cues` to a new array) before this would run again, so
+ * there's no separate cleanup path and no way to duplicate a row.
+ */
+async function _renderMomentFindings() {
+  if (!_job || !bodyEl) return;
+  const findings = (_job.moment_findings || []).filter((f) => f.frame_url);
+  if (findings.length === 0 || _cues.length === 0) return;
+  // Snapshot before the await — if the job switches or the language
+  // re-renders while this is in flight, `_renderLines` reassigns `_cues`
+  // to a brand new array, so this identity check catches it and we bail
+  // instead of inserting a frame after a detached line from a stale render.
+  const cuesSnapshot = _cues;
+  const base = await daemon.baseUrl();
+  if (_cues !== cuesSnapshot) return;
+
+  for (const finding of findings) {
+    const cue = _nearestCue(finding.seconds);
+    if (!cue) continue;
+    const ref = {
+      seconds: finding.seconds,
+      timecode: finding.timecode,
+      phrase: finding.phrase,
+      frame_url: /** @type {string} */ (finding.frame_url),
+    };
+    const row = buildFrameRow(_job, [ref], base);
+    row.classList.add("look-frame-row");
+    // The finding's own prose never becomes visible text here (the
+    // transcript line already has its own words) — only alt/title, same
+    // as the Summary tab's rendering of the identical data.
+    const img = row.querySelector("img");
+    if (img) {
+      img.alt = finding.finding;
+      img.title = finding.finding;
+    }
+    cue.el.insertAdjacentElement("afterend", row);
+  }
+}
+
+/**
+ * Nearest cue (by `.sec`) to `seconds`, within
+ * `MOMENT_MATCH_TOLERANCE_SECONDS` — same nearest-neighbor rule as app.js's
+ * `_nearestMoment`, just searching transcript cues instead of markers.
+ *
+ * @param {number} seconds
+ * @returns {{ sec: number, el: HTMLElement } | null}
+ */
+function _nearestCue(seconds) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const cue of _cues) {
+    const dist = Math.abs(cue.sec - seconds);
+    if (dist <= MOMENT_MATCH_TOLERANCE_SECONDS && dist < bestDist) {
+      best = cue;
+      bestDist = dist;
+    }
+  }
+  return best;
 }
 
 /**

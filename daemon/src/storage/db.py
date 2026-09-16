@@ -141,6 +141,16 @@ class Job(SQLModel, table=True):
     # pre-existing row. Surfaced via ``GET /jobs/{id}/diagnostics``
     # (api/jobs.py) and carried into the export bundle (storage/bundle.py).
     diagnostics_json: str | None = None
+    # Summary-time visual findings — JSON list of {seconds, timecode, phrase,
+    # category, finding, frame_url}, one entry per deixis moment the
+    # pre-summarization frame-analysis step (workers/pipeline.py, driven by
+    # llm/vision.py's analyze_summary_frames) judged as actually adding
+    # something the transcript alone doesn't. See migration v11 for the
+    # full rationale. Whisper/caption jobs with a timestamped transcript
+    # only (workers.deixis.candidates_for_job's qualification rule) and
+    # ``None`` for every pre-existing row and every job with no qualifying
+    # candidates.
+    moment_findings_json: str | None = None
 
 
 class Message(SQLModel, table=True):

@@ -46,6 +46,7 @@ from src.api.schemas import (
     JobSummary,
     LowConfidenceRange,
     MessagesListResponse,
+    MomentFinding,
     MomentsListResponse,
     TranscriptSource,
 )
@@ -205,6 +206,34 @@ def _derive_low_confidence_ranges(raw_segments_json: str | None) -> list[LowConf
     return [LowConfidenceRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
 
 
+def _derive_moment_findings(moment_findings_json: str | None) -> list[MomentFinding]:
+    """Parse ``Job.moment_findings_json`` (see migration v11 /
+    ``workers.pipeline._run_frame_analysis``) into ``MomentFinding``s.
+
+    Same defensive shape as ``_derive_low_confidence_ranges`` above:
+    missing/malformed input reads as "nothing to show", never an error —
+    this is round-trip storage the daemon itself wrote, but a future format
+    change or a hand-edited row shouldn't be able to 500 this endpoint.
+    """
+    if not moment_findings_json:
+        return []
+    try:
+        parsed = json.loads(moment_findings_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    findings: list[MomentFinding] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            findings.append(MomentFinding(**item))
+        except Exception:
+            log.warning("api: malformed moment_findings_json entry, skipping", exc_info=True)
+    return findings
+
+
 def _to_details(job: Any) -> JobDetails:
     # Include in-flight buffer for running jobs so reconnecting clients can
     # replay buffered content without waiting for future delta events.
@@ -254,6 +283,7 @@ def _to_details(job: Any) -> JobDetails:
         alt_media_candidates=alt_candidates,
         queued_reason=getattr(job, "queued_reason", None),
         whisper_queue_position=get_queue().position(job.id),
+        moment_findings=_derive_moment_findings(getattr(job, "moment_findings_json", None)),
     )
 
 

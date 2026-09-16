@@ -12,6 +12,39 @@
 
 import { resolveVideoId } from "./url.js";
 
+// Shared by every caller that has to decide WHICH rendered timestamp a
+// moment belongs to — sidepanel/app.js (summary markers) and
+// sidepanel/transcript.js (transcript cues). It lives in this module
+// rather than in either caller because both already depend on this one,
+// and a tuned, measured number must exist exactly once.
+// A rendered [MM:SS] marker and the deixis moment it was drawn from rarely
+// land on the exact same second (the summary LLM cites the transcript
+// marker of whichever sentence/line it drew the fact from, which can start
+// a few seconds before or after the exact phrase workers/deixis.py
+// detected). This constant is how far apart the two are allowed to be and
+// still count as "the same moment" for showing the affordance.
+//
+// MEASURED against 8 real video jobs in the owner's SQLite DB (real
+// summary_md + real raw_segments_json), counting how many [MM:SS]-marked
+// summary lines would get the affordance at each candidate window,
+// out of every marked line that had ANY deixis moment on the job at all:
+//
+//   window(s):    3     5     8    10    15    20    30
+//   hits/92:      2     3     4     5     7    11    14
+//   percentage: 2.2%  3.3%  4.3%  5.4%  7.6% 12.0% 15.2%
+//
+// 10s keeps the overall rate low (5.4% — genuinely "few lines", matching
+// the owner's "не пихать лишь бы пихать" rule) while still catching real
+// matches in most measured jobs. 15s already pushes the worst single job
+// to 3 of its 8 marked lines (38%) — i.e. "most" of that job's lines,
+// which is exactly the noise threshold the rule rejects; 10s tops out at
+// 2 of 8 (25%) for that same job. Segments in this DB run 1-5s apart and
+// workers/deixis.py's own COLLAPSE_WINDOW_SECONDS (3s) already merges a
+// gesture spanning consecutive segments into one moment, so 10s comfortably
+// covers "summary cited the sentence's start, not the exact phrase" slack
+// without reaching into unrelated nearby timestamps.
+export const MOMENT_MATCH_TOLERANCE_SECONDS = 10;
+
 /** @import { FrameRef } from "./api-types.js" */
 
 /**
