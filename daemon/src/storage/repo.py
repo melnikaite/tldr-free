@@ -137,6 +137,7 @@ def insert_imported_job(
     translations: list[dict[str, Any]],
     transcript_missing_seconds: float | None = None,
     diagnostics_json: str | None = None,
+    moment_findings_json: str | None = None,
 ) -> Job:
     """Insert a fully-formed Job (plus its Messages + TranscriptTranslations)
     as one atomic transaction — used by ``storage.bundle`` when importing an
@@ -198,6 +199,22 @@ def insert_imported_job(
     further sanitisation is needed on import. ``None`` for every bundle
     written before this column existed, or for a non-Whisper job.
 
+    ``moment_findings_json`` round-trips the exporting machine's persisted
+    summary-time visual findings (see ``Job.moment_findings_json`` /
+    migration v11). The caller (``bundle._build_moment_findings_json``) has
+    already rewritten every entry's ``frame_url`` to this ``job_id`` — same
+    division of labour as ``messages``' ``frame_refs_json`` above, this
+    function just stores what it's handed. ``None`` for every bundle
+    written before this column existed, or for a job that had no findings.
+
+    ``media_url`` (migration v12) is deliberately NOT a parameter here and
+    every imported job gets ``media_url=None`` regardless of what the
+    exporting machine had — see that migration's docstring for why it's
+    excluded from the bundle in the first place (frequently a signed/
+    expiring CDN URL, closer to a credential than a public address). An
+    imported media job simply has no frame-analysis source URL to resolve
+    until it's re-summarized, same as any pre-migration-v12 row.
+
     Emits ``job_event("created", …)`` same as ``create_job`` so an open
     Library page renders the imported row live.
     """
@@ -222,10 +239,12 @@ def insert_imported_job(
         transcript_source=transcript_source,
         video_id=video_id,
         transcript_language=transcript_language,
+        # media_url intentionally omitted — see docstring above.
         raw_segments_json=raw_segments_json,
         alt_media_candidates_json=alt_media_candidates_json,
         transcript_missing_seconds=transcript_missing_seconds,
         diagnostics_json=diagnostics_json,
+        moment_findings_json=moment_findings_json,
     )
     with session_scope() as session:
         session.add(job)

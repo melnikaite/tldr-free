@@ -677,6 +677,147 @@ def test_import_normalizes_bogus_translation_status_to_done(client: TestClient) 
     assert transcript.json()["text"] == "привет мир"
 
 
+# ---------------------------------------------------------------------------
+# 8. moment_findings_json round trip — frame_url rewritten to the new job
+# id, same as a message's frame_refs; a finding with no frame_url is kept
+# rather than dropped.
+# ---------------------------------------------------------------------------
+
+
+def test_export_import_round_trips_moment_findings(client: TestClient) -> None:
+    done = _make_done_job(client, "https://export-moment-findings.example")
+    job_id = done["id"]
+
+    frame_url_12 = f"/jobs/{job_id}/frames/t12/frame_01.jpg"
+    findings = [
+        {
+            "seconds": 12.0,
+            "timecode": "00:12",
+            "phrase": "the label on the jar",
+            "category": "object",
+            "finding": "The jar is labelled ACME cream.",
+            "frame_url": frame_url_12,
+        },
+        {
+            "seconds": 30.0,
+            "timecode": "00:30",
+            "phrase": "over there",
+            "category": "action",
+            "finding": "Vision judged this relevant but no frame was stored.",
+            "frame_url": None,
+        },
+    ]
+    repo.set_moment_findings(job_id, moment_findings_json=json.dumps(findings))
+    frame_bytes = b"\xff\xd8\xff\xe0-moment-frame"
+    _write_frame(job_id, "t12", "frame_01.jpg", frame_bytes)
+
+    r = client.post("/jobs/export", json={"ids": [job_id]})
+    assert r.status_code == 200
+    zip_bytes = r.content
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        job_json = json.loads(zf.read(f"jobs/{job_id}/job.json"))
+        exported = json.loads(job_json["moment_findings_json"])
+        assert len(exported) == 2
+        assert exported[0]["frame_url"] == frame_url_12
+        assert exported[1]["frame_url"] is None
+
+    assert client.delete(f"/jobs/{job_id}").status_code == 204
+
+    r2 = client.post("/jobs/import", content=zip_bytes)
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["failed"] == []
+    assert body["skipped"] == []
+    new_id = body["imported"][0]["job_id"]
+    assert new_id != job_id
+
+    new_detail = client.get(f"/jobs/{new_id}").json()
+    moment_findings = new_detail["moment_findings"]
+    assert len(moment_findings) == 2
+
+    with_frame = next(f for f in moment_findings if f["seconds"] == 12.0)
+    assert with_frame["finding"] == "The jar is labelled ACME cream."
+    assert with_frame["frame_url"] == f"/jobs/{new_id}/frames/t12/frame_01.jpg"
+
+    without_frame = next(f for f in moment_findings if f["seconds"] == 30.0)
+    assert without_frame["finding"] == (
+        "Vision judged this relevant but no frame was stored."
+    )
+    assert without_frame["frame_url"] is None
+
+    # The rewritten frame_url resolves to the real file on disk under the
+    # new id, same file-safety check GET /jobs/{id}/frames/{rel_path} uses.
+    rel = with_frame["frame_url"].split(f"/jobs/{new_id}/frames/", 1)[1]
+    resolved = frames.resolve_frame_path(new_id, rel)
+    assert resolved is not None
+    assert resolved.read_bytes() == frame_bytes
+
+
+def test_import_tolerates_malformed_moment_findings_json(client: TestClient) -> None:
+    """A bad ``moment_findings_json`` payload (not a JSON string, not a
+    list, or containing non-dict entries) must not blow up an import of an
+    otherwise fine job entry — same "nothing to show" tolerance as
+    ``_derive_moment_findings`` applies when reading it back on a live
+    job."""
+    for bad_payload in ("not json at all", json.dumps({"not": "a list"}), json.dumps([1, 2, 3])):
+        job_payload = {
+            "url": f"https://bad-moment-findings-{hash(bad_payload)}.example",
+            "title": "Bad moment findings job",
+            "kind": "page",
+            "raw_text": "hello world",
+            "summary_md": "**hi**",
+            "moment_findings_json": bad_payload,
+        }
+        bundle_zip = _build_zip(
+            {
+                "manifest.json": _manifest_bytes(["x"]),
+                "jobs/x/job.json": json.dumps(job_payload).encode("utf-8"),
+            }
+        )
+
+        r = client.post("/jobs/import", content=bundle_zip)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["failed"] == []
+        assert len(body["imported"]) == 1
+        new_id = body["imported"][0]["job_id"]
+
+        new_detail = client.get(f"/jobs/{new_id}")
+        assert new_detail.status_code == 200
+        assert new_detail.json()["moment_findings"] == []
+
+
+def test_import_missing_moment_findings_json_defaults_to_no_findings(
+    client: TestClient,
+) -> None:
+    """A bundle written before this field existed simply omits the key —
+    must import fine with no findings, same as a null payload."""
+    job_payload = {
+        "url": "https://no-moment-findings-key.example",
+        "title": "Pre-migration bundle job",
+        "kind": "page",
+        "raw_text": "hello world",
+        "summary_md": "**hi**",
+    }
+    bundle_zip = _build_zip(
+        {
+            "manifest.json": _manifest_bytes(["x"]),
+            "jobs/x/job.json": json.dumps(job_payload).encode("utf-8"),
+        }
+    )
+
+    r = client.post("/jobs/import", content=bundle_zip)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["failed"] == []
+    new_id = body["imported"][0]["job_id"]
+
+    new_detail = client.get(f"/jobs/{new_id}")
+    assert new_detail.status_code == 200
+    assert new_detail.json()["moment_findings"] == []
+
+
 def test_import_normalizes_live_translation_status_to_done(client: TestClient) -> None:
     """A translation claiming "running" (a live, in-progress status) must
     not be imported verbatim — ``re_enqueue_running_on_startup`` would

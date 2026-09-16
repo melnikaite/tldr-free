@@ -201,9 +201,21 @@ def _write_job_entry(zf: zipfile.ZipFile, job: Job) -> None:
         # docstring — so it's safe to carry into the bundle verbatim, same
         # as every other field here.
         "diagnostics_json": job.diagnostics_json,
+        # Summary-time visual findings (migration v11, workers/pipeline.py's
+        # _run_frame_analysis) — plain finding text plus a frame_url that
+        # embeds the ORIGINAL job id, same shape problem
+        # Message.frame_refs_json already has. Safe to carry verbatim here
+        # because the rewrite (same _rewrite_frame_url the message path
+        # uses) happens on import, not export — see
+        # bundle._build_moment_findings_json / repo.insert_imported_job.
+        "moment_findings_json": job.moment_findings_json,
         # queued_reason deliberately excluded: only ever non-null while
         # status=="queued", and runner.py clears it back to None before a
         # job can reach "done" — a status=="done" row can never have one.
+        #
+        # media_url deliberately excluded: frequently a signed/expiring CDN
+        # URL, closer to a credential than a public address — see the
+        # module docstring and migration v12 for the full reasoning.
         "messages": [
             {
                 "role": m.role,
@@ -493,6 +505,9 @@ def _import_one_job(
             frame_root = _copy_frames(zf, entry["frames"], new_id)
             messages = _build_messages(payload.get("messages"), new_id)
             translations = _build_translations(payload.get("translations"))
+            moment_findings_json = _build_moment_findings_json(
+                payload.get("moment_findings_json"), new_id
+            )
 
             created_at = _parse_iso(payload.get("created_at")) or datetime.utcnow()
             completed_at = _parse_iso(payload.get("completed_at"))
@@ -514,6 +529,7 @@ def _import_one_job(
                 alt_media_candidates_json=payload.get("alt_media_candidates_json"),
                 transcript_missing_seconds=payload.get("transcript_missing_seconds"),
                 diagnostics_json=payload.get("diagnostics_json"),
+                moment_findings_json=moment_findings_json,
                 messages=messages,
                 translations=translations,
             )
@@ -604,6 +620,42 @@ def _build_messages(raw_messages: Any, new_job_id: str) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _build_moment_findings_json(raw: Any, new_job_id: str) -> str | None:
+    """Parse the exported ``moment_findings_json`` payload and rewrite each
+    entry's ``frame_url`` to ``new_job_id`` using the SAME
+    ``_rewrite_frame_url`` the ``_build_messages`` frame_refs loop above
+    uses — one rewriting rule for both frame-url-carrying shapes, not two.
+
+    Unlike a message's ``frame_refs`` (whose ``FrameRef.frame_url`` is
+    required), ``MomentFinding.frame_url`` is optional — a finding whose
+    frame was never stored is legitimate (see that model's docstring), so
+    an entry with a missing/unrewritable ``frame_url`` keeps its finding
+    text with ``frame_url: None`` rather than being dropped like an
+    unrewritable ``frame_refs`` entry is. Same defensive shape as
+    ``_parse_frame_refs_json``/``_derive_moment_findings`` otherwise:
+    missing, malformed, non-list, or non-dict-item JSON reads as "nothing
+    to carry" and must never raise — this runs on every job entry in an
+    import, and a single bad payload must not fail an otherwise fine job,
+    let alone the whole bundle.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out = [
+        {**item, "frame_url": _rewrite_frame_url(item.get("frame_url"), new_job_id)}
+        for item in parsed
+        if isinstance(item, dict)
+    ]
+    if not out:
+        return None
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
 
 
 # The only two statuses a stored TranscriptTranslation row may safely
