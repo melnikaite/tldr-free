@@ -56,11 +56,19 @@ def _serve(host: str, port: int) -> int:
 
 def _service(action: str) -> int:
     if action == "install":
-        unit = service.install_service()
+        try:
+            unit = service.install_service()
+        except service.ServiceCommandError as exc:
+            print(f"Service install failed: {exc}", file=sys.stderr)
+            return 1
         print(f"Service installed: {unit if unit else 'schtasks logon task (experimental)'}")
         return 0
     if action == "uninstall":
-        service.uninstall_service()
+        try:
+            service.uninstall_service()
+        except service.ServiceCommandError as exc:
+            print(f"Service uninstall failed: {exc}", file=sys.stderr)
+            return 1
         print("Service stopped and removed.")
         return 0
     status = service.service_status()

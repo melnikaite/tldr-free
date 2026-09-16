@@ -277,3 +277,120 @@ async def test_loop_survives_error_then_succeeds_next_iteration(
 
     # Second iteration succeeded with 2 deletions.
     assert deletes == [2]
+
+
+# ---------------------------------------------------------------------------
+# orphaned frame directories — a job row deleted through a path that missed
+# the frame-cleanup hook (or a crash between the two) leaves a frame
+# directory nothing else will ever revisit. See workers/frames.py's
+# all_frame_job_ids() and this module's _sweep_orphaned_frame_dirs().
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_sweep_removes_only_dirs_with_no_job_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        retention.frames, "all_frame_job_ids", lambda: ["job-with-row", "job-orphaned"]
+    )
+
+    def fake_get_job(job_id: str) -> object | None:
+        return object() if job_id == "job-with-row" else None
+
+    monkeypatch.setattr(retention.repo, "get_job", fake_get_job)
+
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        retention.frames, "delete_job_frames", lambda job_id: deleted.append(job_id) or True
+    )
+
+    retention._sweep_orphaned_frame_dirs()
+
+    assert deleted == ["job-orphaned"]
+
+
+def test_orphan_sweep_no_op_when_nothing_orphaned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(retention.frames, "all_frame_job_ids", lambda: ["job-a", "job-b"])
+    monkeypatch.setattr(retention.repo, "get_job", lambda _job_id: object())
+
+    def fail_delete(_job_id: str) -> bool:  # pragma: no cover - must not run
+        raise AssertionError("should not delete frames for a job that still has a row")
+
+    monkeypatch.setattr(retention.frames, "delete_job_frames", fail_delete)
+
+    retention._sweep_orphaned_frame_dirs()  # must not raise
+
+
+def test_orphan_sweep_swallows_listing_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_list() -> list[str]:
+        raise OSError("disk hiccup")
+
+    monkeypatch.setattr(retention.frames, "all_frame_job_ids", fail_list)
+
+    retention._sweep_orphaned_frame_dirs()  # must not raise, must not abort the caller
+
+
+def test_orphan_sweep_swallows_per_job_delete_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(retention.frames, "all_frame_job_ids", lambda: ["job-a", "job-b"])
+    monkeypatch.setattr(retention.repo, "get_job", lambda _job_id: None)
+
+    calls: list[str] = []
+
+    def flaky_delete(job_id: str) -> bool:
+        calls.append(job_id)
+        if job_id == "job-a":
+            raise OSError("permission denied")
+        return True
+
+    monkeypatch.setattr(retention.frames, "delete_job_frames", flaky_delete)
+
+    retention._sweep_orphaned_frame_dirs()  # must not raise
+
+    # job-a's failure didn't stop job-b from being attempted.
+    assert calls == ["job-a", "job-b"]
+
+
+@pytest.mark.asyncio
+async def test_retention_worker_runs_orphan_sweep_every_cycle_even_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The orphan sweep is a DB/disk consistency check, not an age-based
+    policy — disabling storage.retention_days must not disable it."""
+    _patch_config(monkeypatch, 0)
+    monkeypatch.setattr(retention.repo, "delete_jobs_older_than", lambda _c: 0)
+
+    sweep_calls = 0
+
+    def fake_sweep() -> None:
+        nonlocal sweep_calls
+        sweep_calls += 1
+
+    monkeypatch.setattr(retention, "_sweep_orphaned_frame_dirs", fake_sweep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
+
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
+
+    assert sweep_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_retention_worker_calls_orphan_sweep_each_active_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_config(monkeypatch, 7)
+    monkeypatch.setattr(retention.repo, "delete_jobs_older_than", lambda _c: 0)
+
+    sweep_calls = 0
+
+    def fake_sweep() -> None:
+        nonlocal sweep_calls
+        sweep_calls += 1
+
+    monkeypatch.setattr(retention, "_sweep_orphaned_frame_dirs", fake_sweep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(2))
+
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
+
+    assert sweep_calls == 2

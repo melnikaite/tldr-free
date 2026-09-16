@@ -156,6 +156,186 @@ def test_systemd_unit_content_and_hardening(
     assert not unit.exists()
 
 
+def _sequenced_run(responses: dict[tuple[str, str], list[int]], calls: list[list[str]]) -> object:
+    """Fake ``service._run`` keyed on ``(argv[0], argv[1])``.
+
+    ``responses`` maps that key to a list of return codes to hand out in
+    order (one per call); once exhausted, the last value repeats. Any
+    command not in ``responses`` (e.g. ``bootout``) always succeeds.
+    """
+
+    def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        key = (cmd[0], cmd[1]) if len(cmd) > 1 else (cmd[0], "")
+        codes = responses.get(key)
+        if codes is None:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        code = codes.pop(0) if len(codes) > 1 else codes[0]
+        stderr = "" if code == 0 else f"launchctl: exit {code}"
+        return subprocess.CompletedProcess(cmd, code, "", stderr)
+
+    return run
+
+
+def test_install_service_bootstrap_succeeds_immediately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+    # "print" reports the service already gone (exit != 0); "bootstrap"
+    # succeeds on the first attempt.
+    monkeypatch.setattr(
+        service,
+        "_run",
+        _sequenced_run({("launchctl", "print"): [1], ("launchctl", "bootstrap"): [0]}, calls),
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(service, "daemon_executable", lambda: "/opt/bin/tldr-daemon")
+    monkeypatch.setattr(service, "_resolve_data_dir", lambda: tmp_path / "data")
+
+    plist = service.install_service(platform="darwin", home=tmp_path)
+
+    bootstrap_calls = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
+    assert len(bootstrap_calls) == 1
+    assert plist is not None and plist.is_file()
+
+
+def test_install_service_bootstrap_succeeds_on_later_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+    # First bootstrap attempt hits the bootout/bootstrap race (exit 5, as in
+    # the real repro), second attempt succeeds. "print" always reports gone
+    # so the retry isn't blocked waiting on the domain-free check.
+    monkeypatch.setattr(
+        service,
+        "_run",
+        _sequenced_run({("launchctl", "print"): [1], ("launchctl", "bootstrap"): [5, 0]}, calls),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(service.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(service, "daemon_executable", lambda: "/opt/bin/tldr-daemon")
+    monkeypatch.setattr(service, "_resolve_data_dir", lambda: tmp_path / "data")
+
+    plist = service.install_service(platform="darwin", home=tmp_path)
+
+    bootstrap_calls = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
+    assert len(bootstrap_calls) == 2
+    assert plist is not None and plist.is_file()
+    # A retry delay actually happened between the two bootstrap attempts.
+    assert sleeps
+
+
+def test_install_service_bootstrap_exhausts_retries_raises_legible_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+    # Every bootstrap attempt fails with the same race exit code.
+    monkeypatch.setattr(
+        service,
+        "_run",
+        _sequenced_run({("launchctl", "print"): [1], ("launchctl", "bootstrap"): [5]}, calls),
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(service, "daemon_executable", lambda: "/opt/bin/tldr-daemon")
+    monkeypatch.setattr(service, "_resolve_data_dir", lambda: tmp_path / "data")
+
+    with pytest.raises(service.ServiceCommandError) as excinfo:
+        service.install_service(platform="darwin", home=tmp_path)
+
+    bootstrap_calls = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
+    assert len(bootstrap_calls) == service.LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS
+    message = str(excinfo.value)
+    assert "bootstrap" in message
+    assert "5" in message  # exit code surfaced, not swallowed into a bare traceback
+
+
+def test_install_service_never_raises_bare_calledprocesserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exact bug report: a raw subprocess.CalledProcessError traceback
+    is the wrong output for a CLI. Confirm the old failure mode is gone —
+    the retry-exhausted path raises our own error type, never lets
+    CalledProcessError (or any non-ServiceCommandError) escape."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        service,
+        "_run",
+        _sequenced_run({("launchctl", "print"): [1], ("launchctl", "bootstrap"): [5]}, calls),
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(service, "daemon_executable", lambda: "/opt/bin/tldr-daemon")
+    monkeypatch.setattr(service, "_resolve_data_dir", lambda: tmp_path / "data")
+
+    try:
+        service.install_service(platform="darwin", home=tmp_path)
+    except service.ServiceCommandError:
+        pass
+    except subprocess.CalledProcessError:
+        pytest.fail("raw CalledProcessError escaped install_service")
+
+
+def test_install_service_waits_for_domain_free_before_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``print`` reports the service still present for the first couple of
+    polls (simulating bootout not having finished yet), then gone. Confirm
+    install_service polls rather than bootstrapping immediately."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        service,
+        "_run",
+        _sequenced_run(
+            {("launchctl", "print"): [0, 0, 1], ("launchctl", "bootstrap"): [0]}, calls
+        ),
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(service, "daemon_executable", lambda: "/opt/bin/tldr-daemon")
+    monkeypatch.setattr(service, "_resolve_data_dir", lambda: tmp_path / "data")
+
+    service.install_service(platform="darwin", home=tmp_path)
+
+    print_calls = [c for c in calls if c[:2] == ["launchctl", "print"]]
+    assert len(print_calls) >= 3
+    bootstrap_calls = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
+    assert len(bootstrap_calls) == 1
+
+
+def test_uninstall_service_waits_for_domain_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        service, "_run", _sequenced_run({("launchctl", "print"): [0, 1]}, calls)
+    )
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+
+    plist = service.launchd_plist_path(tmp_path)
+    plist.parent.mkdir(parents=True)
+    plist.write_text("x")
+
+    service.uninstall_service(platform="darwin", home=tmp_path)
+
+    print_calls = [c for c in calls if c[:2] == ["launchctl", "print"]]
+    assert len(print_calls) >= 2
+    assert not plist.exists()
+
+
+def test_cli_service_install_reports_legible_error_on_exhausted_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cli.py must turn a ServiceCommandError into a clean message + exit
+    code 1, never a raw traceback (the reported bug)."""
+    from src import cli
+
+    def fake_install() -> Path | None:
+        raise service.ServiceCommandError("launchctl bootstrap failed after 5 attempts: exit 5")
+
+    monkeypatch.setattr(service, "install_service", fake_install)
+
+    rc = cli._service("install")
+    assert rc == 1
+
+
 def test_service_status_reflects_unit_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -103,7 +103,12 @@ restart"), there is nothing here that's safe or worth persisting across a
 restart, so this module doesn't try. That means the ``retention.py`` sweep
 (keyed off ``Job.created_at`` / row deletion in the DB) has no way to find
 these directories on its own — see ``delete_job_frames`` below for the
-hook ``storage/repo.py`` calls to close that gap.
+hook ``storage/repo.py`` calls to close that gap for jobs it deletes
+itself. ``all_frame_job_ids`` below covers the remaining gap — a frame
+directory whose job row is gone through some OTHER path (or a crash
+between the row delete and the frame unlink) — which ``retention.
+_sweep_orphaned_frame_dirs`` calls every cycle regardless of
+``storage.retention_days``.
 
 The section/full clip downloaded on the way to the frames is never
 persisted — it lives in a ``tempfile.TemporaryDirectory`` under
@@ -824,6 +829,22 @@ def resolve_frame_path(job_id: str, rel_path: str) -> Path | None:
     return candidate
 
 
+def all_frame_job_ids() -> list[str]:
+    """Every job id that currently has a frame directory on disk.
+
+    Used by ``workers.retention``'s orphan sweep: normal deletion (``repo.
+    delete_job`` / ``repo.delete_jobs_older_than``) already calls
+    ``delete_job_frames`` for every row it removes, but a job row deleted
+    through some OTHER path that missed that hook, or a crash between the
+    row delete and the frame unlink, would otherwise leak its directory
+    forever — nothing else ever revisits it once the row is gone. This
+    walks the frame root once per retention cycle so that check is possible;
+    cheap, since frame directories are expected to be rare.
+    """
+    root = _frames_root_dir()
+    return [p.name for p in root.iterdir() if p.is_dir()]
+
+
 def delete_job_frames(job_id: str) -> bool:
     """Remove every frame JPEG (and the per-job directory) for ``job_id``.
 
@@ -857,6 +878,7 @@ __all__ = [
     "FULL_DOWNLOAD_MAX_BYTES",
     "MAX_FRAMES_PER_CALL",
     "MAX_FRAMES_PER_JOB",
+    "all_frame_job_ids",
     "delete_job_frames",
     "ensure_job_frames_dir",
     "fetch_frames",
