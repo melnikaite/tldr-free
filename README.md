@@ -463,6 +463,7 @@ If you skip it, those videos will error instead of transcribing via Whisper.
 | Backend | Platform | Notes |
 |---|---|---|
 | **mlx-openai-server** | macOS Apple Silicon | Already included if you use it for LLM |
+| [**LocalAI**](https://localai.io/) | Any OS, CPU / GPU (Metal on Apple Silicon) | `brew install local-ai`; `local-ai run` — model gallery, backends installed on demand |
 | [**faster-whisper-server**](https://github.com/fedirz/faster-whisper-server) | Any OS, CPU / GPU | `docker run -p 8000:8000 fedirz/faster-whisper-server` |
 | [**whisper.cpp server**](https://github.com/ggml-org/whisper.cpp) | Any OS | `brew install whisper-cpp`; start with `whisper-server` |
 | **Cloud** | — | See the short list below — *most* LLM providers have no transcription API at all |
@@ -471,6 +472,64 @@ Like the LLM backend, `whisper.base_url` can point at a cloud provider —
 `whisper.api_key` supports the exact same three storage mechanisms
 (environment variable, OS keychain, file) as `llm.api_key`, fully
 independent of it; see [API key storage](#api-key-storage).
+
+#### Which model to pick
+
+The server matters less than the model you load on it. Measured
+2026-09-21 on one Apple Silicon machine: LocalAI 4.10.0, all models GGUF on
+Metal, requests through `POST /v1/audio/transcriptions` with
+`response_format=verbose_json`. WER is computed after collapsing
+consecutive duplicate segments — the same normalization the daemon's
+`collapse_repeated_segments` applies. References: ZDF's official subtitles
+for a 25-minute episode (German, colloquial Berlin dialect — hard
+material), the Golos test set (Russian, 120 utterances / 590 words), and
+LibriSpeech test-clean (English, 90 utterances / 1637 words).
+
+| Model (LocalAI gallery name) | German | Russian | English | Segments/25 min | Time/25 min |
+|---|---|---|---|---|---|
+| `parakeet-cpp-tdt-0.6b-v3` | 37.1% | 14.2% | 2.5% | 428 | 72 s |
+| `qwen3-1.7b-crispasr` (Qwen3-ASR 1.7B) | 39.0% | 28.6% | 1.9% | 56 | 210 s |
+| `canary-crispasr` (Canary 1B v2) | 41.5% | 20.2% | 11.3% | 51 | 44 s |
+| `whisper-large-q5_0` (large-v3 Q5_0) | 52.4% | 24.6% | 1.8% | 555 | 131 s |
+| `whisper-large` (large-v3 f16, 3.1 GB) | 51.4% | 26.6% | not measured | 484 | 159 s |
+
+- **Non-English → `parakeet-cpp-tdt-0.6b-v3`.** Best WER on both German and
+  Russian, at roughly half Whisper's transcription time, with the most
+  granular segments (1.45 s average) — segment granularity is what
+  timecode accuracy in summaries rides on.
+- **Whisper large-v3 wins only on clean English** (1.8% vs. 2.5%). On hard
+  material it fails differently from the rest: fewest substitutions of any
+  model (173 on German — what it does transcribe tends to be right) but
+  641 omissions — it loops on repeated segments and drops whole stretches
+  of track. 35% of its raw German output was consecutive duplicate
+  segments; the other three models: 0%.
+- **Skip the full-precision f16 build (3.1 GB).** Against the quantized
+  Q5_0 (1.0 GB) it gains 1 point on German, loses 2 points on Russian,
+  runs 21% slower, and is three times the size. Omissions are 645 vs.
+  641 — quantization isn't what's driving the decoder loops.
+- **`canary-crispasr` silently mistranslates without an explicit
+  `language` parameter** — it translates to English instead of
+  transcribing. On the Russian set that was 100% WER ("Sixty thousand
+  tenge" for "Шестьдесят тысяч тенге"); on German, English text back.
+  Sending `task=transcribe` doesn't fix it. This is quiet corruption:
+  HTTP 200, non-empty segments, nothing in the daemon's existing checks
+  catches it. The daemon's first request in every `transcribe_audio` call
+  goes out without a language, so Canary is unsafe here without a code
+  change. Parakeet gave identical results (14.2%) with or without a
+  language on the same test.
+- **Segment granularity varies a lot.** `qwen3-1.7b-crispasr` and
+  `canary-crispasr` both return fixed ~27-second buckets rather than
+  per-utterance segments, which puts summary timecodes at roughly ±13 s
+  instead of ±2 s — a real cost when you click a timecode to seek.
+- **Compatibility.** Parakeet returns `segments` and `text` but no
+  `language` or `duration`; the daemon copes fine — language falls back to
+  text detection (`_bootstrap_language` → `detect_language`) and duration
+  comes from whatever the caller passed in. Switching models needs no code
+  changes.
+
+These numbers are from one machine against a small, specific set of
+references — a starting point, not a universal ranking. Re-check against
+your own material before committing to a model.
 
 <details>
 <summary><strong>Cloud transcription — who actually offers it</strong> (most LLM providers have no audio API at all)</summary>
