@@ -2307,6 +2307,52 @@ async def test_restore_does_nothing_when_first_pass_produced_no_content(
     assert diagnostics.backfilled_spans == []
     assert result_segments == segments
 
+    # The counterpart to backfilled_spans: this span had nothing to
+    # restore at all, so it's recorded as a genuine "no text here" hole —
+    # see TranscribeDiagnostics.record_missing_span /
+    # api.jobs._derive_missing_ranges.
+    assert diagnostics.missing_span_count == 1
+    assert diagnostics.missing_span_total_seconds == pytest.approx(40.0)
+    assert diagnostics.missing_spans == [
+        {"unit": "whole", "window_start": 10.0, "window_end": 50.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_coverage_backfilled_span_is_not_also_recorded_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A span the first pass DID produce something for (and Phase 6
+    restored) must show up in backfilled_spans only, never in
+    missing_spans too — the two lists partition the same "still uncertain
+    after the recheck budget ran out" set, they never overlap."""
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    audio = tmp_path / "a.opus"
+    audio.write_bytes(b"x")
+
+    loop_text = "I'm not sure if I'm doing that right."
+    segments = [{"start": 0.0, "end": 5.0, "text": "intro speech"}]
+    t = 5.0
+    while t < 90.0:
+        segments.append({"start": t, "end": t + 1.0, "text": loop_text})
+        t += 1.0
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    await transcribe._ensure_coverage(
+        segments,
+        source_path=audio,
+        window_duration=100.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert diagnostics.backfill_count == 1
+    assert diagnostics.missing_span_count == 0
+    assert diagnostics.missing_spans == []
+    assert diagnostics.missing_span_total_seconds == 0.0
+
 
 @pytest.mark.asyncio
 async def test_restore_tracks_multiple_independent_unresolved_windows(

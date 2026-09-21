@@ -222,6 +222,24 @@ class LowConfidenceRange(BaseModel):
     end_seconds: float
 
 
+class MissingRange(BaseModel):
+    """A contiguous span, merged from one or more entries in
+    ``Job.diagnostics_json``'s ``missing_spans`` (see
+    ``workers.transcribe.TranscribeDiagnostics.record_missing_span``), where
+    Whisper's coverage recheck couldn't resolve a stretch AND the first pass
+    produced no text at all to fall back on — unlike ``LowConfidenceRange``,
+    where SOME (unreliable) text exists, here there is genuinely nothing:
+    the transcript has an actual hole for this stretch of the timeline.
+
+    ``start_seconds``/``end_seconds`` are in the ORIGINAL AUDIO's timeline
+    (seconds), same convention as ``LowConfidenceRange`` — time-based, not
+    text-based, so a range stays correct on a translated transcript too.
+    Touching or overlapping spans are merged into one range.
+    """
+    start_seconds: float
+    end_seconds: float
+
+
 class JobDetails(JobSummary):
     """Full job with summary_md and partial_summary for reconnect replay."""
     summary_md: str | None
@@ -252,6 +270,17 @@ class JobDetails(JobSummary):
     # ``raw_segments_json``, which we don't want to do for every row in a
     # job list.
     low_confidence_ranges: list[LowConfidenceRange] = []
+    # Contiguous spans (original audio timeline, seconds) where Whisper's
+    # coverage recheck couldn't resolve a stretch AND the first pass had
+    # nothing at all for it — a genuine hole, as opposed to
+    # ``low_confidence_ranges``'s "text exists but is unreliable" (see
+    # ``MissingRange`` and ``workers.transcribe.TranscribeDiagnostics.
+    # record_missing_span``). Same emptiness conditions as
+    # ``low_confidence_ranges`` above (legacy jobs, non-Whisper jobs, jobs
+    # whose recheck budget never ran out unresolved), PLUS every job whose
+    # diagnostics_json predates this field (parsed defensively, reads as
+    # ``[]`` rather than erroring — see ``_derive_missing_ranges``).
+    missing_ranges: list[MissingRange] = []
     # Other playable sources the extension discovered on the page at
     # job-creation time. Surfaced by the sidepanel as a "wrong source?"
     # chip when non-empty — clicking opens the list so the user can

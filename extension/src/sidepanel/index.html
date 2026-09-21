@@ -78,6 +78,10 @@
         <!-- rendered by transcript.js's _renderSourceNotice() when
              Job.transcript_source === "site_captions" -->
       </div>
+      <div id="transcript-missing-badge" class="transcript-missing-badge hidden">
+        <!-- rendered by transcript.js's _renderMissingBadge() when
+             JobDetails.transcript_missing_seconds is present and > 0 -->
+      </div>
       <div id="diagnostics-section" class="diagnostics-section hidden">
         <!-- shown by transcript.js's _renderDiagnosticsControl() only for
              Job.transcript_source === "whisper" — GET /jobs/{id}/diagnostics -->

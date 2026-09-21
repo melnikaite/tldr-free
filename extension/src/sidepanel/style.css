@@ -948,6 +948,20 @@ body {
   box-sizing: border-box;
 }
 
+/* Summary-level counterpart to .tx-gap-mark below — one number in the
+   transcript header instead of making the user scroll to find every gap.
+   Same dashed/muted treatment as the in-body gap markers so the two read
+   as the same signal at different zoom levels. */
+.transcript-missing-badge {
+  margin: 0 0.8rem 0.4rem;
+  padding: 0.2rem 0.5rem;
+  display: inline-block;
+  border: 1px dashed color-mix(in srgb, var(--muted) 60%, transparent);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 0.8em;
+}
+
 .transcript-body {
   padding: 0.6rem 0.8rem 2rem;
   line-height: 1.5;
@@ -974,6 +988,22 @@ body {
   font-size: 0.7em;
   color: #c90;
   opacity: 0.8;
+  cursor: default;
+}
+/* Standalone insertion for a JobDetails.missing_ranges span (Phase 8) — a
+   stretch with NO text at all, unlike .tx-low-mark above (text exists, just
+   unreliable). Deliberately its own block rather than an inline decoration
+   on a line, and visually a different signal from the amber "⚠": a dashed
+   box reads as "content is missing here", not "trust this cautiously". */
+.tx-gap-mark {
+  margin: 0.35rem 0.2rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px dashed color-mix(in srgb, var(--muted) 60%, transparent);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 0.8em;
+  font-style: italic;
+  text-align: center;
   cursor: default;
 }
 .tx-line--current {

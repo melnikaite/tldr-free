@@ -166,6 +166,9 @@ td.title {
 .muted { color: var(--muted); }
 .small { font-size: 0.85em; }
 .imported-note { margin-top: 0.15rem; }
+/* JobSummary.transcript_missing_seconds row badge — see
+   library/app.js's renderMissingSecondsBadge. */
+.missing-seconds-badge { margin-top: 0.15rem; }
 
 .status-badge {
   display: inline-block;

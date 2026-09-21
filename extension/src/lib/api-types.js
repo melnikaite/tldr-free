@@ -108,6 +108,19 @@
  */
 
 /**
+ * A contiguous span where Whisper's coverage recheck couldn't resolve a
+ * stretch AND the first pass produced no text at all to fall back on —
+ * unlike LowConfidenceRange (unreliable text DOES exist), here the
+ * transcript has a genuine hole for this stretch of the timeline. See
+ * daemon ``workers.transcribe.TranscribeDiagnostics.record_missing_span`` /
+ * ``api.jobs._derive_missing_ranges``.
+ *
+ * @typedef {object} MissingRange
+ * @property {number} start_seconds - original audio timeline, seconds
+ * @property {number} end_seconds   - original audio timeline, seconds
+ */
+
+/**
  * Response of GET /jobs/{id}/transcript?lang=…
  *
  * When ``is_pending`` is true, ``text`` is null and the UI should show a
@@ -131,6 +144,7 @@
  *   transcript_language: string | null,
  *   transcript_translations: TranscriptTranslationSummary[],
  *   low_confidence_ranges: LowConfidenceRange[],
+ *   missing_ranges: MissingRange[],
  *   alt_media_candidates: MediaCandidate[],
  *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
  *   whisper_queue_position?: number | null,
@@ -145,6 +159,17 @@
  * The transcript view marks any rendered cue whose timestamp falls inside
  * one of these ranges — applies unchanged across every language since the
  * ranges are time-based, not text-based.
+ *
+ * ``missing_ranges`` are the OTHER half of the same coverage-recheck
+ * accounting: contiguous spans where the recheck budget ran out AND the
+ * first pass had nothing at all for that stretch (see daemon
+ * ``workers.transcribe.TranscribeDiagnostics.record_missing_span`` /
+ * ``api.jobs._derive_missing_ranges``). Unlike ``low_confidence_ranges``,
+ * there's no text here to mark — the transcript view renders a standalone
+ * gap marker between the surrounding cues instead. Time-based, same as
+ * ``low_confidence_ranges``. Empty for legacy jobs (diagnostics_json
+ * predates this field or is absent entirely), non-Whisper jobs, and any
+ * Whisper transcript that never left a fully-unresolved-and-empty span.
  *
  * ``queued_reason`` mirrors daemon ``Job.queued_reason``. Only meaningful
  * when ``status === "queued"`` — explains why the transcript fast path

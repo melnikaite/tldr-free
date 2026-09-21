@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.jobs import _derive_low_confidence_ranges
+from src.api.jobs import _derive_low_confidence_ranges, _derive_missing_ranges
 from src.main import app
 from src.storage.db import dispose_engine, init_engine
 from src.storage.migrations import run_migrations
@@ -641,6 +641,71 @@ def test_get_job_returns_empty_low_confidence_ranges_for_fresh_job(
     detail = client.get(f"/jobs/{job_id}").json()
     assert "low_confidence_ranges" in detail
     assert detail["low_confidence_ranges"] == []
+
+
+def test_derive_missing_ranges_merges_touching_spans() -> None:
+    """Two missing_spans entries that touch (one's end == the next's
+    start) merge into a single contiguous range, same as
+    _derive_low_confidence_ranges."""
+    diagnostics = {
+        "missing_spans": [
+            {"unit": "chunk-0", "window_start": 10.0, "window_end": 20.0},
+            {"unit": "chunk-0", "window_start": 20.0, "window_end": 25.0},
+        ]
+    }
+    ranges = _derive_missing_ranges(json.dumps(diagnostics))
+    assert len(ranges) == 1
+    assert ranges[0].start_seconds == 10.0
+    assert ranges[0].end_seconds == 25.0
+
+
+def test_derive_missing_ranges_keeps_gapped_spans_separate() -> None:
+    """A real gap between one missing span's end and the next's start
+    means two separate ranges, not one merged span."""
+    diagnostics = {
+        "missing_spans": [
+            {"unit": "chunk-0", "window_start": 0.0, "window_end": 5.0},
+            {"unit": "chunk-0", "window_start": 8.0, "window_end": 10.0},
+        ]
+    }
+    ranges = _derive_missing_ranges(json.dumps(diagnostics))
+    assert len(ranges) == 2
+    assert (ranges[0].start_seconds, ranges[0].end_seconds) == (0.0, 5.0)
+    assert (ranges[1].start_seconds, ranges[1].end_seconds) == (8.0, 10.0)
+
+
+def test_derive_missing_ranges_no_spans_returns_empty() -> None:
+    """diagnostics_json present but with an empty (or absent) missing_spans
+    list → []."""
+    assert _derive_missing_ranges(json.dumps({"missing_spans": []})) == []
+    assert _derive_missing_ranges(json.dumps({"other_field": 1})) == []
+
+
+def test_derive_missing_ranges_legacy_and_malformed_inputs_return_empty() -> None:
+    """None/empty diagnostics_json, not-valid-JSON, and valid-JSON-that-
+    isn't-a-dict/list all fail safe rather than raising — same defensive
+    style as _derive_low_confidence_ranges."""
+    assert _derive_missing_ranges(None) == []
+    assert _derive_missing_ranges("") == []
+    assert _derive_missing_ranges("not json{{{") == []
+    assert _derive_missing_ranges(json.dumps(["not", "a", "dict"])) == []
+    assert _derive_missing_ranges(json.dumps({"missing_spans": "not a list"})) == []
+
+
+def test_get_job_returns_empty_missing_ranges_for_fresh_job(client: TestClient) -> None:
+    """A job with no diagnostics_json at all (every job before this feature,
+    and every non-Whisper job) must get back ``missing_ranges: []`` — not
+    null, not missing."""
+    r = client.post(
+        "/jobs",
+        json={"url": "https://example.com/no-missing-ranges", "kind": "page", "page_text": "hi"},
+    )
+    job_id = r.json()["id"]
+    _wait_until_done(client, job_id)
+
+    detail = client.get(f"/jobs/{job_id}").json()
+    assert "missing_ranges" in detail
+    assert detail["missing_ranges"] == []
 
 
 def test_list_filters_by_exact_url(client: TestClient) -> None:

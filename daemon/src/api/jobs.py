@@ -46,6 +46,7 @@ from src.api.schemas import (
     JobSummary,
     LowConfidenceRange,
     MessagesListResponse,
+    MissingRange,
     MomentFinding,
     MomentsListResponse,
     TranscriptSource,
@@ -206,6 +207,62 @@ def _derive_low_confidence_ranges(raw_segments_json: str | None) -> list[LowConf
     return [LowConfidenceRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
 
 
+def _derive_missing_ranges(diagnostics_json: str | None) -> list[MissingRange]:
+    """Merge ``TranscribeDiagnostics.missing_spans`` entries (see
+    ``workers.transcribe.TranscribeDiagnostics.record_missing_span``) into
+    contiguous [start, end] spans for the side panel to mark as genuine
+    holes — stretches where the coverage recheck never resolved AND the
+    first pass produced no text at all to fall back on. Time-based, not
+    text-based, same as ``_derive_low_confidence_ranges`` above, so ranges
+    stay correct on a translated transcript too.
+
+    Returns [] for every job before ``diagnostics_json`` existed (migration
+    v10), every job before this specific field existed within it, every
+    non-Whisper job, and any Whisper job whose recheck budget never left a
+    span with nothing to restore. Same defensive JSON handling as
+    ``_derive_low_confidence_ranges``: malformed or missing input reads as
+    "nothing to show", never an error.
+    """
+    if not diagnostics_json:
+        return []
+    try:
+        data = json.loads(diagnostics_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_spans = data.get("missing_spans")
+    if not isinstance(raw_spans, list):
+        return []
+    spans = [s for s in raw_spans if isinstance(s, dict)]
+    if not spans:
+        return []
+
+    def _start(span: dict[str, Any]) -> float:
+        try:
+            return float(span.get("window_start", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _end(span: dict[str, Any]) -> float:
+        try:
+            return float(span.get("window_end", _start(span)))
+        except (TypeError, ValueError):
+            return _start(span)
+
+    spans.sort(key=_start)
+    ranges: list[list[float]] = []
+    for span in spans:
+        start, end = _start(span), _end(span)
+        if end < start:
+            end = start
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    return [MissingRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
+
+
 def _derive_moment_findings(moment_findings_json: str | None) -> list[MomentFinding]:
     """Parse ``Job.moment_findings_json`` (see migration v11 /
     ``workers.pipeline._run_frame_analysis``) into ``MomentFinding``s.
@@ -280,6 +337,7 @@ def _to_details(job: Any) -> JobDetails:
         low_confidence_ranges=_derive_low_confidence_ranges(
             getattr(job, "raw_segments_json", None)
         ),
+        missing_ranges=_derive_missing_ranges(getattr(job, "diagnostics_json", None)),
         alt_media_candidates=alt_candidates,
         queued_reason=getattr(job, "queued_reason", None),
         whisper_queue_position=get_queue().position(job.id),

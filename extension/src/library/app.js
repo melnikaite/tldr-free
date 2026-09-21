@@ -10,7 +10,7 @@
 
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
-import { escapeHtml, stringifyError } from "../lib/utils.js";
+import { escapeHtml, formatApproxDuration, stringifyError } from "../lib/utils.js";
 import { openSidePanel } from "../lib/browser-compat.js";
 
 // Library only renders status badges + queue counter — skip the high-volume
@@ -493,6 +493,7 @@ function renderRow(j) {
   const urlAttr = escapeHtml(j.url);
   const { label, cls } = renderStatusBadge(j);
   const checked = selectedIds.has(j.id) ? "checked" : "";
+  const missingBadge = renderMissingSecondsBadge(j);
   return `
     <tr data-id="${escapeHtml(j.id)}">
       <td class="select-col">
@@ -502,6 +503,7 @@ function renderRow(j) {
       <td class="title">
         <div class="title-text">${titleAttr}</div>
         <div class="url muted small" title="${urlAttr}">${urlAttr}</div>
+        ${missingBadge}
       </td>
       <td><span class="status-badge status-${cls}">${label}</span></td>
       <td class="muted small">${escapeHtml(created)}${importedLine}</td>
@@ -538,6 +540,22 @@ function renderStatusBadge(j) {
     };
   }
   return { label: escapeHtml(j.status), cls: escapeHtml(j.status) };
+}
+
+/**
+ * "~5 min not recognized" badge for a row whose transcript is known to be
+ * incomplete — see JobSummary.transcript_missing_seconds (daemon
+ * workers/transcribe.py's coverage check). Only shown when the value is
+ * present and positive; null/0 (the vast majority of rows, and every job
+ * predating this diagnostic) renders nothing.
+ * @param {JobSummary} j
+ * @returns {string}
+ */
+function renderMissingSecondsBadge(j) {
+  const seconds = j.transcript_missing_seconds;
+  if (!seconds || seconds <= 0) return "";
+  const text = `${formatApproxDuration(seconds)} not recognized`;
+  return `<div class="muted small missing-seconds-badge" title="Whisper couldn't reliably transcribe part of this recording — see the Transcript tab for exactly where.">${escapeHtml(text)}</div>`;
 }
 
 /** @param {JobSummary} j */

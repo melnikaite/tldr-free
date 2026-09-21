@@ -452,6 +452,21 @@ class TranscribeDiagnostics:
     backfilled_spans: list[dict[str, Any]] = field(default_factory=list)
     backfill_count: int = 0
     backfill_total_seconds: float = 0.0
+    # The OTHER half of what still counts toward missing_seconds after
+    # Phase 6: spans where the recheck budget ran out AND the first pass
+    # (``original_segments``) had nothing at all overlapping the span, so
+    # there was nothing for ``_restore_unresolved_windows`` to backfill —
+    # see that function's "first pass genuinely produced nothing here"
+    # branch. Distinct from ``backfilled_spans`` (text exists but is
+    # low-confidence) — this is "no text exists for this stretch of
+    # timeline at all". Same privacy posture as ``backfilled_spans``/
+    # ``coverage_rechecks``: unit + window only, never text.
+    # ``api/jobs.py``'s ``_derive_missing_ranges`` turns these into
+    # ``JobDetails.missing_ranges`` for the UI, mirroring
+    # ``_derive_low_confidence_ranges``'s treatment of ``backfilled_spans``.
+    missing_spans: list[dict[str, Any]] = field(default_factory=list)
+    missing_span_count: int = 0
+    missing_span_total_seconds: float = 0.0
     whisper_backend_base_url: str | None = None
     whisper_model: str | None = None
     yt_dlp_version: str | None = None
@@ -509,6 +524,26 @@ class TranscribeDiagnostics:
         )
         self.backfill_count += 1
         self.backfill_total_seconds += end - start
+
+    def record_missing_span(self, *, unit: str, start: float, end: float) -> None:
+        """Append one span where the recheck budget ran out unresolved AND
+        the first pass produced nothing at all overlapping it — see
+        ``_restore_unresolved_windows``'s "first pass genuinely produced
+        nothing here" branch. This is the counterpart to
+        ``record_backfill``: together they partition every span that still
+        counts toward ``missing_seconds`` after Phase 6 into "low-confidence
+        text restored" vs. "genuinely nothing here" — the distinction the
+        UI needs to tell a wrong-but-present transcript apart from an
+        actual silent gap in recognition."""
+        self.missing_spans.append(
+            {
+                "unit": unit,
+                "window_start": round(start, 1),
+                "window_end": round(end, 1),
+            }
+        )
+        self.missing_span_count += 1
+        self.missing_span_total_seconds += end - start
 
 
 def _yt_dlp_version() -> str | None:
@@ -1483,9 +1518,17 @@ def _restore_unresolved_windows(
         ):
             clipped = _clip_to_gap(original_segments, sub_start, sub_end)
             if not clipped:
+                if diagnostics is not None:
+                    diagnostics.record_missing_span(
+                        unit=unit_label, start=sub_start, end=sub_end
+                    )
                 continue  # first pass genuinely produced nothing here
             collapsed, _discarded = collapse_repeated_segments(clipped)
             if not collapsed:
+                if diagnostics is not None:
+                    diagnostics.record_missing_span(
+                        unit=unit_label, start=sub_start, end=sub_end
+                    )
                 continue
             marked = [dict(seg, low_confidence=True) for seg in collapsed]
             last = marked[-1]

@@ -26,7 +26,7 @@ import {
   MOMENT_MATCH_TOLERANCE_SECONDS,
 } from "../lib/frame-thumbnails.js";
 import { resolveVideoId } from "../lib/url.js";
-import { stringifyError } from "../lib/utils.js";
+import { formatApproxDuration, stringifyError } from "../lib/utils.js";
 
 /** @import { JobDetails, TranscriptResponse } from "../lib/api-types.js" */
 
@@ -48,6 +48,9 @@ const bodyEl = /** @type {HTMLElement | null} */ (
 );
 const sourceNoticeEl = /** @type {HTMLElement | null} */ (
   document.getElementById("transcript-source-notice")
+);
+const missingBadgeEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("transcript-missing-badge")
 );
 const exportTranscriptBtn = /** @type {HTMLButtonElement | null} */ (
   document.getElementById("export-transcript-btn")
@@ -101,6 +104,30 @@ let _cues = [];
 /** Last highlight index — fast path for monotonic playback. */
 let _lastCueIdx = -1;
 
+/**
+ * One-shot: force the NEXT ``_highlight`` call to scroll even if playback
+ * is paused. Set by ``_renderLines`` — it wipes ``bodyEl`` and resets
+ * ``_lastCueIdx``, which collapses the viewport back to the top of the
+ * transcript. On a normal read (paused, nothing rebuilt) ``_pollOnce``
+ * deliberately skips scrolling so the page doesn't get yanked out from
+ * under the user — but that same "don't scroll while paused" rule also
+ * hid the fact that a rebuild just happened, so after a language switch
+ * (almost always done on a paused video) the highlight landed on the
+ * right line while the viewport stayed stranded at the top. Set
+ * unconditionally in ``_renderLines`` rather than only at its one current
+ * caller (``_showLanguage``): every existing path into ``_renderLines`` —
+ * direct switch, a translation finishing for the language being viewed, a
+ * pending transcript resolving — is the FIRST real render of that content
+ * (previously blank, a spinner, or a different language), never a rebuild
+ * out from under text the user was already mid-read on, so forcing one
+ * scroll after each is exactly as welcome as after an explicit switch.
+ * Consumed (and cleared) by the very next ``_pollOnce`` tick; also
+ * cleared by ``_startPoll`` when no source tab is found, so it can't
+ * linger and fire much later once a tab finally reappears while the user
+ * is calmly reading.
+ */
+let _scrollOnNextHighlight = false;
+
 /** setInterval handle for the currentTime poll. */
 let _pollId = /** @type {number | null} */ (null);
 
@@ -142,6 +169,7 @@ _eventStream.subscribe((event) => {
     _job.transcript_translations = next;
     _renderChips();
     _renderSourceNotice();
+    _renderMissingBadge();
     _renderDiagnosticsControl();
     _syncExportButton();
     // If the just-completed translation is the language the user is
@@ -236,6 +264,7 @@ export function setJob(job) {
   // without re-fetching the body.
   _renderChips();
   _renderSourceNotice();
+  _renderMissingBadge();
   _renderDiagnosticsControl();
   _syncExportButton();
 }
@@ -328,6 +357,7 @@ function _renderNoJobState() {
   if (!bodyEl) return;
   if (langBarEl) langBarEl.innerHTML = "";
   _renderSourceNotice();
+  _renderMissingBadge();
   _renderDiagnosticsControl();
   _syncExportButton();
   bodyEl.innerHTML = `
@@ -367,6 +397,7 @@ async function _showLanguage(lang) {
   _currentLang = lang;
   _renderChips();
   _renderSourceNotice();
+  _renderMissingBadge();
   _renderDiagnosticsControl();
   _syncExportButton();
 
@@ -426,6 +457,31 @@ function _isLowConfidence(sec) {
   const ranges = _job?.low_confidence_ranges;
   if (!ranges || !ranges.length) return false;
   return ranges.some((r) => sec >= r.start_seconds && sec <= r.end_seconds);
+}
+
+/**
+ * Standalone marker for one ``JobDetails.missing_ranges`` span (see
+ * daemon ``api.jobs._derive_missing_ranges`` /
+ * ``workers.transcribe.TranscribeDiagnostics.record_missing_span``) — a
+ * stretch where the coverage recheck never resolved AND the first pass
+ * produced no text at all. Deliberately a DIFFERENT element from the
+ * ``.tx-low-mark`` "⚠" flag: that one decorates a cue whose (unreliable)
+ * text IS there; this one has no cue to decorate at all, so it's its own
+ * inserted block between the surrounding lines, visually distinct (see
+ * ``.tx-gap-mark`` in style.css) so a reader can tell "shaky text" apart
+ * from "nothing was recognized here".
+ * @param {{start_seconds: number, end_seconds: number}} range
+ * @returns {HTMLElement}
+ */
+function _buildMissingGapElement(range) {
+  const div = document.createElement("div");
+  div.className = "tx-gap-mark";
+  const duration = Math.max(0, range.end_seconds - range.start_seconds);
+  div.textContent = `— ${formatApproxDuration(duration)} not recognized —`;
+  div.title =
+    "Speech was likely here, but nothing could be transcribed for this stretch.";
+  div.setAttribute("role", "note");
+  return div;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +574,8 @@ function _renderLines(rawText) {
   bodyEl.innerHTML = "";
   _cues = [];
   _lastCueIdx = -1;
+  // See _scrollOnNextHighlight's own doc comment.
+  _scrollOnNextHighlight = true;
 
   // The transcript shape from build_marked_text is one [MM:SS] (or
   // [HH:MM:SS]) marker per line, followed by the bucket's text. Split
@@ -525,6 +583,18 @@ function _renderLines(rawText) {
   const lines = rawText.split(/\r?\n/);
   const re = /^\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]\s*(.*)$/;
   const frag = document.createDocumentFragment();
+  // Genuine transcription holes (JobDetails.missing_ranges — see
+  // _buildMissingGapElement's doc comment) have no segment of their own to
+  // decorate, so they're spliced in as standalone elements positioned by
+  // TIME rather than rendered alongside any one line. Sorted ascending so
+  // a single forward pointer can consume them as we pass each timestamped
+  // line below — gaps never overlap real segments (they're computed as
+  // exactly the stretches with no segment at all — see daemon
+  // api.jobs._derive_missing_ranges), so the walk never needs to look back.
+  const gaps = [...(_job?.missing_ranges || [])].sort(
+    (a, b) => a.start_seconds - b.start_seconds,
+  );
+  let gapIdx = 0;
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -536,6 +606,14 @@ function _renderLines(rawText) {
       const mm = Number(m[2]);
       const ss = Number(m[3]);
       const sec = h * 3600 + mm * 60 + ss;
+      // Any gap that starts before this line's own timestamp belongs
+      // strictly earlier in the timeline — splice it in now, before this
+      // line, rather than after (covers a gap before the very first line
+      // too, since gapIdx starts at 0).
+      while (gapIdx < gaps.length && gaps[gapIdx].start_seconds < sec) {
+        frag.appendChild(_buildMissingGapElement(gaps[gapIdx]));
+        gapIdx++;
+      }
       p.dataset.txSeconds = String(sec);
       // Make the marker clickable to seek — reuse the same click handler
       // pattern as the summary timecode links so app.js handles it.
@@ -562,6 +640,13 @@ function _renderLines(rawText) {
       p.textContent = trimmed;
     }
     frag.appendChild(p);
+  }
+  // Any remaining gap starts at/after the last timestamped line (the
+  // "after the last segment" case) — nothing left to splice it in front
+  // of, so it goes at the very end.
+  while (gapIdx < gaps.length) {
+    frag.appendChild(_buildMissingGapElement(gaps[gapIdx]));
+    gapIdx++;
   }
   bodyEl.appendChild(frag);
 
@@ -645,6 +730,33 @@ function _renderSourceNotice() {
     "Transcript from this site's own subtitles (not machine-transcribed) — " +
     "occasionally auto-translated or out of sync on some sites.";
   sourceNoticeEl.classList.remove("hidden");
+}
+
+/**
+ * Fills/hides ``#transcript-missing-badge`` — the summary-level counterpart
+ * to the per-gap ``.tx-gap-mark`` markers in the body: one number the user
+ * can see without scrolling through the whole transcript. Sourced from
+ * ``JobDetails.transcript_missing_seconds`` (daemon
+ * ``workers/transcribe.py``'s coverage check), not from summing
+ * ``missing_ranges`` client-side — the daemon's figure also includes any
+ * span that isn't its own contiguous range for other reasons, so this is
+ * the authoritative total. Hidden whenever the value is null/0 (every
+ * non-Whisper job, every fully-resolved Whisper transcript, and every job
+ * predating this diagnostic).
+ */
+function _renderMissingBadge() {
+  if (!missingBadgeEl) return;
+  const seconds = _job?.transcript_missing_seconds;
+  if (!seconds || seconds <= 0) {
+    missingBadgeEl.classList.add("hidden");
+    missingBadgeEl.textContent = "";
+    return;
+  }
+  missingBadgeEl.textContent = `${formatApproxDuration(seconds)} not recognized`;
+  missingBadgeEl.title =
+    "Whisper couldn't reliably transcribe part of this recording — see the " +
+    "marked gaps below for exactly where.";
+  missingBadgeEl.classList.remove("hidden");
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +1007,7 @@ function _renderChips() {
             ];
             _renderChips();
             _renderSourceNotice();
+            _renderMissingBadge();
             _renderDiagnosticsControl();
           }
         }
@@ -1015,7 +1128,12 @@ async function _startPoll() {
   _pollTabId = await _findSourceTab();
   if (_pollTabId == null) {
     // No matching tab open — nothing to follow. The user can still
-    // click [MM:SS] links to open one.
+    // click [MM:SS] links to open one. Nothing will consume
+    // _scrollOnNextHighlight while there's no poll running, so clear it
+    // here rather than leaving it to fire much later — whenever a tab
+    // finally reappears and a poll starts, the user is reading normally
+    // by then, not mid-rebuild, so that later scroll would be unwelcome.
+    _scrollOnNextHighlight = false;
     return;
   }
   _pollId = /** @type {number} */ (
@@ -1035,7 +1153,15 @@ async function _pollOnce() {
   if (_pollTabId == null) return;
   const result = await _readMediaState(_pollTabId);
   if (!result) return;
-  if (result.paused) {
+  // One-shot override: a rebuild (language switch, translation landing,
+  // pending transcript resolving) just collapsed the scroll position —
+  // see _scrollOnNextHighlight's doc comment. Consume it immediately so
+  // normal paused-reading behavior resumes right after this one forced
+  // scroll, regardless of whether _highlight below actually finds
+  // anything to scroll to.
+  const forceScroll = _scrollOnNextHighlight;
+  _scrollOnNextHighlight = false;
+  if (result.paused && !forceScroll) {
     // Paused → don't autoscroll; just leave the current highlight as it
     // is so the user can read freely.
     _highlight(result.currentTime, /* scroll */ false);
