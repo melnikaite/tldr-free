@@ -121,6 +121,22 @@
  */
 
 /**
+ * A contiguous span where VAD positively confirmed there is no speech AND
+ * the audio was loud enough to likely be music or some other non-speech
+ * sound, rather than a silent pause. Deliberately NOT a kind of
+ * MissingRange and never merged with one: a MissingRange means speech was
+ * probably lost, this means the opposite — there was likely nothing to
+ * lose. A quiet VAD-confirmed-silent span (a genuine pause) produces
+ * neither a MissingRange nor a NonSpeechRange. See daemon
+ * ``workers.transcribe.TranscribeDiagnostics.record_non_speech_span`` /
+ * ``api.jobs._derive_non_speech_ranges``.
+ *
+ * @typedef {object} NonSpeechRange
+ * @property {number} start_seconds - original audio timeline, seconds
+ * @property {number} end_seconds   - original audio timeline, seconds
+ */
+
+/**
  * Response of GET /jobs/{id}/transcript?lang=…
  *
  * When ``is_pending`` is true, ``text`` is null and the UI should show a
@@ -145,6 +161,7 @@
  *   transcript_translations: TranscriptTranslationSummary[],
  *   low_confidence_ranges: LowConfidenceRange[],
  *   missing_ranges: MissingRange[],
+ *   non_speech_ranges: NonSpeechRange[],
  *   alt_media_candidates: MediaCandidate[],
  *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
  *   whisper_queue_position?: number | null,
@@ -170,6 +187,16 @@
  * ``low_confidence_ranges``. Empty for legacy jobs (diagnostics_json
  * predates this field or is absent entirely), non-Whisper jobs, and any
  * Whisper transcript that never left a fully-unresolved-and-empty span.
+ *
+ * ``non_speech_ranges`` is a DIFFERENT signal from ``missing_ranges``,
+ * read from a separate stored list: contiguous spans where VAD positively
+ * confirmed no speech AND the audio was loud enough to likely be music or
+ * other non-speech sound (see ``NonSpeechRange`` /
+ * ``api.jobs._derive_non_speech_ranges``). Never lost speech, so never
+ * counted toward ``transcript_missing_seconds`` and never overlapping a
+ * ``missing_ranges`` entry. Empty for every job before this feature
+ * existed, plus any job whose VAD-confirmed-silent spans were all too
+ * quiet to call music (a plain pause gets no marker on either list).
  *
  * ``queued_reason`` mirrors daemon ``Job.queued_reason``. Only meaningful
  * when ``status === "queued"`` — explains why the transcript fast path

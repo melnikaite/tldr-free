@@ -465,9 +465,44 @@ class TranscribeDiagnostics:
     # ``api/jobs.py``'s ``_derive_missing_ranges`` turns these into
     # ``JobDetails.missing_ranges`` for the UI, mirroring
     # ``_derive_low_confidence_ranges``'s treatment of ``backfilled_spans``.
+    # Unlike every other window/span list on this dataclass,
+    # ``window_start``/``window_end`` here are ABSOLUTE seconds into the
+    # full recording, not local to the unit named in ``unit`` — see
+    # ``_restore_unresolved_windows``'s docstring for why this one
+    # field alone gets the caller's frame instead of its own chunk-local
+    # one. A window VAD positively confirmed holds no speech is not
+    # recorded here at all (same docstring) — the number
+    # (``final_missing_seconds``) already excluded it; this list now
+    # agrees.
     missing_spans: list[dict[str, Any]] = field(default_factory=list)
     missing_span_count: int = 0
     missing_span_total_seconds: float = 0.0
+    # The OTHER thing a window VAD positively confirms holds no speech can
+    # be, once loudness enters the picture (see
+    # ``_MUSIC_LOUDNESS_THRESHOLD_DBFS`` / ``_classify_vad_silent_loudness``):
+    # a LOUD confirmed-empty span is recorded here as probable music/other
+    # non-speech sound, instead of silently vanishing the way a quiet
+    # confirmed-empty span does (no marker at all — see
+    # ``_restore_unresolved_windows``'s docstring). Deliberately a SEPARATE
+    # list from ``missing_spans``, not a third value folded into it:
+    # ``missing_spans``/``missing_span_count``/``missing_span_total_seconds``
+    # mean "lost speech" everywhere else they're read (the transcript-tab
+    # badge, this dataclass's own ``final_missing_seconds``), and a show
+    # with a five-minute instrumental intro must not inflate that number —
+    # see the owner ruling this field exists to satisfy. Same shape,
+    # frame, and privacy posture as ``missing_spans`` (unit + ABSOLUTE
+    # window only, never text) — ``api/jobs.py``'s ``_derive_non_speech_ranges``
+    # turns these into ``JobDetails.non_speech_ranges`` for the UI, the
+    # same way ``_derive_missing_ranges`` handles ``missing_spans``.
+    # A job transcribed BEFORE this field existed simply has none of these
+    # in its stored ``diagnostics_json`` (a point-in-time snapshot, never
+    # rewritten) — its VAD-confirmed-empty-and-loud spans, if any, still
+    # show up as nothing at all until the job is re-transcribed, same
+    # stored-data limitation ``missing_spans``' own docstring already
+    # documents for the absolute-vs-chunk-local fix.
+    non_speech_spans: list[dict[str, Any]] = field(default_factory=list)
+    non_speech_span_count: int = 0
+    non_speech_span_total_seconds: float = 0.0
     whisper_backend_base_url: str | None = None
     whisper_model: str | None = None
     yt_dlp_version: str | None = None
@@ -579,7 +614,12 @@ class TranscribeDiagnostics:
         counts toward ``missing_seconds`` after Phase 6 into "low-confidence
         text restored" vs. "genuinely nothing here" — the distinction the
         UI needs to tell a wrong-but-present transcript apart from an
-        actual silent gap in recognition."""
+        actual silent gap in recognition. Never called at all for a span
+        VAD positively confirmed holds no speech, and ``start``/
+        ``end`` here are already in the CALLER's absolute frame, not the
+        unit's own local one — both handled by the caller
+        (``_restore_unresolved_windows``) before this method ever sees the
+        values; see that function's docstring."""
         self.missing_spans.append(
             {
                 "unit": unit,
@@ -589,6 +629,27 @@ class TranscribeDiagnostics:
         )
         self.missing_span_count += 1
         self.missing_span_total_seconds += end - start
+
+    def record_non_speech_span(self, *, unit: str, start: float, end: float) -> None:
+        """Append one span VAD positively confirmed holds no speech AND
+        loudness judged loud enough to be music/other non-speech sound
+        (``_MUSIC_LOUDNESS_THRESHOLD_DBFS``) — see
+        ``_restore_unresolved_windows``'s docstring for the full rule and
+        ``non_speech_spans``' own docstring for why this is a SEPARATE
+        counter from ``record_missing_span``, not a variant of it: this is
+        never "lost speech", so it must never affect ``missing_seconds`` or
+        anything derived from it. Same frame/rounding/privacy convention as
+        ``record_missing_span`` — ``start``/``end`` are already in the
+        CALLER's absolute frame by the time this is called."""
+        self.non_speech_spans.append(
+            {
+                "unit": unit,
+                "window_start": round(start, 1),
+                "window_end": round(end, 1),
+            }
+        )
+        self.non_speech_span_count += 1
+        self.non_speech_span_total_seconds += end - start
 
     def record_vad_skip(self, *, unit: str, start: float, end: float) -> None:
         """One window VAD confirmed holds zero speech — never spent a
@@ -1275,6 +1336,13 @@ async def _transcribe_chunked(
                 diagnostics=diagnostics,
                 unit_label=f"chunk {idx + 1}/{len(chunks)}",
                 language=pinned_language,
+                # missing_spans/non_speech_spans must carry ABSOLUTE times
+                # (the transcript segments get this same `offset` shift a
+                # few lines below; missing_spans didn't, which is the bug
+                # being fixed) — see _ensure_coverage's / _restore_unresolved_
+                # windows's docstrings for why only those two, not
+                # coverage_rechecks/backfilled_spans, are shifted.
+                time_offset=offset,
             )
             if missing > 0:
                 missing_total += missing
@@ -1499,12 +1567,12 @@ def _overlaps_checked(
     return False
 
 
-def _vad_attributed_speech(
+def _best_vad_match(
     window: tuple[float, float], vad_map: dict[tuple[float, float], float]
-) -> float | None:
-    """Speech-seconds VAD attributes to ``window`` (a pending recheck slice,
-    or a final unresolved window), prorated when ``window`` is only part of
-    the (usually larger, pre-slicing) window VAD actually examined.
+) -> tuple[tuple[float, float], float] | None:
+    """The ``vad_map`` entry — ``(window, speech_seconds)`` — that best
+    matches ``window`` (a pending recheck slice, or a final unresolved
+    window), or ``None`` when nothing overlaps it enough to count.
 
     Uses the SAME overlap-fraction matching technique as
     ``_overlaps_checked`` — the entry in ``vad_map`` whose window covers at
@@ -1514,12 +1582,14 @@ def _vad_attributed_speech(
     same window I have data for", rather than inventing a second matching
     rule. Ties go to whichever candidate has the largest overlap ratio.
 
-    Returns ``None`` when nothing in ``vad_map`` overlaps ``window`` enough
-    to count as a match — "VAD never examined this" (distinct from a real
-    ``0.0``, which means "VAD examined it and found no speech"). Callers
-    MUST keep those two apart: only a real ``0.0`` may skip a recheck or
-    zero out ``missing``; ``None`` means "fall back to the pre-VAD
-    behavior for this window".
+    Factored out of ``_vad_attributed_speech`` so a second caller
+    (``_restore_unresolved_windows``, via ``vad_loud_windows`` — see
+    ``_ensure_coverage``'s loudness-classification step) can answer "which
+    ORIGINAL vad_map window matched" without duplicating this matching
+    logic — that caller needs the matched window's own identity (to look
+    up a per-window loudness verdict keyed the same way), not just the
+    prorated speech-seconds figure ``_vad_attributed_speech`` computes
+    from it.
     """
     start, end = window
     length = end - start
@@ -1538,12 +1608,130 @@ def _vad_attributed_speech(
             best = (v_window, speech)
     if best is None or best_ratio < _WINDOW_OVERLAP_DEDUP_FRACTION:
         return None
-    (v_start, v_end), speech = best
+    return best
+
+
+def _vad_attributed_speech(
+    window: tuple[float, float], vad_map: dict[tuple[float, float], float]
+) -> float | None:
+    """Speech-seconds VAD attributes to ``window`` (a pending recheck slice,
+    or a final unresolved window), prorated when ``window`` is only part of
+    the (usually larger, pre-slicing) window VAD actually examined — see
+    ``_best_vad_match`` for the matching rule this is built on.
+
+    Returns ``None`` when nothing in ``vad_map`` overlaps ``window`` enough
+    to count as a match — "VAD never examined this" (distinct from a real
+    ``0.0``, which means "VAD examined it and found no speech"). Callers
+    MUST keep those two apart: only a real ``0.0`` may skip a recheck or
+    zero out ``missing``; ``None`` means "fall back to the pre-VAD
+    behavior for this window".
+    """
+    match = _best_vad_match(window, vad_map)
+    if match is None:
+        return None
+    (v_start, v_end), speech = match
     v_length = v_end - v_start
     if v_length <= 0:
         return 0.0
+    start, end = window
     overlap = min(end, v_end) - max(start, v_start)
     return speech * (overlap / v_length)
+
+
+# Below this mean loudness (ffmpeg's ``volumedetect`` "mean_volume", in
+# dBFS — see ``_mean_volume_dbfs``), a window VAD confirms holds zero
+# speech is treated as a genuine pause, not music: no marker at all in the
+# transcript body, rather than mislabeling quiet room tone as "music" just
+# because VAD found no speech in it. At or above it, the same window is
+# labeled music (see ``_classify_vad_silent_loudness`` /
+# ``TranscribeDiagnostics.record_non_speech_span``).
+#
+# Measured against a real 24:57 ZDF episode ("Grumpy Elster",
+# https://www.zdf.de/play/serien/spaeti-102/grumpy-elster-100) — the same
+# episode workers/vad.py's module docstring measures VAD's own accuracy
+# against. silero-vad-ggml scanned the whole episode in 10s windows;
+# 19 of them came back with exactly zero attributed speech. ffmpeg's
+# ``volumedetect`` filter over each of those 19 windows (plus a handful of
+# finer 5s sub-windows across the two that turned out to be the quiet
+# ones, to rule out an averaging artefact):
+#
+# - The 17 windows that hold background music (the show's title theme,
+#   plus four later music cues) measured mean_volume -37.4 to -21.2 dBFS.
+# - The 2 windows that turned out to be a genuine quiet dip WITHIN that
+#   same title theme (a fade-out before the vocals return) measured
+#   -54.6 to -45.8 dBFS — confirmed at 5s granularity too, so this isn't
+#   an artefact of averaging a loud and a quiet half together.
+#
+# The two clusters never come within 8.4 dB of each other in this sample.
+# -42.0 dBFS sits in that gap with real margin on both sides: 4.6 dB below
+# every measured music window, 3.8 dB above every measured quiet dip.
+_MUSIC_LOUDNESS_THRESHOLD_DBFS = -42.0
+
+
+def _mean_volume_dbfs(audio_path: Path, start: float, duration: float) -> float | None:
+    """Mean loudness (dBFS) of ``[start, start+duration)`` in ``audio_path``,
+    via ffmpeg's ``volumedetect`` audio filter (``-f null -`` — no output
+    file, just the filter's stats on stderr). Sync; the caller
+    (``_classify_vad_silent_loudness``) runs this through
+    ``asyncio.to_thread``, same as every other ffmpeg subprocess call in
+    this module.
+
+    Returns ``None`` on ANY failure — ffmpeg unavailable, the process
+    failing or timing out, or output that doesn't contain a parseable
+    ``mean_volume`` line — never raises. A caller that can't measure
+    loudness must fall back to treating the span as NOT loud (see
+    ``_classify_vad_silent_loudness``): claiming "music" on a
+    measurement we couldn't actually take would be worse than the
+    conservative default of no marker at all.
+    """
+    ffmpeg = _ffmpeg_bin("ffmpeg")
+    if not ffmpeg or duration <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                "-i", str(audio_path),
+                "-af", "volumedetect", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.warning("transcribe: loudness probe failed (%s)", exc)
+        return None
+    match = re.search(r"mean_volume:\s*(-?\d+\.?\d*) dB", proc.stderr)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+async def _classify_vad_silent_loudness(
+    source_path: Path, windows: list[tuple[float, float]]
+) -> frozenset[tuple[float, float]]:
+    """For each ``window`` VAD confirmed holds zero speech, measure its
+    loudness and return the subset judged loud enough to label as music
+    (``_MUSIC_LOUDNESS_THRESHOLD_DBFS``) rather than a silent pause.
+
+    Called once per ``_ensure_coverage`` call, over exactly the ``vad_map``
+    entries with ``speech <= 0.0`` — bounded by the same
+    ``whisper.vad_max_seconds`` budget that already bounds ``vad_map``
+    itself, so this never adds an unbounded amount of extra ffmpeg work.
+    A window this couldn't measure (``_mean_volume_dbfs`` returned
+    ``None``) is simply absent from the returned set — same "can't tell,
+    stay conservative" posture as that function's own docstring.
+
+    The returned set's keys are the SAME ``(start, end)`` tuples as
+    ``vad_map``'s (never recomputed), so ``_restore_unresolved_windows``
+    can look up "was the vad_map window THIS sub-range matched to judged
+    loud" via ``_best_vad_match`` and a plain ``in`` check — see that
+    function's docstring for how the two pieces fit together.
+    """
+    loud: set[tuple[float, float]] = set()
+    for start, end in windows:
+        dbfs = await asyncio.to_thread(_mean_volume_dbfs, source_path, start, end - start)
+        if dbfs is not None and dbfs >= _MUSIC_LOUDNESS_THRESHOLD_DBFS:
+            loud.add((start, end))
+    return frozenset(loud)
 
 
 def _pending_slices(
@@ -1636,6 +1824,51 @@ def _subtract_confirmed_silent(
     return [(start, end) for start, end in pieces if end - start > 0]
 
 
+def _record_empty_or_non_speech_span(
+    diagnostics: TranscribeDiagnostics | None,
+    *,
+    unit_label: str,
+    start: float,
+    end: float,
+    time_offset: float,
+    vad_confirmed_empty: bool,
+    vad_confirmed_loud: bool,
+) -> None:
+    """One sub-range ``_restore_unresolved_windows`` found NOTHING to
+    restore for (first pass produced no usable text at all) — decide which
+    diagnostics list, if any, it belongs on. A free function taking every
+    input explicitly (rather than a closure over the caller's loop
+    variables) purely to keep ruff's B023 happy about the two call sites
+    living inside a ``for`` loop; behaviourally this is just the shared
+    tail of both branches.
+
+    - Loud AND confirmed-empty (``vad_confirmed_loud``): probable music —
+      ``record_non_speech_span``.
+    - Confirmed-empty but not loud: a genuine quiet pause — no marker at
+      all.
+    - Not confirmed-empty (includes "VAD never examined this" and "VAD
+      unavailable"): genuinely missing — ``record_missing_span``, same as
+      before this feature existed.
+
+    ``start``/``end`` are shifted by ``time_offset`` into the caller's
+    absolute frame here, at the call site, same as before this was
+    factored out — see ``_restore_unresolved_windows``'s docstring for why
+    only these two diagnostics fields get that treatment.
+    """
+    if diagnostics is None:
+        return
+    if vad_confirmed_loud:
+        diagnostics.record_non_speech_span(
+            unit=unit_label, start=start + time_offset, end=end + time_offset
+        )
+    elif not vad_confirmed_empty:
+        diagnostics.record_missing_span(
+            unit=unit_label, start=start + time_offset, end=end + time_offset
+        )
+    # else: confirmed-empty and not loud — a genuine quiet pause, no
+    # marker at all.
+
+
 def _restore_unresolved_windows(
     working: list[dict[str, Any]],
     original_segments: list[dict[str, Any]],
@@ -1644,6 +1877,9 @@ def _restore_unresolved_windows(
     *,
     diagnostics: TranscribeDiagnostics | None,
     unit_label: str,
+    vad_map: dict[tuple[float, float], float] | None = None,
+    vad_loud_windows: frozenset[tuple[float, float]] = frozenset(),
+    time_offset: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Owner ruling, 2026-08-28: **"a wrong transcript beats a hole."**
     Never let a span end up with literally ZERO text once the recheck
@@ -1704,6 +1940,70 @@ def _restore_unresolved_windows(
     instead of leaving two — the only case this function ever touches a
     restored segment's ``start``, and it never touches any OTHER kept
     segment's bounds.
+
+    Two rules this function applies before recording anything (both
+    diagnosed against a live job, ``lQD4P5PFYwX6``, whose badge read 21s
+    while its body carried 234s of markers, most of them over the show's
+    intro music):
+
+    **Confirmed non-speech is not a hole — but it might be music.**
+    ``vad_map``, when given (``None`` when the VAD feature is off or
+    unavailable — see ``TranscribeDiagnostics.vad_available``), is
+    consulted before either ``record_missing_span`` call below, via
+    ``_vad_attributed_speech`` on the exact sub-range about to be marked —
+    the SAME rule the recheck-picking loop above already applies: a
+    sub-range VAD positively attributes ZERO speech to
+    (``speech is not None and speech <= 0.0``) never gets a "not
+    recognized" marker, because there is nothing "not recognized" about
+    it — it's confirmed non-speech, exactly like the number already
+    reflects (``_final_window_missing``). ``speech is None`` ("VAD never
+    examined this sub-range" — feature off, budget cut it off, or no
+    sufficiently-overlapping VAD entry) is NOT treated as confirmed-empty,
+    so behaviour there — and whenever ``vad_map is None`` — is
+    byte-identical to before this fix.
+
+    A confirmed-empty sub-range isn't simply dropped, though: owner
+    ruling (this feature) is that a LOUD confirmed-empty span is probably
+    music (or other non-speech sound) and worth saying so, while a QUIET
+    one is probably just a pause — nothing worth marking at all. Which is
+    which was already decided by the caller (``_ensure_coverage``, the
+    only place with access to ``source_path`` for a loudness measurement)
+    and handed down as ``vad_loud_windows`` — the subset of ``vad_map``'s
+    OWN windows (see ``_classify_vad_silent_loudness``) judged loud
+    enough. This function re-derives which ``vad_map`` window the
+    sub-range matched (``_best_vad_match`` — the same matching
+    ``_vad_attributed_speech`` uses internally) purely to look it up in
+    that set: a match found in ``vad_loud_windows`` gets
+    ``record_non_speech_span`` instead of nothing; a confirmed-empty match
+    NOT in ``vad_loud_windows`` (quiet, or loudness couldn't be measured —
+    see ``_mean_volume_dbfs``'s docstring for why that also reads as "not
+    loud") gets no marker at all, same as before this step existed. This
+    only changes the two ``record_missing_span`` branches; it never
+    changes which segments get restored, never touches ``missing_seconds``
+    (computed by the caller before this function runs — see above), and
+    never touches ``record_backfill``.
+
+    **Spans are recorded in the caller's frame.** ``time_offset`` (the
+    chunk's own offset into the full
+    recording; 0.0 on the whole-file path) is added to a span's start/end
+    ONLY at the ``record_missing_span``/``record_non_speech_span`` call
+    sites, deliberately NOT to ``record_backfill`` or the
+    ``coverage_rechecks``/``overlap_suppressed`` entries logged elsewhere
+    in this module: those are read by a human right next to their own
+    ``unit`` label ("chunk 4/5"), where chunk-local coordinates are the
+    actually useful ones, while ``missing_spans``/``non_speech_spans`` are
+    the only diagnostics fields consumed as an absolute POSITION in the
+    final, reassembled transcript (``api/jobs.py``'s
+    ``_derive_missing_ranges``/``_derive_non_speech_ranges``) — so they
+    alone need the caller's frame, not the chunk's. This is a deliberate
+    inconsistency, not an oversight.
+
+    Diagnostics recorded by a job transcribed BEFORE this fix keep their
+    old, unfixed spans forever (``diagnostics_json`` is a point-in-time
+    snapshot never rewritten after the fact) — only re-transcribing the
+    job produces corrected ``missing_spans``, and only re-transcribing
+    AFTER the loudness step existed produces any ``non_speech_spans`` at
+    all.
     """
     restored: list[dict[str, Any]] = []
     restored_ranges: list[tuple[float, float]] = []
@@ -1713,19 +2013,48 @@ def _restore_unresolved_windows(
         for sub_start, sub_end in _subtract_confirmed_silent(
             (w_start, w_end), confirmed_silent
         ):
+            # A sub-range VAD positively attributes zero speech to never
+            # gets a ``missing_spans`` marker — see this function's own
+            # docstring for the exact rule and why ``None`` (VAD never
+            # examined this sub-range) must NOT be treated the same way.
+            # Whether it instead gets a ``non_speech_spans`` marker
+            # depends on loudness, decided by the caller and handed down
+            # as ``vad_loud_windows`` — see the docstring's "but it might
+            # be music" section.
+            vad_speech = (
+                _vad_attributed_speech((sub_start, sub_end), vad_map)
+                if vad_map is not None
+                else None
+            )
+            vad_confirmed_empty = vad_speech is not None and vad_speech <= 0.0
+            vad_confirmed_loud = False
+            if vad_confirmed_empty and vad_map is not None:
+                match = _best_vad_match((sub_start, sub_end), vad_map)
+                vad_confirmed_loud = match is not None and match[0] in vad_loud_windows
+
             clipped = _clip_to_gap(original_segments, sub_start, sub_end)
             if not clipped:
-                if diagnostics is not None:
-                    diagnostics.record_missing_span(
-                        unit=unit_label, start=sub_start, end=sub_end
-                    )
+                _record_empty_or_non_speech_span(
+                    diagnostics,
+                    unit_label=unit_label,
+                    start=sub_start,
+                    end=sub_end,
+                    time_offset=time_offset,
+                    vad_confirmed_empty=vad_confirmed_empty,
+                    vad_confirmed_loud=vad_confirmed_loud,
+                )
                 continue  # first pass genuinely produced nothing here
             collapsed, _discarded = collapse_repeated_segments(clipped)
             if not collapsed:
-                if diagnostics is not None:
-                    diagnostics.record_missing_span(
-                        unit=unit_label, start=sub_start, end=sub_end
-                    )
+                _record_empty_or_non_speech_span(
+                    diagnostics,
+                    unit_label=unit_label,
+                    start=sub_start,
+                    end=sub_end,
+                    time_offset=time_offset,
+                    vad_confirmed_empty=vad_confirmed_empty,
+                    vad_confirmed_loud=vad_confirmed_loud,
+                )
                 continue
             marked = [dict(seg, low_confidence=True) for seg in collapsed]
             last = marked[-1]
@@ -1985,6 +2314,7 @@ async def _ensure_coverage(
     diagnostics: TranscribeDiagnostics | None = None,
     unit_label: str = "whole",
     language: str | None = None,
+    time_offset: float = 0.0,
 ) -> tuple[list[dict[str, Any]], float]:
     """Check ``segments`` (a LOCAL timeline starting at 0) against
     ``window_duration`` seconds of ``source_path``: re-transcribe every
@@ -1992,6 +2322,30 @@ async def _ensure_coverage(
     ``_MAX_RECHECK_SLICE_SECONDS`` at most per request — and decide, from
     what comes back, whether it was real speech, confirmed non-speech, or
     still unresolved.
+
+    ``time_offset`` is this unit's own offset into the full recording
+    (0.0 on the whole-file path; the chunk's start time on the chunked
+    path — see ``_transcribe_chunked``'s call site). It is used ONLY to
+    convert ``TranscribeDiagnostics.missing_spans``/``non_speech_spans``
+    entries from this call's local timeline to the caller's absolute one
+    before recording them — see ``_restore_unresolved_windows``'s
+    docstring for exactly why only those two fields get shifted. Every
+    OTHER local-timeline value this function returns or records (the
+    returned ``segments``, ``coverage_rechecks``, ``backfilled_spans``,
+    ``missing_seconds`` itself) stays in this call's own local frame,
+    unaffected by ``time_offset`` — the chunk-merge loop in
+    ``_transcribe_chunked`` shifts the returned segments separately, the
+    same way it always has.
+
+    Before deciding what's still unresolved, this function also measures
+    LOUDNESS for every window ``vad_map`` confirms holds zero speech (see
+    ``_classify_vad_silent_loudness`` / ``_MUSIC_LOUDNESS_THRESHOLD_DBFS``)
+    and hands the loud subset down into ``_restore_unresolved_windows`` as
+    ``vad_loud_windows`` — a loud confirmed-empty span is recorded as
+    probable music instead of silently producing no marker at all. A job
+    transcribed before this loudness step existed has no ``non_speech_spans``
+    in its stored diagnostics regardless of what its audio actually
+    contains; only re-transcribing produces them.
 
     ``language``, when given, is pinned on every recheck request this call
     makes (see ``_call_whisper``/``_post_audio``) instead of letting each
@@ -2166,6 +2520,26 @@ async def _ensure_coverage(
             diagnostics.vad_speech_seconds_total += sum(vad_map.values())
             if len(vad_map) < len(vad_candidate_windows):
                 diagnostics.vad_budget_exceeded = True
+
+    # Loudness classification for VAD-confirmed-empty windows — decides,
+    # for the ``_restore_unresolved_windows`` call at the end of this
+    # function, whether a confirmed-empty span gets labeled music
+    # (``TranscribeDiagnostics.record_non_speech_span``) or gets no marker
+    # at all (a genuine quiet pause). Done HERE, not in
+    # ``_restore_unresolved_windows``, because measuring loudness needs
+    # ``source_path`` — this function has it, that one (sync, and called
+    # from more than just this async context) doesn't. Only the windows
+    # ``vad_map`` already says hold zero speech are measured — bounded by
+    # the same ``vad_max_seconds`` budget that already bounds ``vad_map``
+    # itself, so this never costs more ffmpeg work than VAD already did.
+    vad_loud_windows: frozenset[tuple[float, float]] = frozenset()
+    if vad_map is not None:
+        zero_speech_windows = [w for w, speech in vad_map.items() if speech <= 0.0]
+        if zero_speech_windows:
+            vad_loud_windows = await _classify_vad_silent_loudness(
+                source_path, zero_speech_windows
+            )
+
     # Dedup for VAD-confirmed-empty windows: unlike checked/suppressed
     # windows, a VAD-skip window is never spliced or added to ``checked``,
     # so it recurs with EXACTLY the same (start, end) on every outer-loop
@@ -2459,6 +2833,9 @@ async def _ensure_coverage(
         confirmed_silent,
         diagnostics=diagnostics,
         unit_label=unit_label,
+        vad_map=vad_map,
+        vad_loud_windows=vad_loud_windows,
+        time_offset=time_offset,
     )
     return working, missing
 

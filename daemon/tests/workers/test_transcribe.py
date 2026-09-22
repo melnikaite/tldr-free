@@ -2456,6 +2456,340 @@ async def test_restore_does_nothing_when_first_pass_produced_no_content(
     ]
 
 
+# ---------------------------------------------------------------------------
+# VAD-confirmed-empty regression (live job lQD4P5PFYwX6): the NUMBER
+# (missing_seconds,
+# via _final_window_missing) already excludes a window VAD positively
+# confirms holds no speech, but record_missing_span — called from
+# _restore_unresolved_windows, which never saw vad_map at all — did not, so
+# every unresolved window whose first pass produced no text got a "not
+# recognized" marker in the transcript body, music included. Fixed by
+# threading vad_map into _restore_unresolved_windows and applying the SAME
+# rule the recheck-picking loop already uses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_missing_span_when_vad_confirms_no_speech_and_quiet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A window VAD positively attributes ZERO speech to, that also turns
+    out too QUIET to be music (see _MUSIC_LOUDNESS_THRESHOLD_DBFS), gets NO
+    marker at all — not "not recognized", not "music" — matching the
+    number, which already excludes it: it's a genuine pause."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+
+    async def fail_post(*_a: object, **_k: object) -> dict:
+        pytest.fail("no Whisper recheck should be spent on a VAD-confirmed-silent window")
+
+    monkeypatch.setattr(transcribe, "_post_audio", fail_post)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {w: 0.0 for w in windows}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+    # Well below _MUSIC_LOUDNESS_THRESHOLD_DBFS (-42.0) — a genuine quiet
+    # pause, not music. Patched directly rather than exercising real
+    # ffmpeg against a nonexistent file, same as every other test here
+    # that stubs out the audio-touching layer.
+    monkeypatch.setattr(transcribe, "_mean_volume_dbfs", lambda *a, **k: -60.0)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        [],  # whole 40s window is one gap, first pass produced nothing
+        source_path=tmp_path / "a.opus",
+        window_duration=40.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert missing == 0.0
+    assert diagnostics.missing_spans == []
+    assert diagnostics.missing_span_count == 0
+    assert diagnostics.missing_span_total_seconds == 0.0
+    assert diagnostics.non_speech_spans == []
+    assert diagnostics.non_speech_span_count == 0
+    assert diagnostics.non_speech_span_total_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_restore_records_non_speech_span_when_vad_confirms_no_speech_and_loud(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Counterpart to the quiet case above: a window VAD positively
+    attributes ZERO speech to, that turns out LOUD enough
+    (>= _MUSIC_LOUDNESS_THRESHOLD_DBFS) to be music, gets a
+    non_speech_spans entry instead of vanishing — and, just as important,
+    still gets NO missing_spans entry and doesn't move ``missing`` at all:
+    this is never counted as lost speech, on either list."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+
+    async def fail_post(*_a: object, **_k: object) -> dict:
+        pytest.fail("no Whisper recheck should be spent on a VAD-confirmed-silent window")
+
+    monkeypatch.setattr(transcribe, "_post_audio", fail_post)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {w: 0.0 for w in windows}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+    # Well above _MUSIC_LOUDNESS_THRESHOLD_DBFS (-42.0) — music, per the
+    # real-episode measurement backing that constant.
+    monkeypatch.setattr(transcribe, "_mean_volume_dbfs", lambda *a, **k: -25.0)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        [],
+        source_path=tmp_path / "a.opus",
+        window_duration=40.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert missing == 0.0
+    assert diagnostics.missing_spans == []
+    assert diagnostics.missing_span_count == 0
+    assert diagnostics.missing_span_total_seconds == 0.0
+    assert diagnostics.non_speech_spans == [
+        {"unit": "whole", "window_start": 0.0, "window_end": 40.0}
+    ]
+    assert diagnostics.non_speech_span_count == 1
+    assert diagnostics.non_speech_span_total_seconds == pytest.approx(40.0)
+
+
+def test_record_non_speech_span_does_not_affect_missing_counters() -> None:
+    """record_non_speech_span and record_missing_span accumulate into
+    completely separate counters — this is the guarantee behind the owner
+    ruling that a long musical intro must never inflate the "missing"
+    badge. Calling one must never move the other's count/total, and
+    transcript_missing_seconds (sourced from missing_span_total_seconds /
+    final_missing_seconds, never non_speech_span_total_seconds — see
+    runner.py) is therefore unaffected by however much music a job has."""
+    diagnostics = transcribe.TranscribeDiagnostics()
+    diagnostics.record_missing_span(unit="whole", start=0.0, end=5.0)
+    diagnostics.record_non_speech_span(unit="whole", start=10.0, end=310.0)
+
+    assert diagnostics.missing_span_count == 1
+    assert diagnostics.missing_span_total_seconds == pytest.approx(5.0)
+    assert diagnostics.missing_spans == [
+        {"unit": "whole", "window_start": 0.0, "window_end": 5.0}
+    ]
+
+    assert diagnostics.non_speech_span_count == 1
+    assert diagnostics.non_speech_span_total_seconds == pytest.approx(300.0)
+    assert diagnostics.non_speech_spans == [
+        {"unit": "whole", "window_start": 10.0, "window_end": 310.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restore_records_missing_span_when_vad_attributes_speech(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Counterpart to the above: a window VAD says DOES hold speech is not
+    skipped just because VAD ran at all — only a confirmed-EMPTY verdict
+    (speech <= 0.0) suppresses the marker. Here the recheck itself can't
+    resolve the gap (recut unavailable), so it's still genuinely missing
+    and must still surface as a missing_spans entry, with "not recognized"
+    text intact."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {w: 12.0 for w in windows}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        [],
+        source_path=tmp_path / "a.opus",
+        window_duration=40.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert missing == pytest.approx(12.0)
+    assert diagnostics.missing_span_count == 1
+    assert diagnostics.missing_spans == [
+        {"unit": "whole", "window_start": 0.0, "window_end": 40.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restore_records_missing_span_when_vad_never_examined_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """VAD is enabled but produced no data at all for this exact window
+    (e.g. whisper.vad_max_seconds cut the pass short before reaching it) —
+    _vad_attributed_speech returns None for it, which must NOT be treated
+    as confirmed-empty. Behaviour stays exactly as if vad_map were None."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    async def fake_speech_seconds(
+        _source_path: Path, _windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {}  # budget exhausted before any candidate window was examined
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        [],
+        source_path=tmp_path / "a.opus",
+        window_duration=40.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert missing == pytest.approx(40.0)
+    assert diagnostics.missing_span_count == 1
+    assert diagnostics.missing_spans == [
+        {"unit": "whole", "window_start": 0.0, "window_end": 40.0}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Absolute-frame regression (same live job): _ensure_coverage runs against a
+# single
+# chunk file, so its window coordinates are chunk-local — but the merge loop
+# in _transcribe_chunked shifts transcript SEGMENTS by the chunk's offset
+# without doing the same for missing_spans, so a marker computed for chunk 4
+# rendered in the first few minutes of the reassembled transcript. Fixed by
+# threading time_offset into _ensure_coverage / _restore_unresolved_windows,
+# applied ONLY at the record_missing_span call sites.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_coverage_time_offset_shifts_only_missing_spans(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A direct, single-call check that time_offset shifts missing_spans'
+    window_start/window_end into the caller's absolute frame, while the
+    returned segments and missing_seconds stay in the call's own local
+    frame (the chunked caller shifts those itself, separately, as before)."""
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    segments = [{"start": 0.0, "end": 10.0, "text": "real speech here"}]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    result_segments, missing = await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="chunk 2/5",
+        time_offset=600.0,
+    )
+
+    assert missing == pytest.approx(40.0)  # local accounting, unaffected
+    assert result_segments == segments  # returned segments stay chunk-local
+    assert diagnostics.missing_spans == [
+        {"unit": "chunk 2/5", "window_start": 610.0, "window_end": 650.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_coverage_time_offset_defaults_to_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The whole-file call site never passes time_offset — confirm the
+    default leaves missing_spans exactly as before this fix (chunk-local ==
+    absolute when there's only one unit)."""
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    segments = [{"start": 0.0, "end": 10.0, "text": "real speech here"}]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert diagnostics.missing_spans == [
+        {"unit": "whole", "window_start": 10.0, "window_end": 50.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_chunked_missing_spans_are_absolute(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end: a chunk-2 span that never gets resolved must land in
+    transcribe_audio()'s final diagnostics with ABSOLUTE times — past
+    chunk 1's own duration — not the chunk-local times _ensure_coverage
+    computed them with. This is the same regression
+    test_low_confidence_flag_survives_out_of_transcribe_audio_chunked
+    guards for backfilled_spans/low_confidence, but for missing_spans and
+    the chunk-offset arithmetic specifically."""
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    audio = tmp_path / "big.opus"
+    audio.write_bytes(b"x" * (20 * 1024 * 1024))
+
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "max_chunk_seconds", 100_000.0)
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+
+    c0, c1 = tmp_path / "c0.opus", tmp_path / "c1.opus"
+    c0.write_bytes(b"0")
+    c1.write_bytes(b"1")
+    monkeypatch.setattr(transcribe, "_split_audio", lambda *a, **k: [(c0, 0.0), (c1, 600.0)])
+
+    async def fake_post(path: Path, **_kwargs: object) -> dict:
+        if path == c0:
+            # Chunk 0 (offset 0.0): fully covered, nothing missing.
+            return _payload([{"start": 0.0, "end": 600.0, "text": "first chunk, fine"}])
+        # Chunk 1 (offset 600.0): a pure arithmetic gap in the MIDDLE of
+        # the chunk (10s-590s) that the first pass produced nothing for —
+        # never gets rechecked successfully (recut unavailable), so it
+        # stays a genuine missing_spans entry, recorded at chunk-local
+        # 10.0-590.0 by _ensure_coverage before the offset fix.
+        return _payload(
+            [
+                {"start": 0.0, "end": 10.0, "text": "chunk two starts"},
+                {"start": 590.0, "end": 600.0, "text": "chunk two ends"},
+            ]
+        )
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    result = await transcribe.transcribe_audio(audio, total_duration=1200.0)
+
+    assert result.diagnostics is not None
+    spans = result.diagnostics.missing_spans
+    assert len(spans) == 1
+    span = spans[0]
+    assert span["unit"] == "chunk 2/2"
+    # Absolute: past chunk 1's own 0-600s span entirely, not 10.0-590.0
+    # (the chunk-local coordinates the pre-fix bug would have stored).
+    assert span["window_start"] == pytest.approx(610.0)
+    assert span["window_end"] == pytest.approx(1190.0)
+
+
 @pytest.mark.asyncio
 async def test_ensure_coverage_backfilled_span_is_not_also_recorded_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

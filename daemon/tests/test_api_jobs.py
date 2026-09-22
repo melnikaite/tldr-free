@@ -22,7 +22,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.jobs import _derive_low_confidence_ranges, _derive_missing_ranges
+from src.api.jobs import (
+    _derive_low_confidence_ranges,
+    _derive_missing_ranges,
+    _derive_non_speech_ranges,
+)
 from src.main import app
 from src.storage.db import dispose_engine, init_engine
 from src.storage.migrations import run_migrations
@@ -706,6 +710,85 @@ def test_get_job_returns_empty_missing_ranges_for_fresh_job(client: TestClient) 
     detail = client.get(f"/jobs/{job_id}").json()
     assert "missing_ranges" in detail
     assert detail["missing_ranges"] == []
+
+
+def test_derive_non_speech_ranges_merges_touching_spans() -> None:
+    """Two non_speech_spans entries that touch (one's end == the next's
+    start) merge into a single contiguous range, same as
+    _derive_missing_ranges/_derive_low_confidence_ranges."""
+    diagnostics = {
+        "non_speech_spans": [
+            {"unit": "chunk-0", "window_start": 10.0, "window_end": 20.0},
+            {"unit": "chunk-0", "window_start": 20.0, "window_end": 25.0},
+        ]
+    }
+    ranges = _derive_non_speech_ranges(json.dumps(diagnostics))
+    assert len(ranges) == 1
+    assert ranges[0].start_seconds == 10.0
+    assert ranges[0].end_seconds == 25.0
+
+
+def test_derive_non_speech_ranges_keeps_gapped_spans_separate() -> None:
+    """A real gap between one non-speech span's end and the next's start
+    means two separate ranges, not one merged span."""
+    diagnostics = {
+        "non_speech_spans": [
+            {"unit": "chunk-0", "window_start": 0.0, "window_end": 5.0},
+            {"unit": "chunk-0", "window_start": 8.0, "window_end": 10.0},
+        ]
+    }
+    ranges = _derive_non_speech_ranges(json.dumps(diagnostics))
+    assert len(ranges) == 2
+    assert (ranges[0].start_seconds, ranges[0].end_seconds) == (0.0, 5.0)
+    assert (ranges[1].start_seconds, ranges[1].end_seconds) == (8.0, 10.0)
+
+
+def test_derive_non_speech_ranges_no_spans_returns_empty() -> None:
+    """diagnostics_json present but with an empty (or absent)
+    non_speech_spans list → []."""
+    assert _derive_non_speech_ranges(json.dumps({"non_speech_spans": []})) == []
+    assert _derive_non_speech_ranges(json.dumps({"other_field": 1})) == []
+
+
+def test_derive_non_speech_ranges_legacy_and_malformed_inputs_return_empty() -> None:
+    """None/empty diagnostics_json, not-valid-JSON, and valid-JSON-that-
+    isn't-a-dict/list all fail safe rather than raising — same defensive
+    style as _derive_missing_ranges. This is also what a job transcribed
+    before non_speech_spans existed looks like: its stored diagnostics_json
+    simply has no such key, and reads as "nothing to show", not an error."""
+    assert _derive_non_speech_ranges(None) == []
+    assert _derive_non_speech_ranges("") == []
+    assert _derive_non_speech_ranges("not json{{{") == []
+    assert _derive_non_speech_ranges(json.dumps(["not", "a", "dict"])) == []
+    assert _derive_non_speech_ranges(json.dumps({"non_speech_spans": "not a list"})) == []
+
+
+def test_derive_non_speech_ranges_does_not_read_missing_spans() -> None:
+    """non_speech_spans and missing_spans are separate keys in the stored
+    diagnostics — a diagnostics_json with only missing_spans populated
+    (e.g. a job with lost speech but no confirmed loud VAD-silent span)
+    must not leak into non_speech_ranges, and vice versa (see
+    test_derive_missing_ranges' own suite for the mirror image)."""
+    diagnostics = {
+        "missing_spans": [{"unit": "whole", "window_start": 0.0, "window_end": 5.0}],
+    }
+    assert _derive_non_speech_ranges(json.dumps(diagnostics)) == []
+
+
+def test_get_job_returns_empty_non_speech_ranges_for_fresh_job(client: TestClient) -> None:
+    """A job with no diagnostics_json at all (every job before this feature,
+    and every non-Whisper job) must get back ``non_speech_ranges: []`` —
+    not null, not missing."""
+    r = client.post(
+        "/jobs",
+        json={"url": "https://example.com/no-non-speech-ranges", "kind": "page", "page_text": "hi"},
+    )
+    job_id = r.json()["id"]
+    _wait_until_done(client, job_id)
+
+    detail = client.get(f"/jobs/{job_id}").json()
+    assert "non_speech_ranges" in detail
+    assert detail["non_speech_ranges"] == []
 
 
 def test_list_filters_by_exact_url(client: TestClient) -> None:

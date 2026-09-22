@@ -484,6 +484,33 @@ function _buildMissingGapElement(range) {
   return div;
 }
 
+/**
+ * Standalone marker for one ``JobDetails.non_speech_ranges`` span (see
+ * daemon ``api.jobs._derive_non_speech_ranges`` /
+ * ``workers.transcribe.TranscribeDiagnostics.record_non_speech_span``) —
+ * a stretch where voice-activity detection positively confirmed no
+ * speech AND the audio was loud enough to likely be music or some other
+ * non-speech sound. Its own element and class (``.tx-music-mark``, NOT
+ * ``.tx-gap-mark``) with a deliberately calmer visual treatment than the
+ * "not recognized" marker: this is normal content the model correctly
+ * had nothing to transcribe, not a failure to flag. The tooltip is
+ * careful not to claim the model identified music specifically — all we
+ * actually know is "no speech, and loud enough to not be silence".
+ * @param {{start_seconds: number, end_seconds: number}} range
+ * @returns {HTMLElement}
+ */
+function _buildNonSpeechGapElement(range) {
+  const div = document.createElement("div");
+  div.className = "tx-music-mark";
+  const duration = Math.max(0, range.end_seconds - range.start_seconds);
+  div.textContent = `— ${formatApproxDuration(duration)} music —`;
+  div.title =
+    "No speech was detected here, and the audio was loud enough to be " +
+    "music or some other non-speech sound.";
+  div.setAttribute("role", "note");
+  return div;
+}
+
 // ---------------------------------------------------------------------------
 // Moment findings (JobDetails.moment_findings) — the same summary-time
 // visual findings the Summary tab renders (see app.js's
@@ -584,16 +611,27 @@ function _renderLines(rawText) {
   const re = /^\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]\s*(.*)$/;
   const frag = document.createDocumentFragment();
   // Genuine transcription holes (JobDetails.missing_ranges — see
-  // _buildMissingGapElement's doc comment) have no segment of their own to
-  // decorate, so they're spliced in as standalone elements positioned by
-  // TIME rather than rendered alongside any one line. Sorted ascending so
-  // a single forward pointer can consume them as we pass each timestamped
-  // line below — gaps never overlap real segments (they're computed as
-  // exactly the stretches with no segment at all — see daemon
-  // api.jobs._derive_missing_ranges), so the walk never needs to look back.
-  const gaps = [...(_job?.missing_ranges || [])].sort(
-    (a, b) => a.start_seconds - b.start_seconds,
-  );
+  // _buildMissingGapElement's doc comment) AND confirmed non-speech spans
+  // (JobDetails.non_speech_ranges — see _buildNonSpeechGapElement's doc
+  // comment) have no segment of their own to decorate, so they're spliced
+  // in as standalone elements positioned by TIME rather than rendered
+  // alongside any one line. Merged into ONE sorted list (each entry
+  // remembering which builder produced it) so a single forward pointer can
+  // consume them together as we pass each timestamped line below — the two
+  // source lists never overlap each other (a VAD-confirmed-empty span is
+  // either "missing" or "non-speech", never both — see
+  // _restore_unresolved_windows on the daemon side), so a stable sort by
+  // start_seconds alone is enough; the walk never needs to look back.
+  const gaps = [
+    ...(_job?.missing_ranges || []).map((r) => ({
+      ...r,
+      build: _buildMissingGapElement,
+    })),
+    ...(_job?.non_speech_ranges || []).map((r) => ({
+      ...r,
+      build: _buildNonSpeechGapElement,
+    })),
+  ].sort((a, b) => a.start_seconds - b.start_seconds);
   let gapIdx = 0;
   for (const line of lines) {
     const trimmed = line.trim();
@@ -611,7 +649,7 @@ function _renderLines(rawText) {
       // line, rather than after (covers a gap before the very first line
       // too, since gapIdx starts at 0).
       while (gapIdx < gaps.length && gaps[gapIdx].start_seconds < sec) {
-        frag.appendChild(_buildMissingGapElement(gaps[gapIdx]));
+        frag.appendChild(gaps[gapIdx].build(gaps[gapIdx]));
         gapIdx++;
       }
       p.dataset.txSeconds = String(sec);
@@ -645,7 +683,7 @@ function _renderLines(rawText) {
   // "after the last segment" case) — nothing left to splice it in front
   // of, so it goes at the very end.
   while (gapIdx < gaps.length) {
-    frag.appendChild(_buildMissingGapElement(gaps[gapIdx]));
+    frag.appendChild(gaps[gapIdx].build(gaps[gapIdx]));
     gapIdx++;
   }
   bodyEl.appendChild(frag);

@@ -240,6 +240,42 @@ class MissingRange(BaseModel):
     end_seconds: float
 
 
+class NonSpeechRange(BaseModel):
+    """A contiguous span, merged from one or more entries in
+    ``Job.diagnostics_json``'s ``non_speech_spans`` (see
+    ``workers.transcribe.TranscribeDiagnostics.record_non_speech_span``),
+    where VAD positively confirmed there is no speech AND the audio was
+    loud enough (``workers.transcribe._MUSIC_LOUDNESS_THRESHOLD_DBFS``) to
+    likely be music or some other non-speech sound, rather than a silent
+    pause.
+
+    Deliberately NOT a kind of ``MissingRange``, and never folded into
+    one: a ``MissingRange`` means speech was probably lost — this means
+    the opposite, that the model most likely had nothing to lose, because
+    there was no speech there to begin with. Conflating the two would
+    make a show with a long musical intro read as having a huge
+    transcription failure, which is exactly the misleading signal this
+    type exists to avoid — see ``TranscribeDiagnostics.non_speech_spans``'s
+    own docstring for the full reasoning. A quiet VAD-confirmed-silent
+    span (a genuine pause) produces neither a ``MissingRange`` nor a
+    ``NonSpeechRange`` — there's nothing worth telling the reader about a
+    plain pause.
+
+    ``start_seconds``/``end_seconds`` are in the ORIGINAL AUDIO's timeline
+    (seconds), same convention as ``MissingRange``/``LowConfidenceRange``
+    — time-based, not text-based, so a range stays correct on a translated
+    transcript too. Touching or overlapping spans are merged into one
+    range.
+
+    Empty for every job transcribed before this loudness-classification
+    step existed (its stored ``diagnostics_json`` simply has no
+    ``non_speech_spans`` key, regardless of what the audio actually
+    contains) — only re-transcribing produces them.
+    """
+    start_seconds: float
+    end_seconds: float
+
+
 class JobDetails(JobSummary):
     """Full job with summary_md and partial_summary for reconnect replay."""
     summary_md: str | None
@@ -281,6 +317,18 @@ class JobDetails(JobSummary):
     # diagnostics_json predates this field (parsed defensively, reads as
     # ``[]`` rather than erroring — see ``_derive_missing_ranges``).
     missing_ranges: list[MissingRange] = []
+    # Contiguous spans (original audio timeline, seconds) where VAD
+    # positively confirmed no speech AND the audio was loud enough to
+    # likely be music or other non-speech sound (see ``NonSpeechRange``
+    # and ``workers.transcribe.TranscribeDiagnostics.record_non_speech_span``).
+    # A DIFFERENT signal from ``missing_ranges`` — this is never lost
+    # speech, so it never overlaps a ``missing_ranges`` entry and must
+    # never be summed into ``transcript_missing_seconds``. Empty for every
+    # job before this feature existed (same conditions as
+    # ``missing_ranges`` above), plus any job whose VAD-confirmed-silent
+    # spans all turned out too quiet to call music (a plain pause gets no
+    # marker of any kind, on either list).
+    non_speech_ranges: list[NonSpeechRange] = []
     # Other playable sources the extension discovered on the page at
     # job-creation time. Surfaced by the sidepanel as a "wrong source?"
     # chip when non-empty — clicking opens the list so the user can

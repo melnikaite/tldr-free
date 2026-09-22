@@ -49,6 +49,7 @@ from src.api.schemas import (
     MissingRange,
     MomentFinding,
     MomentsListResponse,
+    NonSpeechRange,
     TranscriptSource,
 )
 from src.api.schemas import (
@@ -235,6 +236,16 @@ def _derive_missing_ranges(diagnostics_json: str | None) -> list[MissingRange]:
     span with nothing to restore. Same defensive JSON handling as
     ``_derive_low_confidence_ranges``: malformed or missing input reads as
     "nothing to show", never an error.
+
+    ``window_start``/``window_end`` on each span are already ABSOLUTE
+    seconds into the full recording (unlike ``coverage_rechecks``/
+    ``backfilled_spans``, which stay chunk-local) — see
+    ``_restore_unresolved_windows``'s docstring for why. A job transcribed
+    BEFORE that fix landed still has its old, chunk-local spans stored on
+    ``diagnostics_json`` (a point-in-time snapshot, never rewritten), so
+    this function will keep rendering those in the wrong place in the
+    transcript until the job is re-transcribed — this is a stored-data
+    limitation, not a bug in this function.
     """
     if not diagnostics_json:
         return []
@@ -274,6 +285,74 @@ def _derive_missing_ranges(diagnostics_json: str | None) -> list[MissingRange]:
         else:
             ranges.append([start, end])
     return [MissingRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
+
+
+def _derive_non_speech_ranges(diagnostics_json: str | None) -> list[NonSpeechRange]:
+    """Merge ``TranscribeDiagnostics.non_speech_spans`` entries (see
+    ``workers.transcribe.TranscribeDiagnostics.record_non_speech_span``)
+    into contiguous [start, end] spans for the side panel to mark as
+    probable music/other non-speech sound — stretches where VAD positively
+    confirmed no speech AND the audio was loud enough
+    (``workers.transcribe._MUSIC_LOUDNESS_THRESHOLD_DBFS``) to be more than
+    silence. Same merge/sort/defensive-JSON approach as
+    ``_derive_missing_ranges`` right above, just reading a different key —
+    see that function's docstring for the shared behaviour this mirrors.
+
+    Deliberately a SEPARATE function reading a SEPARATE stored list, not a
+    second code path over ``missing_spans``: the two mean different things
+    (lost speech vs. probable music) and must never be conflated on the
+    wire either — see ``NonSpeechRange``'s own docstring.
+
+    Returns [] for every job before ``diagnostics_json`` existed (migration
+    v10), every job transcribed before this loudness-classification step
+    existed within it (even one with music in its audio — the stored
+    diagnostics simply predate the field), every non-Whisper job, and any
+    Whisper job whose recheck loop never confirmed a loud VAD-silent span.
+    Malformed or missing input reads as "nothing to show", never an error,
+    same as ``_derive_missing_ranges``.
+
+    ``window_start``/``window_end`` on each span are already ABSOLUTE
+    seconds into the full recording, same convention as ``missing_spans``
+    — see ``_restore_unresolved_windows``'s docstring.
+    """
+    if not diagnostics_json:
+        return []
+    try:
+        data = json.loads(diagnostics_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_spans = data.get("non_speech_spans")
+    if not isinstance(raw_spans, list):
+        return []
+    spans = [s for s in raw_spans if isinstance(s, dict)]
+    if not spans:
+        return []
+
+    def _start(span: dict[str, Any]) -> float:
+        try:
+            return float(span.get("window_start", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _end(span: dict[str, Any]) -> float:
+        try:
+            return float(span.get("window_end", _start(span)))
+        except (TypeError, ValueError):
+            return _start(span)
+
+    spans.sort(key=_start)
+    ranges: list[list[float]] = []
+    for span in spans:
+        start, end = _start(span), _end(span)
+        if end < start:
+            end = start
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    return [NonSpeechRange(start_seconds=r[0], end_seconds=r[1]) for r in ranges]
 
 
 def _derive_moment_findings(moment_findings_json: str | None) -> list[MomentFinding]:
@@ -351,6 +430,7 @@ def _to_details(job: Any) -> JobDetails:
             getattr(job, "raw_segments_json", None)
         ),
         missing_ranges=_derive_missing_ranges(getattr(job, "diagnostics_json", None)),
+        non_speech_ranges=_derive_non_speech_ranges(getattr(job, "diagnostics_json", None)),
         alt_media_candidates=alt_candidates,
         queued_reason=getattr(job, "queued_reason", None),
         whisper_queue_position=get_queue().position(job.id),

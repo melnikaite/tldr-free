@@ -1006,6 +1006,23 @@ body {
   text-align: center;
   cursor: default;
 }
+/* Standalone insertion for a JobDetails.non_speech_ranges span — a stretch
+   VAD confirmed holds no speech AND was loud enough to likely be music or
+   other non-speech sound. Deliberately its own class, not a reuse of
+   .tx-gap-mark: that one signals "content is missing here", a genuine
+   transcription failure; this one is normal content the model correctly
+   had nothing to transcribe, so it gets a visually CALMER treatment —
+   no dashed border (dashing reads as "incomplete"/"placeholder" here),
+   lower opacity, no italics — closer to a quiet aside than a warning. */
+.tx-music-mark {
+  margin: 0.35rem 0.2rem;
+  padding: 0.3rem 0.6rem;
+  color: var(--muted);
+  opacity: 0.65;
+  font-size: 0.8em;
+  text-align: center;
+  cursor: default;
+}
 .tx-line--current {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
