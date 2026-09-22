@@ -54,7 +54,6 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +64,7 @@ from src.llm.chunking import pack_lines
 from src.llm.languages import Language, UnknownLanguageError, normalize_lang
 from src.llm.tokens import count_tokens
 from src.storage import repo
-from src.storage.db import Job, TranscriptTranslation, session_scope
+from src.storage.db import Job, TranscriptTranslation, session_scope, utcnow
 from src.workers import timecodes
 from src.workers.broker import get_broker, get_event_broker, job_event
 from src.workers.control import get_control
@@ -200,7 +199,7 @@ async def enqueue_translation(job_id: str, lang_input: str) -> dict[str, Any]:
             existing.progress_percent = 0
             existing.error = None
             existing.text = None
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = utcnow()
             session.add(existing)
         else:
             row = TranscriptTranslation(
@@ -245,7 +244,7 @@ def _reset_failed_rows(job_id: str) -> list[dict[str, Any]]:
             row.progress_percent = 0
             row.error = None
             row.text = None
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utcnow()
             session.add(row)
             out.append(_row_summary(row))
     return out
@@ -306,7 +305,7 @@ def re_enqueue_running_on_startup() -> int:
         for row in rows:
             row.status = "queued"
             row.progress_percent = 0
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utcnow()
             session.add(row)
             count += 1
 
@@ -1081,7 +1080,7 @@ def _update_status(
             row.text = text
         if error is not None:
             row.error = error
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utcnow()
         session.add(row)
 
 

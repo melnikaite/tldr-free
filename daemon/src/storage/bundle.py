@@ -75,14 +75,14 @@ import re
 import shutil
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from src.api.schemas import ImportedJob, ImportIssue, JobImportResponse, JobKind
 from src.config import DAEMON_API_VERSION
 from src.storage import repo
-from src.storage.db import Job
+from src.storage.db import Job, utcnow
 from src.workers import frames
 
 log = logging.getLogger(__name__)
@@ -164,7 +164,7 @@ def export_jobs(job_ids: list[str]) -> tuple[Path, int]:
             manifest = {
                 "format": BUNDLE_FORMAT,
                 "version": BUNDLE_VERSION,
-                "exported_at": datetime.utcnow().isoformat() + "Z",
+                "exported_at": utcnow().isoformat(),
                 "daemon_api_version": DAEMON_API_VERSION,
                 "jobs": [job.id for job in jobs],
             }
@@ -439,14 +439,27 @@ def _rewrite_frame_url(frame_url: Any, new_job_id: str) -> str | None:
 
 
 def _parse_iso(value: Any) -> datetime | None:
+    """Parse an exported ISO-8601 timestamp into an aware UTC ``datetime``.
+
+    Every bundle written before this fix carries offset-less timestamps
+    (the manifest's ``exported_at`` with a trailing ``"Z"``, the per-job
+    ones without). Those were all UTC, so a naive parse result is read as
+    UTC; an aware one carrying some other offset is normalised to UTC.
+    Either way every value returned here is safe to hand to
+    ``repo.insert_imported_job`` — which, since SQLModel 0.0.45, rejects
+    naive datetimes on write.
+    """
     if not isinstance(value, str) or not value:
         return None
     try:
-        # Tolerate a trailing "Z" (our own exported_at/completed_at use
-        # plain UTC isoformat without one, but be lenient either way).
-        return datetime.fromisoformat(value[:-1] if value.endswith("Z") else value)
+        # Tolerate a trailing "Z" (pre-fix exports appended one to an
+        # otherwise offset-less isoformat string; be lenient either way).
+        parsed = datetime.fromisoformat(value[:-1] if value.endswith("Z") else value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _import_one_job(
@@ -509,7 +522,7 @@ def _import_one_job(
                 payload.get("moment_findings_json"), new_id
             )
 
-            created_at = _parse_iso(payload.get("created_at")) or datetime.utcnow()
+            created_at = _parse_iso(payload.get("created_at")) or utcnow()
             completed_at = _parse_iso(payload.get("completed_at"))
 
             repo.insert_imported_job(

@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,25 @@ from sqlmodel import Field, Session, SQLModel, create_engine
 from src.config import get_config
 
 log = logging.getLogger(__name__)
+
+
+def utcnow() -> datetime:
+    """Timezone-aware "now", in UTC.
+
+    The single source of truth for "current time" across the storage layer
+    (default column values, every hand-written ``now = ...`` in ``repo.py``/
+    ``bundle.py``/``workers/retention.py``/``workers/translator.py``).
+
+    SQLModel 0.0.45+ stores datetimes through a ``UTCDateTime`` column type
+    (see ``sqlmodel/sql/sqltypes.py``) that rejects naive ``datetime``
+    values on write with ``ValueError: Datetime values must have timezone
+    information`` — the old project convention of ``datetime.utcnow()``
+    (naive) no longer works. Reading is unaffected: ``UTCDateTime`` attaches
+    UTC to a naive value it reads back out of SQLite, so pre-existing rows
+    (stored as naive UTC ISO text) still come back as aware UTC — no data
+    migration needed, only every future write has to switch to this.
+    """
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +68,7 @@ class Job(SQLModel, table=True):
     status: str = Field(index=True)                 # queued | running | done | failed
     title: str | None = None
     duration_seconds: int | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
     # When this row appeared ON THIS MACHINE — distinct from created_at (when
     # the material was actually processed). Equal to created_at for every
     # normally-created job; diverges only for a job brought in via
@@ -59,8 +78,8 @@ class Job(SQLModel, table=True):
     # can't be deleted on its very next pass just because the material itself
     # is old. created_at stays what the Library shows and sorts by. Backfilled
     # to created_at for every pre-existing row by migration v7.
-    added_at: datetime = Field(default_factory=datetime.utcnow, index=True)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    added_at: datetime = Field(default_factory=utcnow, index=True)
+    updated_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime | None = None
     error: str | None = None
     progress_stage: str | None = None
@@ -180,7 +199,7 @@ class Message(SQLModel, table=True):
     job_id: str = Field(foreign_key="job.id", index=True)
     role: str                                       # "user" | "assistant"
     content: str
-    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
     # JSON-encoded list of FrameRef dicts (api.schemas.FrameRef) — the video
     # frame(s) that actually backed a visual claim in this message, one per
     # relevant LOOK-step moment (see llm/qa.py). Null for user messages and
@@ -229,8 +248,8 @@ class TranscriptTranslation(SQLModel, table=True):
     text: str | None = None
     error: str | None = None
     progress_percent: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -396,4 +415,5 @@ __all__ = [
     "get_session",
     "init_engine",
     "session_scope",
+    "utcnow",
 ]

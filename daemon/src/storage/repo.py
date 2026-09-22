@@ -15,8 +15,8 @@ Public surface:
 All functions open their own short-lived session through ``session_scope`` so
 callers (FastAPI handlers, workers) don't have to thread a Session around.
 
-Datetimes use ``datetime.utcnow()`` for default values, matching the SQLModel
-pattern in ``db.py``.
+Datetimes use ``storage.db.utcnow()`` (timezone-aware UTC) for default
+values, matching the SQLModel pattern in ``db.py``.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import defer
 from sqlmodel import select
 
-from src.storage.db import Job, Message, session_scope
+from src.storage.db import Job, Message, session_scope, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ def create_job(
     Emits ``job_event("created", …)`` so the Library renders the row instantly
     without polling.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     job = Job(
         id=_new_id(),
         url=url,
@@ -220,7 +220,7 @@ def insert_imported_job(
     """
     from src.storage.db import TranscriptTranslation
 
-    now = datetime.utcnow()
+    now = utcnow()
     job = Job(
         id=job_id,
         url=url,
@@ -325,7 +325,7 @@ def update_status(
             job.error = error
         if queued_reason is not _UNSET:
             job.queued_reason = queued_reason
-        job.updated_at = datetime.utcnow()
+        job.updated_at = utcnow()
         session.add(job)
     _emit_updated(job_id)
 
@@ -367,7 +367,7 @@ def mark_done(
     Emits ``job_event("updated", …)`` so the Library row flips to done with the
     final title in one event.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -432,7 +432,7 @@ def set_extracted(
     Emits ``job_event("updated", …)`` — this is the path that surfaces the
     canonical YouTube title to the Library mid-pipeline.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -461,7 +461,7 @@ def mark_failed(job_id: str, *, error: str) -> None:
 
     Emits ``job_event("updated", …)``.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -482,7 +482,7 @@ def reset_for_retry(job_id: str) -> None:
 
     Emits ``job_event("updated", …)``.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -511,7 +511,7 @@ def set_audio(
     Does NOT emit a job event — ``audio_path`` is internal plumbing the UI
     doesn't render. Skipping the publish keeps the global stream quiet.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -544,7 +544,7 @@ def set_moment_findings(job_id: str, *, moment_findings_json: str | None) -> Non
     picks up the findings without a page reload once ``GET /jobs/{id}``
     is re-fetched.
     """
-    now = datetime.utcnow()
+    now = utcnow()
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
@@ -963,7 +963,7 @@ def add_message(
         job_id=job_id,
         role=role,
         content=content,
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
         frame_refs_json=frame_refs_json,
     )
     with session_scope() as session:

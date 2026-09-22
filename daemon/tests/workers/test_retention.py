@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -161,10 +161,10 @@ async def test_sweep_runs_with_correct_cutoff(
     monkeypatch.setattr(retention.repo, "delete_jobs_older_than", fake_delete)
     monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
 
-    before = datetime.utcnow()
+    before = datetime.now(UTC)
     with pytest.raises(_StopLoop):
         await retention.retention_worker()
-    after = datetime.utcnow()
+    after = datetime.now(UTC)
 
     assert len(cutoffs) == 1
     cutoff = cutoffs[0]

@@ -14,7 +14,7 @@ import io
 import json
 import zipfile
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 from src.config import get_config
 from src.main import app
-from src.storage import repo
+from src.storage import bundle, repo
 from src.storage.db import TranscriptTranslation, dispose_engine, init_engine, session_scope
 from src.storage.migrations import run_migrations
 from src.workers import frames
@@ -359,7 +359,7 @@ def test_imported_job_gets_added_at_now_and_survives_retention_that_would_catch_
 
         job_row = session.get(Job, job_id)
         assert job_row is not None
-        job_row.created_at = datetime.fromisoformat(old_created_at)
+        job_row.created_at = datetime.fromisoformat(old_created_at).replace(tzinfo=UTC)
         session.add(job_row)
 
     r = client.post("/jobs/export", json={"ids": [job_id]})
@@ -381,7 +381,7 @@ def test_imported_job_gets_added_at_now_and_survives_retention_that_would_catch_
 
     # A cutoff that would have caught the old created_at many times over —
     # the imported job must survive because retention reads added_at.
-    cutoff = datetime(2020, 1, 1)
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
     deleted = repo.delete_jobs_older_than(cutoff)
 
     assert deleted == 0
@@ -453,7 +453,7 @@ def test_import_duplicate_check_ignores_newer_failed_sibling(client: TestClient)
     done = _make_done_job(client, url)
 
     # A second, NEWER row for the same URL that ends up failed — simulates
-    # a retry attempt left behind. repo.create_job sets created_at=utcnow()
+    # a retry attempt left behind. repo.create_job sets created_at=storage.db.utcnow()
     # at call time, so this row is guaranteed newer than `done`'s.
     newer_failed = repo.create_job(url=url, kind="page")
     repo.mark_failed(newer_failed.id, error="simulated retry failure")
@@ -848,3 +848,93 @@ def test_import_normalizes_live_translation_status_to_done(client: TestClient) -
 
     translations = client.get(f"/jobs/{new_id}").json()["transcript_translations"]
     assert translations[0]["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Timezone-aware datetimes (sqlmodel 0.0.45's UTCDateTime rejects naive
+# writes — see storage/db.utcnow and this module's bundle._parse_iso).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_iso_treats_naive_input_as_utc() -> None:
+    """A bundle written before this fix (or by the old, buggy
+    ``exported_at`` "+ 'Z'" concatenation, which produced a non-offset
+    string once the trailing char was stripped) has no explicit offset.
+    ``_parse_iso`` must read that as UTC — the same meaning it was always
+    written with — not raise, and not silently return a naive value that
+    would later blow up on write."""
+    parsed = bundle._parse_iso("2015-06-01T00:00:00")
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parsed == datetime(2015, 6, 1, tzinfo=UTC)
+
+
+def test_parse_iso_tolerates_trailing_z() -> None:
+    """Legacy tolerance for a trailing "Z" some exports may carry."""
+    parsed = bundle._parse_iso("2015-06-01T00:00:00Z")
+    assert parsed == datetime(2015, 6, 1, tzinfo=UTC)
+
+
+def test_parse_iso_normalizes_non_utc_offset_to_utc() -> None:
+    parsed = bundle._parse_iso("2015-06-01T02:00:00+02:00")
+    assert parsed == datetime(2015, 6, 1, tzinfo=UTC)
+
+
+def test_parse_iso_invalid_or_missing_returns_none() -> None:
+    assert bundle._parse_iso(None) is None
+    assert bundle._parse_iso("") is None
+    assert bundle._parse_iso("not-a-date") is None
+    assert bundle._parse_iso(12345) is None
+
+
+def test_export_manifest_exported_at_has_exactly_one_offset_marker(
+    client: TestClient,
+) -> None:
+    """Regression for the old ``datetime.utcnow().isoformat() + "Z"`` bug —
+    once ``utcnow()`` started returning an aware value, that produced
+    ``...+00:00Z``, a doubled/garbage zone marker. The manifest's
+    ``exported_at`` must parse back with exactly one, correct offset."""
+    done = _make_done_job(client, "https://export-manifest-exported-at.example")
+    r = client.post("/jobs/export", json={"ids": [done["id"]]})
+    assert r.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+    exported_at = manifest["exported_at"]
+    assert exported_at.count("Z") == 0
+    parsed = datetime.fromisoformat(exported_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_insert_imported_job_rejects_nothing_writes_aware_utc(client: TestClient) -> None:
+    """The actual bug this whole fix chases: writing a Job row must not
+    raise ``ValueError: Datetime values must have timezone information``
+    (sqlmodel 0.0.45's ``UTCDateTime``), and the round-tripped row must
+    come back timezone-aware."""
+    job = repo.insert_imported_job(
+        job_id=repo.generate_job_id(),
+        url="https://aware-write-regression.example",
+        kind="page",
+        title="Aware write regression",
+        duration_seconds=None,
+        created_at=datetime(2015, 6, 1, tzinfo=UTC),
+        completed_at=None,
+        raw_text="hello",
+        summary_md="**hi**",
+        transcript_source="trafilatura",
+        video_id=None,
+        transcript_language=None,
+        raw_segments_json=None,
+        alt_media_candidates_json=None,
+        messages=[],
+        translations=[],
+    )
+    assert job.created_at.tzinfo is not None
+    assert job.added_at is not None
+    assert job.added_at.tzinfo is not None
+
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.created_at.tzinfo is not None
+    assert reloaded.added_at.tzinfo is not None

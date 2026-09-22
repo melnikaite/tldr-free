@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -104,15 +104,28 @@ def _parse_status_filter(raw: str | None) -> list[str] | None:
 
 
 def _parse_since(raw: str | None) -> datetime | None:
+    """Parse the ``since`` query param into an aware UTC ``datetime``.
+
+    ``Job.created_at`` is aware UTC (SQLModel 0.0.45's ``UTCDateTime``
+    column type — see ``storage/db.utcnow``), and SQLAlchemy runs the
+    query-side value through that same column type's bind processor when
+    comparing against it — a naive value would raise the same "Datetime
+    values must have timezone information" error a naive write does. A
+    caller-supplied offset-less timestamp is treated as UTC, matching what
+    every stored naive-looking value actually means.
+    """
     if raw is None:
         return None
     try:
-        return datetime.fromisoformat(raw)
+        parsed = datetime.fromisoformat(raw)
     except ValueError as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"`since` must be ISO-8601, got {raw!r}: {exc}",
         ) from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _to_summary(job: Any) -> JobSummary:

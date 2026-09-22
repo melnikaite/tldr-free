@@ -8,7 +8,7 @@ through the ``isolated_db`` fixture.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -59,6 +59,69 @@ def test_get_job_round_trip(isolated_db) -> None:
     found = repo.get_job(j.id)
     assert found is not None
     assert found.id == j.id
+
+
+# ---------------------------------------------------------------------------
+# Timezone-aware datetimes (sqlmodel 0.0.45's UTCDateTime column type
+# rejects naive datetime writes — see storage/db.utcnow's docstring). These
+# guard the actual regression: POST /jobs used to 500 the moment sqlmodel
+# was upgraded, because every write in this module used the naive
+# ``datetime.utcnow()``.
+# ---------------------------------------------------------------------------
+
+
+def test_create_job_writes_timezone_aware_datetimes(isolated_db) -> None:
+    """The write itself must not raise (the exact shape of the original
+    bug — see storage/db.utcnow), and every timestamp column must come
+    back timezone-aware, not just non-crashing."""
+    job = repo.create_job(url="https://aware.example", kind="page")
+    assert job.created_at.tzinfo is not None
+    assert job.added_at.tzinfo is not None
+    assert job.updated_at.tzinfo is not None
+
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.created_at.tzinfo is not None
+    assert reloaded.added_at.tzinfo is not None
+    assert reloaded.updated_at.tzinfo is not None
+
+
+def test_reading_a_legacy_naive_row_returns_aware_utc(isolated_db) -> None:
+    """Rows written before this fix are stored as naive UTC ISO text (no
+    offset) — sqlmodel 0.0.45's ``UTCDateTime.process_result_value``
+    attaches UTC to a naive value read back out of SQLite, so no data
+    migration is needed. This proves that actually holds: a row patched
+    to a bare, offset-less string via raw SQL (simulating a pre-upgrade
+    row) still comes back timezone-aware through the normal repo read
+    path."""
+    job = repo.create_job(url="https://legacy-row.example", kind="page")
+
+    raw = isolated_db.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(
+            "UPDATE job SET created_at = ? WHERE id = ?",
+            ("2019-03-04T05:06:07", job.id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.created_at.tzinfo is not None
+    assert reloaded.created_at == datetime(2019, 3, 4, 5, 6, 7, tzinfo=UTC)
+
+
+def test_update_status_writes_aware_updated_at(isolated_db) -> None:
+    """Every write helper in this module (not just create_job) must produce
+    an aware ``updated_at`` — this one exercises the plain ``now =
+    utcnow()`` pattern shared by update_status/mark_done/mark_failed/etc."""
+    job = repo.create_job(url="https://update-status-aware.example", kind="page")
+    repo.update_status(job.id, status="queued", progress_stage="downloading")
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.updated_at.tzinfo is not None
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +283,13 @@ def test_list_jobs_since_filter(isolated_db) -> None:
     raw = isolated_db.raw_connection()
     try:
         cur = raw.cursor()
-        old = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=7)).isoformat()
         cur.execute("UPDATE job SET created_at = ? WHERE id = ?", (old, a.id))
         raw.commit()
     finally:
         raw.close()
 
-    cutoff = datetime.utcnow() - timedelta(days=1)
+    cutoff = datetime.now(UTC) - timedelta(days=1)
     rows, total = repo.list_jobs(since=cutoff, limit=50, offset=0)
     assert total == 1
     assert rows[0].id == b.id
@@ -586,7 +649,7 @@ def test_delete_jobs_older_than_removes_old_keeps_recent(isolated_db) -> None:
     finally:
         raw.close()
 
-    cutoff = datetime(2020, 1, 1)
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
     deleted = repo.delete_jobs_older_than(cutoff)
 
     assert deleted == 1
@@ -614,7 +677,7 @@ def test_delete_jobs_older_than_sweeps_on_added_at_not_created_at(isolated_db) -
     finally:
         raw.close()
 
-    cutoff = datetime(2020, 1, 1)
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
     deleted = repo.delete_jobs_older_than(cutoff)
 
     assert deleted == 0
@@ -627,8 +690,8 @@ def test_insert_imported_job_sets_added_at_now_keeps_bundle_created_at(
     """storage.bundle.import_bundle calls insert_imported_job with the
     EXPORTING machine's created_at. added_at must still be "now" on THIS
     machine — that's the whole point (see Job.added_at docstring)."""
-    bundle_created_at = datetime(2015, 6, 1)
-    before = datetime.utcnow()
+    bundle_created_at = datetime(2015, 6, 1, tzinfo=UTC)
+    before = datetime.now(UTC)
     job = repo.insert_imported_job(
         job_id=repo.generate_job_id(),
         url="https://imported.example",
@@ -647,7 +710,7 @@ def test_insert_imported_job_sets_added_at_now_keeps_bundle_created_at(
         messages=[],
         translations=[],
     )
-    after = datetime.utcnow()
+    after = datetime.now(UTC)
 
     assert job.created_at == bundle_created_at
     assert job.added_at is not None
@@ -666,7 +729,7 @@ def test_insert_imported_job_round_trips_transcript_missing_seconds(
         kind="youtube",
         title="Partial transcript",
         duration_seconds=None,
-        created_at=datetime(2024, 1, 1),
+        created_at=datetime(2024, 1, 1, tzinfo=UTC),
         completed_at=None,
         raw_text="hello",
         summary_md="**hi**",
@@ -690,7 +753,7 @@ def test_insert_imported_job_round_trips_transcript_missing_seconds(
         kind="page",
         title="Legacy bundle entry",
         duration_seconds=None,
-        created_at=datetime(2020, 1, 1),
+        created_at=datetime(2020, 1, 1, tzinfo=UTC),
         completed_at=None,
         raw_text="hello",
         summary_md="**hi**",
@@ -713,7 +776,7 @@ def test_imported_job_not_swept_by_cutoff_that_would_catch_its_created_at(
     """An imported job's created_at can be years old — that must not make
     it eligible for the retention sweep on its very next pass, since
     added_at (what the sweep actually reads) is "now"."""
-    bundle_created_at = datetime(2015, 6, 1)
+    bundle_created_at = datetime(2015, 6, 1, tzinfo=UTC)
     job = repo.insert_imported_job(
         job_id=repo.generate_job_id(),
         url="https://imported-old.example",
@@ -734,7 +797,7 @@ def test_imported_job_not_swept_by_cutoff_that_would_catch_its_created_at(
     )
 
     # A cutoff that would have caught bundle_created_at (2015) many times over.
-    cutoff = datetime(2020, 1, 1)
+    cutoff = datetime(2020, 1, 1, tzinfo=UTC)
     deleted = repo.delete_jobs_older_than(cutoff)
 
     assert deleted == 0
@@ -764,7 +827,7 @@ def test_delete_jobs_older_than_unlinks_audio_file(isolated_db, tmp_path) -> Non
     finally:
         raw.close()
 
-    assert repo.delete_jobs_older_than(datetime(2020, 1, 1)) == 1
+    assert repo.delete_jobs_older_than(datetime(2020, 1, 1, tzinfo=UTC)) == 1
     assert not audio.exists(), "swept job's audio should be unlinked"
     assert kept_audio.exists(), "surviving job's audio must be left alone"
 
@@ -803,7 +866,7 @@ def test_delete_jobs_older_than_deletes_frames(isolated_db, monkeypatch) -> None
     finally:
         raw.close()
 
-    assert repo.delete_jobs_older_than(datetime(2020, 1, 1)) == 1
+    assert repo.delete_jobs_older_than(datetime(2020, 1, 1, tzinfo=UTC)) == 1
     assert called == [old.id]
 
 

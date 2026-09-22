@@ -56,11 +56,12 @@ import contextlib
 import logging
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 from src.config import get_config
 from src.storage import repo
+from src.storage.db import utcnow
 from src.workers import frames
 
 log = logging.getLogger(__name__)
@@ -299,7 +300,7 @@ async def retention_worker() -> None:
                 last_logged_days = days
 
             if days > 0:
-                cutoff = datetime.utcnow() - timedelta(days=days)
+                cutoff = utcnow() - timedelta(days=days)
                 n = repo.delete_jobs_older_than(cutoff)
                 if n:
                     log.info("retention sweep deleted %d job(s) older than %s", n, cutoff)

@@ -10,7 +10,7 @@ here, against the real broker.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -189,7 +189,7 @@ async def test_delete_jobs_older_than_emits_one_event_per_row(isolated_db: Any) 
     raw = isolated_db.raw_connection()
     try:
         cur = raw.cursor()
-        old = (datetime.utcnow() - timedelta(days=10)).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
         cur.execute("UPDATE job SET added_at=? WHERE id IN (?, ?)", (old, a.id, b.id))
         raw.commit()
     finally:
@@ -197,7 +197,7 @@ async def test_delete_jobs_older_than_emits_one_event_per_row(isolated_db: Any) 
 
     queue = get_event_broker().subscribe()
 
-    n = repo.delete_jobs_older_than(datetime.utcnow() - timedelta(days=1))
+    n = repo.delete_jobs_older_than(datetime.now(UTC) - timedelta(days=1))
     assert n == 2
 
     # Two deleted events, in the order they were processed.
