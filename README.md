@@ -531,6 +531,53 @@ These numbers are from one machine against a small, specific set of
 references — a starting point, not a universal ranking. Re-check against
 your own material before committing to a model.
 
+#### Recovering dropped dialogue with VAD (optional, LocalAI only)
+
+Switching to `parakeet-cpp-tdt-0.6b-v3` (above) has one side effect: unlike
+Whisper, it emits nothing at all for music/silence instead of a
+`*Musik*`-style pseudo-segment. The daemon's coverage-recheck logic
+rechecks its largest unresolved gaps first, which used to make sense when
+a big gap was as likely to be dropped dialogue as it was silence — but
+with Parakeet, a big gap is overwhelmingly likely to be music, so the
+recheck budget gets spent on the wrong windows. Measured on a real 24:57
+ZDF episode: reported `transcript_missing_seconds` was 470 s (31% of the
+episode), while actual dropped dialogue (checked against the official
+subtitles) was only ~27 s across 17 short interjections. Running
+[silero VAD](https://github.com/snakers4/silero-vad) over the same gaps
+found just 66 s of speech in 607 s of total gap length — and the biggest
+gaps were the emptiest: gaps ≥10 s held 242 s of audio and only 2 s of
+speech; gaps ≥6 s held 384 s and only 9 s.
+
+If your backend is LocalAI, you can enable voice-activity detection so the
+recheck loop skips gaps VAD confirms are silent and spends its budget on
+the short gaps that actually held dialogue instead. This is a LocalAI-only
+extension (`POST /vad`, outside the OpenAI-compatible `/v1` prefix) and is
+off by default — set these in `tldr.local.yaml`:
+
+```yaml
+whisper:
+  vad_model: silero-vad-ggml   # empty (default) = feature off
+  vad_url: ""                 # override; default derives from base_url minus /v1
+  vad_max_seconds: 600.0       # per-call budget on seconds of audio VAD examines
+```
+
+`silero-vad-ggml` is a ~2 MB model that runs on LocalAI's existing
+`whisper` backend — install it from the model gallery; no extra backend or
+service beyond what transcription already needs.
+
+Measured on the same episode, same model, everything else identical:
+
+| | VAD off | VAD on |
+|---|---|---|
+| `transcript_missing_seconds` | 484 s | 23 s |
+| WER against the broadcaster's subtitles | 37.9% | 37.2% |
+| ASR rechecks spent | 37 | 18 |
+| wall time for 25 minutes of audio | 146 s | 137 s |
+
+It comes out *faster*: VAD examined 45 gaps, found 35 of them speechless,
+and skipping those 35 recheck requests more than paid for the detection
+itself.
+
 <details>
 <summary><strong>Cloud transcription — who actually offers it</strong> (most LLM providers have no audio API at all)</summary>
 

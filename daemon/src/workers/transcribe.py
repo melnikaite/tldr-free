@@ -266,6 +266,7 @@ import httpx
 
 from src.config import get_config
 from src.llm import languages
+from src.workers import vad
 from src.workers.timecodes import collapse_repeated_segments
 
 log = logging.getLogger(__name__)
@@ -470,6 +471,50 @@ class TranscribeDiagnostics:
     whisper_backend_base_url: str | None = None
     whisper_model: str | None = None
     yt_dlp_version: str | None = None
+    # Set when the single-request path (chosen because the file's size was
+    # within _upload_budget_bytes()) still got HTTP 413 back from the
+    # backend, and transcribe_audio recovered by retrying through
+    # _transcribe_chunked with a reduced, guaranteed-smaller budget instead
+    # of failing the job outright — see transcribe_audio's except clause.
+    # This is a defensive second layer on top of the headroom itself (see
+    # _UPLOAD_HEADROOM's comment): it should be rare in practice, but a
+    # backend whose real limit is smaller than assumed, or whose multipart
+    # overhead is bigger than assumed, would otherwise still fail the whole
+    # job on a size that looked safe by our own arithmetic.
+    upload_413_fallback: bool = False
+    # Voice-activity-detection support (workers/vad.py) — optional,
+    # LocalAI-only, off by default (whisper.vad_model=""). See that
+    # module's docstring and WhisperConfig.vad_model's comment for the
+    # measured problem this exists to fix: the ASR backend switching to
+    # parakeet-cpp-tdt-0.6b-v3 means non-speech spans emit NOTHING (no more
+    # Whisper-style "*Musik*" pseudo-segments), so the coverage-recheck
+    # loop below — which picks the LARGEST unresolved window every
+    # iteration — used to spend nearly its whole budget on music instead of
+    # the short real dialogue gaps that matter. Accumulated across every
+    # _ensure_coverage call this transcribe_audio() call makes (one per
+    # chunk on the chunked path), same as coverage_rechecks above.
+    vad_available: bool = False
+    # How many candidate windows VAD actually examined THIS call (may be
+    # fewer than the number of candidates — see vad_budget_exceeded).
+    vad_windows_examined: int = 0
+    # Of those, how many VAD found to hold ZERO speech — these were never
+    # spent a recheck on and never occupied a budget slot (see
+    # _ensure_coverage's recheck-picking loop). Tally only, unlike
+    # coverage_rechecks/backfilled_spans/missing_spans: a VAD skip isn't a
+    # Whisper call, so there's no verdict/text worth a per-window entry.
+    vad_zero_speech_windows: int = 0
+    # Sum of VAD-attributed speech-seconds across every window VAD
+    # examined this call — a rough sense of how much real speech VAD found
+    # in the suspicious windows overall, independent of how the recheck
+    # budget then chose to spend itself.
+    vad_speech_seconds_total: float = 0.0
+    # True when whisper.vad_max_seconds cut the VAD pass short before every
+    # candidate window could be examined (or, less commonly, a mid-call
+    # failure stopped it early — see workers.vad.speech_seconds's partial-
+    # failure behavior) — either way, some candidate windows have no VAD
+    # entry and fall back to the pre-VAD raw-length/uncovered-length
+    # treatment for the parts of this call that VAD didn't reach.
+    vad_budget_exceeded: bool = False
 
     def record_recheck(
         self, *, unit: str, index: int, of: int, start: float, end: float, verdict: str,
@@ -544,6 +589,15 @@ class TranscribeDiagnostics:
         )
         self.missing_span_count += 1
         self.missing_span_total_seconds += end - start
+
+    def record_vad_skip(self, *, unit: str, start: float, end: float) -> None:
+        """One window VAD confirmed holds zero speech — never spent a
+        recheck, never added to ``checked``/the recheck budget (see
+        ``_ensure_coverage``'s recheck-picking loop). Tally only, unlike
+        ``record_recheck``/``record_backfill``/``record_missing_span``: a
+        VAD skip isn't a Whisper call, so it has no verdict or text worth a
+        per-window entry — see ``vad_zero_speech_windows``."""
+        self.vad_zero_speech_windows += 1
 
 
 def _yt_dlp_version() -> str | None:
@@ -691,6 +745,49 @@ def _coverage_recheck_budget(window_duration: float) -> int:
     return min(cfg.max_coverage_rechecks, max(cfg.min_coverage_rechecks, scaled))
 
 
+# Fraction of the configured raw cap (WhisperConfig.max_upload_mb) actually
+# usable for one request's multipart body. Applied in BOTH places that used
+# to each hardcode their own factor — the single-vs-chunked decision below
+# and the chunk-size target in _transcribe_chunked — via
+# _upload_budget_bytes(), so the two can never drift apart again (they used
+# to: the decision compared raw size against the FULL cap while chunking
+# already discounted it by 0.9, leaving a window where a file was "small
+# enough" for one request yet the chunker, given the same bytes, would have
+# planned around a smaller number).
+#
+# MEASURED FACT (bisected against this machine's LocalAI backend, 2026-09):
+# a 14,999,370-byte request body got HTTP 200; a 15,099,918-byte body got
+# HTTP 413. The backend's real limit is 15,000,000 DECIMAL bytes — not the
+# 15 * 1024 * 1024 = 15,728,640 bytes max_upload_mb naively implies. Two
+# things eat into that gap, independently of each other:
+#   1. MiB vs MB — the config is denominated in MiB (1024-based) because
+#      that's what humans read off a file's size in Finder/`ls -lh`, but
+#      backends (LocalAI, and presumably others) advertise their upload
+#      ceiling in decimal MB. 15 MiB is already 728,640 bytes MORE than
+#      15 MB before anything else is considered.
+#   2. The cap applies to the whole multipart BODY that _post_audio sends
+#      (boundary markers, the `file`/`model`/`response_format`/`language`
+#      form fields), not just the audio file's own bytes — so even a file
+#      exactly at the backend's advertised limit can push the request over
+#      once multipart framing is added.
+# Together these mean a file sized in the window [15,000,000, 15,728,640)
+# bytes used to pass the naive `size <= max_bytes` check, get sent WHOLE,
+# and fail the entire job with a 413 that the single-request path had no
+# way to recover from (see the 413 fallback in transcribe_audio below).
+# 0.9 headroom comfortably clears both effects without giving up a
+# meaningful fraction of the configured budget.
+_UPLOAD_HEADROOM = 0.9
+
+
+def _upload_budget_bytes(max_bytes: int) -> int:
+    """Turn the raw configured cap (``max_bytes`` — MiB-denominated
+    ``whisper.max_upload_mb`` converted to bytes) into the actual per-
+    request byte budget, after ``_UPLOAD_HEADROOM``. See that constant's
+    comment for why the raw cap alone isn't safe to upload right up to.
+    """
+    return max(1, int(max_bytes * _UPLOAD_HEADROOM))
+
+
 async def transcribe_audio(
     audio_path: Path,
     *,
@@ -753,7 +850,14 @@ async def transcribe_audio(
     """
     per_job_lock = asyncio.Semaphore(1)
     cfg = get_config().whisper
+    # Raw configured cap (whisper.max_upload_mb, MiB -> bytes) — kept around
+    # under its original name because ChunkingDiagnostics.max_upload_bytes
+    # reports exactly this, the number an operator would recognise from
+    # their own config. The byte budget actually used to make decisions is
+    # _upload_budget_bytes(max_bytes) — see that helper's comment for why
+    # the two aren't the same number.
     max_bytes = max(1, cfg.max_upload_mb) * 1024 * 1024
+    budget = _upload_budget_bytes(max_bytes)
     size = audio_path.stat().st_size
     normalized_metadata_language = _normalize_metadata_language(metadata_language)
 
@@ -768,23 +872,61 @@ async def transcribe_audio(
         yt_dlp_version=_yt_dlp_version(),
     )
 
-    if size <= max_bytes:
+    if size <= budget:
         diagnostics.chunking = ChunkingDiagnostics(
             chunked=False,
             audio_size_bytes=size,
             max_upload_bytes=max_bytes,
             reason=(
-                f"{size / 1024 / 1024:.1f} MB <= {max_bytes / 1024 / 1024:.0f} MB "
-                "cap — single request"
+                f"{size / 1024 / 1024:.1f} MB <= {budget / 1024 / 1024:.1f} MB "
+                f"budget ({_UPLOAD_HEADROOM:.0%} of {max_bytes / 1024 / 1024:.0f} MB "
+                "configured cap, headroom for decimal-MB backends + "
+                "multipart overhead) — single request"
             ),
         )
-        result = await _transcribe_whole(
-            audio_path,
-            total_duration=total_duration,
-            per_job_lock=per_job_lock,
-            diagnostics=diagnostics,
-            metadata_language=normalized_metadata_language,
-        )
+        try:
+            result = await _transcribe_whole(
+                audio_path,
+                total_duration=total_duration,
+                per_job_lock=per_job_lock,
+                diagnostics=diagnostics,
+                metadata_language=normalized_metadata_language,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 413:
+                raise
+            # Second layer of defence on top of the headroom above: even a
+            # size we judged "safe" got rejected — the backend's real
+            # limit (or the multipart overhead on top of the file bytes)
+            # turned out smaller than assumed. Don't fail the whole job;
+            # fall back to the chunked path with a budget guaranteed
+            # strictly smaller than the size that just failed (headroom
+            # applied to the FAILED size itself, not to the original,
+            # already-too-optimistic budget — this is what makes the
+            # retry strictly smaller rather than a repeat of the same
+            # request). Only one retry: a second 413 propagates normally.
+            log.warning(
+                "transcribe: single-request upload got HTTP 413 at %d bytes "
+                "(within our %d-byte budget) — retrying chunked with a "
+                "reduced budget",
+                size, budget,
+            )
+            diagnostics.upload_413_fallback = True
+            reduced_max_bytes = max(1, int(size * _UPLOAD_HEADROOM))
+            result = await _transcribe_chunked(
+                audio_path,
+                total_duration=total_duration,
+                max_bytes=reduced_max_bytes,
+                per_job_lock=per_job_lock,
+                metadata_language=normalized_metadata_language,
+                diagnostics=diagnostics,
+            )
+            if diagnostics.chunking is not None:
+                diagnostics.chunking.reason = (
+                    f"HTTP 413 on single-request attempt at {size} bytes "
+                    "(within budget) — retried chunked with a reduced "
+                    f"budget derived from the failed size; {diagnostics.chunking.reason}"
+                )
     else:
         result = await _transcribe_chunked(
             audio_path,
@@ -980,8 +1122,15 @@ async def _transcribe_chunked(
         )
 
     size = audio_path.stat().st_size
-    # Target 90% of the cap for VBR headroom; at least 2 chunks since we're here.
-    target = max(1, int(max_bytes * 0.9))
+    # Same _UPLOAD_HEADROOM as the single-vs-chunked decision in
+    # transcribe_audio — see that constant's comment. Using the shared
+    # helper here (rather than a second, separately-maintained 0.9) is the
+    # whole point: the two used to drift apart, which is exactly how a
+    # file could look "small enough" for one request while the chunker,
+    # given the same max_bytes, would have planned around a smaller
+    # number. At least 2 chunks since we're here regardless of what the
+    # byte math alone implies (see num_chunks below).
+    target = _upload_budget_bytes(max_bytes)
     chunks_by_bytes = math.ceil(size / target)
     # Bound chunk DURATION too, not just size — see WhisperConfig.
     # max_chunk_seconds's own comment for why the byte cap alone isn't
@@ -1017,8 +1166,9 @@ async def _transcribe_chunked(
             chunks_by_seconds=chunks_by_seconds,
             max_chunk_seconds_cap=max_chunk_seconds,
             reason=(
-                f"{size / 1024 / 1024:.1f} MB > {max_bytes / 1024 / 1024:.0f} MB "
-                f"cap -> {chunks_by_bytes} chunks by size; {duration:.0f}s / "
+                f"{size / 1024 / 1024:.1f} MB > {target / 1024 / 1024:.1f} MB "
+                f"budget ({_UPLOAD_HEADROOM:.0%} of {max_bytes / 1024 / 1024:.0f} MB "
+                f"cap) -> {chunks_by_bytes} chunks by size; {duration:.0f}s / "
                 f"{max_chunk_seconds:.0f}s cap -> {chunks_by_seconds} chunks by "
                 f"duration -> using {num_chunks} chunks of ~{chunk_seconds:.0f}s "
                 f"(bound: {bound})"
@@ -1347,6 +1497,53 @@ def _overlaps_checked(
         if overlap / length >= _WINDOW_OVERLAP_DEDUP_FRACTION:
             return True
     return False
+
+
+def _vad_attributed_speech(
+    window: tuple[float, float], vad_map: dict[tuple[float, float], float]
+) -> float | None:
+    """Speech-seconds VAD attributes to ``window`` (a pending recheck slice,
+    or a final unresolved window), prorated when ``window`` is only part of
+    the (usually larger, pre-slicing) window VAD actually examined.
+
+    Uses the SAME overlap-fraction matching technique as
+    ``_overlaps_checked`` — the entry in ``vad_map`` whose window covers at
+    least ``_WINDOW_OVERLAP_DEDUP_FRACTION`` of ``window``'s own length is
+    treated as "this is the VAD data for this window" — reused here for
+    consistency with how this module already answers "is this roughly the
+    same window I have data for", rather than inventing a second matching
+    rule. Ties go to whichever candidate has the largest overlap ratio.
+
+    Returns ``None`` when nothing in ``vad_map`` overlaps ``window`` enough
+    to count as a match — "VAD never examined this" (distinct from a real
+    ``0.0``, which means "VAD examined it and found no speech"). Callers
+    MUST keep those two apart: only a real ``0.0`` may skip a recheck or
+    zero out ``missing``; ``None`` means "fall back to the pre-VAD
+    behavior for this window".
+    """
+    start, end = window
+    length = end - start
+    if length <= 0:
+        return None
+    best_ratio = 0.0
+    best: tuple[tuple[float, float], float] | None = None
+    for v_window, speech in vad_map.items():
+        v_start, v_end = v_window
+        overlap = min(end, v_end) - max(start, v_start)
+        if overlap <= 0:
+            continue
+        ratio = overlap / length
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = (v_window, speech)
+    if best is None or best_ratio < _WINDOW_OVERLAP_DEDUP_FRACTION:
+        return None
+    (v_start, v_end), speech = best
+    v_length = v_end - v_start
+    if v_length <= 0:
+        return 0.0
+    overlap = min(end, v_end) - max(start, v_start)
+    return speech * (overlap / v_length)
 
 
 def _pending_slices(
@@ -1930,6 +2127,52 @@ async def _ensure_coverage(
     confirmed_silent: list[tuple[float, float]] = []
     rechecks = 0
 
+    # --- VAD-based recheck prioritisation (optional, off by default) -------
+    #
+    # See workers/vad.py's module docstring and WhisperConfig.vad_model's
+    # comment for why this exists: without it, the line below picks the
+    # LARGEST pending slice every iteration, which — on a backend that
+    # emits nothing at all for music/silence (see the module docstring's
+    # top) — spends the bounded recheck budget almost entirely on music
+    # instead of the short real dialogue gaps that matter.
+    #
+    # Computed ONCE per _ensure_coverage call (not per outer-loop
+    # iteration): the candidate windows are exactly what _pending_slices
+    # would derive before any slicing/overlap-dedup — the full suspicious
+    # windows above the cost cutoff — so vad_map's keys are the UNSLICED
+    # windows, and a later pending SLICE (possibly a sub-range of one of
+    # these, once a suspicious window is longer than
+    # _MAX_RECHECK_SLICE_SECONDS) is matched back to its VAD entry via
+    # _vad_attributed_speech's overlap-fraction technique, not by exact key.
+    #
+    # vad_map is None when the feature is off (whisper.vad_model=="") or
+    # VAD's first request failed outright — in that case every branch below
+    # that reads it is skipped and the loop's behavior is BYTE-IDENTICAL to
+    # before this feature existed (see the plain `if vad_map is None`
+    # picking branch just below).
+    vad_map: dict[tuple[float, float], float] | None = None
+    vad_candidate_windows: list[tuple[float, float]] = []
+    if get_config().whisper.vad_model:
+        vad_candidate_windows = [
+            (start, end)
+            for start, end in _suspicious_windows(working, window_duration)
+            if (end - start) > _MIN_RECHECK_SECONDS
+        ]
+        vad_map = await vad.speech_seconds(source_path, vad_candidate_windows)
+    if diagnostics is not None:
+        diagnostics.vad_available = diagnostics.vad_available or (vad_map is not None)
+        if vad_map is not None:
+            diagnostics.vad_windows_examined += len(vad_map)
+            diagnostics.vad_speech_seconds_total += sum(vad_map.values())
+            if len(vad_map) < len(vad_candidate_windows):
+                diagnostics.vad_budget_exceeded = True
+    # Dedup for VAD-confirmed-empty windows: unlike checked/suppressed
+    # windows, a VAD-skip window is never spliced or added to ``checked``,
+    # so it recurs with EXACTLY the same (start, end) on every outer-loop
+    # iteration until every other pending window resolves — exact-key dedup
+    # (unlike _overlaps_checked's fuzzy match) is correct here.
+    logged_vad_skips: set[tuple[float, float]] = set()
+
     while rechecks < budget:
         pending, suppressed = _pending_slices(working, window_duration, checked)
         if diagnostics is not None:
@@ -1944,7 +2187,45 @@ async def _ensure_coverage(
         if not pending:
             break
 
-        gap_start, gap_end, leading = max(pending, key=lambda w: w[1] - w[0])
+        if vad_map is None:
+            # No VAD data at all this call — pick exactly as before this
+            # feature existed.
+            gap_start, gap_end, leading = max(pending, key=lambda w: w[1] - w[0])
+        else:
+            ranked: list[tuple[tuple[float, float, bool], float]] = []
+            for p_start, p_end, p_leading in pending:
+                speech = _vad_attributed_speech((p_start, p_end), vad_map)
+                if speech is not None and speech <= 0.0:
+                    # VAD confirmed this slice holds no speech at all —
+                    # never spend a recheck on it, never add it to
+                    # ``checked``. Log/tally it at most once per exact
+                    # window (see logged_vad_skips above).
+                    key = _window_key(p_start, p_end)
+                    if key not in logged_vad_skips:
+                        logged_vad_skips.add(key)
+                        if diagnostics is not None:
+                            diagnostics.record_vad_skip(
+                                unit=unit_label, start=p_start, end=p_end
+                            )
+                    continue
+                # None (VAD never examined this exact slice — a later
+                # splice/split produced it, or the budget cut VAD off
+                # before it got here) is NOT "confirmed empty": fall back
+                # to raw length as the ranking key, same signal as before
+                # VAD existed, rather than treating "no data" as if VAD had
+                # confirmed silence.
+                rank_value = speech if speech is not None else (p_end - p_start)
+                ranked.append(((p_start, p_end, p_leading), rank_value))
+            if not ranked:
+                # Every remaining pending slice is a VAD-confirmed-empty
+                # skip — nothing left worth a recheck. Without this, the
+                # next iteration would recompute the exact same all-skip
+                # ``pending`` set (none of these windows were spliced or
+                # added to ``checked``) and spin forever instead of
+                # terminating once the real work is done.
+                break
+            gap_start, gap_end, leading = max(ranked, key=lambda item: item[1])[0]
+
         checked.append((gap_start, gap_end))
         rechecks += 1
 
@@ -2144,8 +2425,24 @@ async def _ensure_coverage(
         "(bug in the clip/splice logic, not the transcript)"
     )
     final_windows = _suspicious_windows(working, window_duration)
+
+    def _final_window_missing(window: tuple[float, float]) -> float:
+        # When VAD examined (a window overlapping) this final window,
+        # trust its speech-seconds count instead of the raw uncovered
+        # length — a window VAD found to hold zero speech contributes
+        # exactly 0 (it's music/silence, not lost dialogue). A window VAD
+        # never examined (feature off, budget cut it off, or no
+        # sufficiently-overlapping VAD entry — see
+        # _vad_attributed_speech) falls back to the pre-VAD accounting,
+        # completely unchanged.
+        if vad_map is not None:
+            speech = _vad_attributed_speech(window, vad_map)
+            if speech is not None:
+                return speech
+        return _uncovered_by_confirmed_silence(window, confirmed_silent)
+
     missing = sum(
-        _uncovered_by_confirmed_silence((start, end), confirmed_silent)
+        _final_window_missing((start, end))
         for start, end in final_windows
         if (end - start) > _MIN_RECHECK_SECONDS
     )

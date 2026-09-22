@@ -226,6 +226,43 @@ class WhisperConfig(_ApiKeyConfigMixin):
     # fixed value (12) used to play for every unit unconditionally; this is
     # now only the worst case.
     max_coverage_rechecks: int = 20
+    # Voice-activity-detection model name on LocalAI's `POST /vad` extension
+    # (e.g. "silero-vad-ggml") — see workers/vad.py. Empty (the default)
+    # means the feature is OFF: this is a LocalAI-only bonus on top of the
+    # coverage-recheck loop, not something every OpenAI-compatible backend
+    # is expected to have (CLAUDE.md — the daemon targets ANY such backend).
+    #
+    # MEASURED (real 24:57 ZDF episode, job zuglcbAoGy9h, transcribed by the
+    # current parakeet-cpp-tdt-0.6b-v3 backend, which — unlike Whisper —
+    # emits NOTHING for non-speech instead of a "*Musik*" pseudo-segment):
+    # reported transcript_missing_seconds was 470s (31% of the episode), but
+    # the actual dropped dialogue, checked against the official ZDF
+    # subtitles, was only ~27s (17 short interjections). Silero VAD over
+    # the same gaps found 66s of speech in 607s of gaps — and crucially the
+    # LARGEST gaps (which _ensure_coverage's recheck budget spends on
+    # first) were almost entirely music: gaps >=10s held 242s of audio and
+    # only 2s of speech; gaps >=6s held 384s and only 9s. VAD lets the
+    # recheck loop skip windows it confirms are silent and spend its
+    # bounded budget on the short gaps that actually held the missing
+    # dialogue instead — see workers/transcribe.py's use of this module.
+    vad_model: str = ""
+    # Explicit override for the VAD endpoint's base URL. Empty (the
+    # default) derives it from `base_url` by stripping a trailing "/v1" —
+    # LocalAI serves `/vad` at the SERVER ROOT, not under `/v1` like
+    # `/audio/transcriptions` and every other route this project calls.
+    # Set this only if your `/vad`-capable backend doesn't follow that
+    # convention.
+    vad_url: str = ""
+    # Per-transcription-unit (whole file, or each chunk) budget: how many
+    # seconds of audio VAD is allowed to examine before workers/vad.py stops
+    # calling out and reports what it gathered so far. A cost regulator,
+    # same role as _MIN_RECHECK_SECONDS elsewhere in this file — not a
+    # correctness gate. MEASURED: one 27s window cost ~0.94s wall time
+    # (0.06s ffmpeg cut + 0.10s hand-rolled JSON body build + 0.78s HTTP
+    # round trip including inference), roughly 0.035s of wall time per
+    # second of audio examined — so the 600s default costs on the order of
+    # 21s, comfortably affordable once per transcription unit.
+    vad_max_seconds: float = 600.0
 
 
 # ISO 639-1 → English language name. Small enough to inline; covers the

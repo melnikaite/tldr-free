@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from src.workers import transcribe
@@ -126,6 +127,143 @@ async def test_large_file_routes_to_chunked(
 
     result = await transcribe.transcribe_audio(audio, total_duration=10.0)
     assert result.duration_seconds == 1.0
+
+
+@pytest.mark.asyncio
+async def test_size_in_decimal_vs_mib_gap_takes_chunked_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MEASURED (bisected against this machine's LocalAI backend): a
+    14,999,370-byte body got HTTP 200, a 15,099,918-byte body got HTTP
+    413 — the backend's real cap is 15,000,000 decimal bytes, not the
+    15 * 1024 * 1024 = 15,728,640 bytes whisper.max_upload_mb (default 15)
+    naively implies. A file sized inside that gap used to pass the naive
+    ``size <= max_bytes`` check and get sent whole, failing the job. With
+    the shared _UPLOAD_HEADROOM budget (0.9 * 15,728,640 = 14,155,776),
+    anything in the gap is now safely routed to the chunked path instead."""
+    audio = tmp_path / "gap.opus"
+    audio.write_bytes(b"x" * 15_200_000)  # inside [15_000_000, 15_728_640)
+
+    async def fake_chunked(*_a: object, **_k: object) -> transcribe.TranscribeResult:
+        return transcribe.TranscribeResult(segments=[], language=None, duration_seconds=1.0)
+
+    monkeypatch.setattr(transcribe, "_transcribe_chunked", fake_chunked)
+    monkeypatch.setattr(
+        transcribe, "_post_audio", lambda *a, **k: pytest.fail("should chunk")
+    )
+
+    result = await transcribe.transcribe_audio(audio, total_duration=10.0)
+    assert result.duration_seconds == 1.0
+
+
+@pytest.mark.asyncio
+async def test_size_comfortably_under_budget_stays_single(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file well under the 14,155,776-byte budget (0.9 * default 15 MiB
+    cap) still takes the single-request path — the headroom shouldn't push
+    ordinary, comfortably-sized files onto the chunked path."""
+    audio = tmp_path / "small.opus"
+    audio.write_bytes(b"x" * 10_000_000)  # comfortably under the budget
+
+    calls: list[Path] = []
+
+    async def fake_post(path: Path, **_kwargs: object) -> dict:
+        calls.append(path)
+        return _payload([{"start": 1.0, "end": 2.0, "text": "hi"}])
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+    monkeypatch.setattr(
+        transcribe, "_transcribe_chunked", lambda *a, **k: pytest.fail("should not chunk")
+    )
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    result = await transcribe.transcribe_audio(audio, total_duration=100.0)
+    assert calls == [audio]
+    assert result.segments == [{"start": 1.0, "end": 2.0, "text": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_413_on_single_request_falls_back_to_chunked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even a file within our own upload budget can still get HTTP 413
+    back from the backend — its real limit may be smaller than assumed, or
+    multipart framing may have pushed the request over anyway (see
+    _UPLOAD_HEADROOM's module comment). transcribe_audio must recover by
+    retrying through the chunked path with a reduced budget instead of
+    failing the whole job, and record that it did so."""
+    audio = tmp_path / "a.opus"
+    audio.write_bytes(b"x" * 1024)  # well under the cap either way
+
+    c0, c1 = tmp_path / "c0.opus", tmp_path / "c1.opus"
+    c0.write_bytes(b"0")
+    c1.write_bytes(b"1")
+    monkeypatch.setattr(
+        transcribe, "_split_audio", lambda *a, **k: [(c0, 0.0), (c1, 5.0)]
+    )
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    request = httpx.Request("POST", "http://localhost/v1/audio/transcriptions")
+    response = httpx.Response(413, request=request)
+    whole_calls = 0
+
+    async def fake_post(path: Path, **_kwargs: object) -> dict:
+        nonlocal whole_calls
+        if path == audio:
+            whole_calls += 1
+            raise httpx.HTTPStatusError(
+                "413 Payload Too Large", request=request, response=response
+            )
+        if path == c0:
+            return _payload([{"start": 0.0, "end": 1.0, "text": "first"}])
+        return _payload([{"start": 0.0, "end": 1.0, "text": "second"}])
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    result = await transcribe.transcribe_audio(audio, total_duration=10.0)
+
+    assert whole_calls == 1  # only one 413 attempt — no retry loop
+    assert result.segments == [
+        {"start": 0.0, "end": 1.0, "text": "first"},
+        {"start": 5.0, "end": 6.0, "text": "second"},
+    ]
+    assert result.diagnostics is not None
+    assert result.diagnostics.upload_413_fallback is True
+    assert result.diagnostics.chunking is not None
+    assert result.diagnostics.chunking.chunked is True
+
+
+@pytest.mark.asyncio
+async def test_second_413_after_chunked_fallback_propagates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only ONE fallback attempt — if the retry (now chunked) also gets a
+    413 on one of its chunk uploads, that error propagates like any other
+    chunk-upload failure, rather than looping."""
+    audio = tmp_path / "a.opus"
+    audio.write_bytes(b"x" * 1024)
+
+    c0, c1 = tmp_path / "c0.opus", tmp_path / "c1.opus"
+    c0.write_bytes(b"0")
+    c1.write_bytes(b"1")
+    monkeypatch.setattr(
+        transcribe, "_split_audio", lambda *a, **k: [(c0, 0.0), (c1, 5.0)]
+    )
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", lambda *a, **k: None)
+
+    request = httpx.Request("POST", "http://localhost/v1/audio/transcriptions")
+    response = httpx.Response(413, request=request)
+
+    async def fake_post(_path: Path, **_kwargs: object) -> dict:
+        raise httpx.HTTPStatusError(
+            "413 Payload Too Large", request=request, response=response
+        )
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await transcribe.transcribe_audio(audio, total_duration=10.0)
 
 
 @pytest.mark.asyncio
@@ -2656,3 +2794,308 @@ async def test_unpinned_retry_does_not_consume_extra_recheck_budget(
     assert len(calls) == 4
     assert len(diagnostics.coverage_rechecks) == 2
     assert all(r["verdict"] == "recovered_unpinned" for r in diagnostics.coverage_rechecks)
+
+
+# ---------------------------------------------------------------------------
+# VAD-based recheck prioritisation (workers/vad.py) — optional, off by
+# default. Mocking transcribe.vad.speech_seconds directly (rather than the
+# HTTP/ffmpeg boundary vad.py's own tests use) is consistent with how this
+# suite already isolates _ensure_coverage's OTHER collaborators
+# (_post_audio, _cut_audio_segment are mocked directly, not the httpx/
+# subprocess calls underneath them).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_vad_off_by_default_picks_largest_window_exactly_as_before(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """THE most important regression test: with whisper.vad_model unset
+    (the default), _ensure_coverage's picking must be byte-identical to
+    before this feature existed — max(pending, key=length) — and
+    vad.speech_seconds must never even be called."""
+    monkeypatch.setattr(transcribe, "_PREFIX_DISTRUST_SECONDS", 0.0)
+    monkeypatch.setattr(transcribe, "_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(transcribe, "_coverage_recheck_budget", lambda _wd: 1)
+
+    async def fail_speech_seconds(*_a: object, **_k: object) -> None:
+        pytest.fail("vad.speech_seconds must never be called when vad_model is unset")
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fail_speech_seconds)
+
+    cut_calls: list[tuple[float, float]] = []
+
+    def fake_cut(src_path: Path, start: float, duration: float) -> Path:
+        cut_calls.append((start, duration))
+        return src_path.parent / "retry.opus"
+
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", fake_cut)
+
+    async def fake_post(_path: Path, **_kwargs: object) -> dict:
+        return _payload([])  # confirmed non-speech — ends the one recheck slot cleanly
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    # Two real gaps: (0, 30) is the LARGER one, (40, 46) is smaller but
+    # still above the cost cutoff. Pre-VAD picking always takes the larger
+    # one first.
+    segments = [
+        {"start": 30.0, "end": 40.0, "text": "middle"},
+        {"start": 46.0, "end": 50.0, "text": "tail"},
+    ]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert cut_calls == [(0.0, 30.0)]  # the LARGER gap (0, 30), not (40, 46)
+    # Confirmed non-speech on the one recheck slot spent -> that gap no
+    # longer counts as missing; the smaller untouched gap (40, 46) still
+    # does, exactly as it would have before VAD existed.
+    assert missing == pytest.approx(6.0)
+    # VAD diagnostics fields stay at their inert defaults when the feature
+    # is off — same "shape" as every job transcribed before this feature
+    # existed.
+    assert diagnostics.vad_available is False
+    assert diagnostics.vad_windows_examined == 0
+    assert diagnostics.vad_zero_speech_windows == 0
+    assert diagnostics.vad_speech_seconds_total == 0.0
+    assert diagnostics.vad_budget_exceeded is False
+
+
+@pytest.mark.asyncio
+async def test_vad_first_call_failure_falls_back_to_byte_identical_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """whisper.vad_model IS set, but vad.speech_seconds's own contract says
+    "the very first request failed" by returning None (see workers/vad.py) —
+    _ensure_coverage must fall back to the exact same picking/missing
+    behavior as if VAD were off entirely, never crash, never behave
+    differently."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    monkeypatch.setattr(transcribe, "_PREFIX_DISTRUST_SECONDS", 0.0)
+    monkeypatch.setattr(transcribe, "_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(transcribe, "_coverage_recheck_budget", lambda _wd: 1)
+
+    async def none_speech_seconds(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", none_speech_seconds)
+
+    cut_calls: list[tuple[float, float]] = []
+
+    def fake_cut(src_path: Path, start: float, duration: float) -> Path:
+        cut_calls.append((start, duration))
+        return src_path.parent / "retry.opus"
+
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", fake_cut)
+
+    async def fake_post(_path: Path, **_kwargs: object) -> dict:
+        return _payload([])
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    segments = [
+        {"start": 30.0, "end": 40.0, "text": "middle"},
+        {"start": 46.0, "end": 50.0, "text": "tail"},
+    ]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert cut_calls == [(0.0, 30.0)]
+    assert missing == pytest.approx(6.0)
+    assert diagnostics.vad_available is False  # speech_seconds returned None this call
+
+
+@pytest.mark.asyncio
+async def test_vad_confirmed_silent_window_never_rechecked_and_not_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A window VAD reports as holding zero speech is skipped entirely —
+    never spliced, never added to `checked`, never spends a recheck — and
+    contributes 0 to missing (it's confirmed music/silence, not lost
+    dialogue)."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+
+    async def fail_post(*_a: object, **_k: object) -> dict:
+        pytest.fail("no Whisper recheck should be spent on a VAD-confirmed-silent window")
+
+    monkeypatch.setattr(transcribe, "_post_audio", fail_post)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {w: 0.0 for w in windows}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        [],  # whole 40s window is one gap
+        source_path=tmp_path / "a.opus",
+        window_duration=40.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    assert missing == 0.0
+    assert diagnostics.coverage_rechecks == []  # no recheck slot spent
+    assert diagnostics.vad_zero_speech_windows == 1
+    assert diagnostics.vad_available is True
+    assert diagnostics.vad_windows_examined == 1
+
+
+@pytest.mark.asyncio
+async def test_vad_orders_recheck_by_speech_seconds_not_raw_length(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SHORTER window with MORE VAD-attributed speech is rechecked
+    before a LONGER window with less — the opposite of raw-length
+    ordering, which is exactly the fix this feature exists for (a big
+    hole is very likely music once VAD can tell)."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    monkeypatch.setattr(transcribe, "_PREFIX_DISTRUST_SECONDS", 0.0)
+    monkeypatch.setattr(transcribe, "_RETRY_BACKOFF_SECONDS", 0.0)
+    # Force exactly one recheck slot so only the FIRST pick is observable.
+    monkeypatch.setattr(transcribe, "_coverage_recheck_budget", lambda _wd: 1)
+
+    # Two gaps: (0, 60) is the LONGER one (raw-length winner), (65, 100) is
+    # SHORTER but VAD says it holds much more speech.
+    segments = [{"start": 60.0, "end": 65.0, "text": "mid"}]
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        return {(0.0, 60.0): 5.0, (65.0, 100.0): 25.0}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    cut_calls: list[tuple[float, float]] = []
+
+    def fake_cut(src_path: Path, start: float, duration: float) -> Path:
+        cut_calls.append((start, duration))
+        return src_path.parent / "retry.opus"
+
+    monkeypatch.setattr(transcribe, "_cut_audio_segment", fake_cut)
+
+    async def fake_post(_path: Path, **_kwargs: object) -> dict:
+        return _payload([])
+
+    monkeypatch.setattr(transcribe, "_post_audio", fake_post)
+
+    diagnostics = transcribe.TranscribeDiagnostics()
+    await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=100.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    # The SHORTER window (65, 100) was rechecked, not the longer (0, 60) —
+    # raw-length ordering would have picked (0, 60) first.
+    assert cut_calls == [(65.0, 35.0)]
+
+
+@pytest.mark.asyncio
+async def test_vad_budget_cutoff_windows_fall_back_to_raw_length_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """vad.speech_seconds's own budget (whisper.vad_max_seconds) can stop
+    partway through and return a dict covering only SOME of the candidate
+    windows (see workers/vad.py's contract) — the windows it didn't reach
+    must fall back to the OLD raw-uncovered-length accounting in
+    `missing`, exactly as if VAD had never run for them."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    # No rechecks at all — isolates the `missing` accounting from any
+    # splicing side effects.
+    monkeypatch.setattr(transcribe, "_coverage_recheck_budget", lambda _wd: 0)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        # Simulate the budget running out after the FIRST candidate window
+        # — the second is simply absent, per vad.speech_seconds's contract.
+        return {windows[0]: 3.0}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    segments = [{"start": 20.0, "end": 25.0, "text": "mid"}]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    _result_segments, missing = await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    # (0, 20) got VAD data (3.0s of speech attributed); (25, 50) got none
+    # and falls back to its full raw uncovered length (25.0s).
+    assert missing == pytest.approx(3.0 + 25.0)
+    assert diagnostics.vad_budget_exceeded is True
+    assert diagnostics.vad_windows_examined == 1
+
+
+@pytest.mark.asyncio
+async def test_vad_malformed_or_partial_response_does_not_crash_ensure_coverage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A malformed VAD response for one window degrades to "no data for
+    that window" (a later window simply absent from the returned dict,
+    per vad.speech_seconds's own contract) rather than crashing
+    _ensure_coverage — same shape as the budget-cutoff case, exercised
+    here from the "malformed response" angle explicitly."""
+    cfg = transcribe.get_config()
+    monkeypatch.setattr(cfg.whisper, "vad_model", "silero-vad-ggml")
+    monkeypatch.setattr(transcribe, "get_config", lambda: cfg)
+    monkeypatch.setattr(transcribe, "_coverage_recheck_budget", lambda _wd: 0)
+
+    async def fake_speech_seconds(
+        _source_path: Path, windows: list[tuple[float, float]]
+    ) -> dict[tuple[float, float], float]:
+        # windows[1]'s response was malformed on the backend side — per
+        # vad.speech_seconds's contract that stops the pass and the window
+        # is simply absent from the result, never raised.
+        return {windows[0]: 2.0}
+
+    monkeypatch.setattr(transcribe.vad, "speech_seconds", fake_speech_seconds)
+
+    segments = [{"start": 20.0, "end": 25.0, "text": "mid"}]
+    diagnostics = transcribe.TranscribeDiagnostics()
+    result_segments, missing = await transcribe._ensure_coverage(
+        segments,
+        source_path=tmp_path / "a.opus",
+        window_duration=50.0,
+        per_job_lock=asyncio.Semaphore(1),
+        diagnostics=diagnostics,
+        unit_label="whole",
+    )
+
+    # No crash; the untouched segment survives; missing mixes VAD data for
+    # the first window with old-style accounting for the unreached one.
+    assert result_segments == segments
+    assert missing == pytest.approx(2.0 + 25.0)
