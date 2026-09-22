@@ -853,6 +853,21 @@ def count_jobs_by_status() -> dict[str, int]:
         return {status: int(count) for status, count in session.exec(stmt).all()}
 
 
+def all_referenced_audio_paths() -> set[str]:
+    """Every non-NULL ``Job.audio_path`` currently in the DB.
+
+    Used by ``workers.retention``'s orphaned-audio sweep: a file under
+    ``<data_dir>/audio`` that isn't in this set has no row pointing at it and
+    is unreachable by any DB-driven delete path (``delete_job`` /
+    ``delete_jobs_older_than`` only ever unlink the path the row THEY remove
+    points at — a file whose row is already gone, or that never got a row,
+    is invisible to both). Cheap — one column scan, no join.
+    """
+    with session_scope() as session:
+        stmt = select(Job.audio_path).where(Job.audio_path.is_not(None))  # type: ignore[union-attr]
+        return {path for path in session.exec(stmt).all() if path}
+
+
 def find_pending_for_restart() -> list[Job]:
     """Return all jobs left in ``queued`` or ``running`` state.
 
@@ -1029,6 +1044,7 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
 
 __all__ = [
     "add_message",
+    "all_referenced_audio_paths",
     "create_job",
     "delete_job",
     "delete_jobs_older_than",

@@ -508,6 +508,34 @@ def test_reset_for_retry_preserves_audio_path(isolated_db) -> None:
 
 
 # ---------------------------------------------------------------------------
+# all_referenced_audio_paths — used by workers.retention's orphaned-audio
+# sweep to tell a live cached-audio file from one no row points at.
+# ---------------------------------------------------------------------------
+
+
+def test_all_referenced_audio_paths_empty_when_no_jobs_have_audio(isolated_db) -> None:
+    repo.create_job(url="https://x", kind="youtube")
+    assert repo.all_referenced_audio_paths() == set()
+
+
+def test_all_referenced_audio_paths_returns_only_non_null_paths(isolated_db) -> None:
+    with_audio = repo.create_job(url="https://a", kind="youtube")
+    repo.set_audio(with_audio.id, audio_path="/data/audio/a.opus")
+    repo.create_job(url="https://b", kind="youtube")  # audio_path stays NULL
+
+    assert repo.all_referenced_audio_paths() == {"/data/audio/a.opus"}
+
+
+def test_all_referenced_audio_paths_covers_multiple_jobs(isolated_db) -> None:
+    a = repo.create_job(url="https://a", kind="youtube")
+    b = repo.create_job(url="https://b", kind="youtube")
+    repo.set_audio(a.id, audio_path="/data/audio/a.opus")
+    repo.set_audio(b.id, audio_path="/data/audio/b.opus")
+
+    assert repo.all_referenced_audio_paths() == {"/data/audio/a.opus", "/data/audio/b.opus"}
+
+
+# ---------------------------------------------------------------------------
 # delete_job — audio file cleanup
 # ---------------------------------------------------------------------------
 

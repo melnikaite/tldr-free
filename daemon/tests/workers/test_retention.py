@@ -22,7 +22,10 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -394,3 +397,259 @@ async def test_retention_worker_calls_orphan_sweep_each_active_cycle(
         await retention.retention_worker()
 
     assert sweep_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# orphaned audio — files/directories under <data_dir>/audio that no job row
+# references. See retention._sweep_orphaned_audio()'s docstring (and the
+# module docstring) for the three confirmed leak sources and the
+# grace-period reasoning. Uses tmp_path throughout — never the real data
+# dir — via monkeypatching retention._audio_dir().
+# ---------------------------------------------------------------------------
+
+_OLD_SECONDS = retention._AUDIO_ORPHAN_GRACE_SECONDS + 60  # comfortably past the grace period
+_FRESH_SECONDS = 60  # well inside the grace period
+
+
+def _age(path: Path, seconds_ago: float) -> None:
+    """Backdate a file/dir's mtime (and atime) by ``seconds_ago`` seconds,
+    so tests can simulate "old" vs "fresh" without real wall-clock waits."""
+    ts = time.time() - seconds_ago
+    os.utime(path, (ts, ts))
+
+
+def test_audio_sweep_keeps_referenced_file_even_when_old(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    referenced = tmp_path / "referenced.opus"
+    referenced.write_bytes(b"data")
+    _age(referenced, _OLD_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: {str(referenced)})
+
+    retention._sweep_orphaned_audio()
+
+    assert referenced.exists()
+
+
+def test_audio_sweep_keeps_stale_file_referenced_via_redundant_path_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DB reference and the on-disk entry can both point at the same
+    file without being string-identical (e.g. a redundant ``./`` segment
+    from some other normalization). The resolved-path fallback must still
+    recognize them as the same file."""
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    referenced = tmp_path / "referenced.opus"
+    referenced.write_bytes(b"data")
+    _age(referenced, _OLD_SECONDS)
+    equivalent_ref = f"{tmp_path}/./referenced.opus"
+    assert equivalent_ref != str(referenced)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: {equivalent_ref})
+
+    retention._sweep_orphaned_audio()
+
+    assert referenced.exists()
+
+
+def test_audio_sweep_keeps_stale_file_referenced_via_symlinked_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlinked data dir (e.g. macOS /var vs /private/var) means the DB
+    reference and the audio-dir entry can resolve to the same file while
+    looking like different strings on either side of the symlink. The
+    resolved-path fallback must catch this."""
+    real_dir = tmp_path / "real_audio"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link_audio"
+    try:
+        os.symlink(real_dir, link_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available in this environment")
+
+    monkeypatch.setattr(retention, "_audio_dir", lambda: real_dir)
+    referenced = real_dir / "referenced.opus"
+    referenced.write_bytes(b"data")
+    _age(referenced, _OLD_SECONDS)
+    # DB stores the path as seen through the symlinked parent.
+    referenced_via_link = str(link_dir / "referenced.opus")
+    assert referenced_via_link != str(referenced)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: {referenced_via_link})
+
+    retention._sweep_orphaned_audio()
+
+    assert referenced.exists()
+
+
+def test_audio_sweep_keeps_stale_file_referenced_by_basename_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reference whose full path differs entirely but whose basename
+    matches an entry in the (single, flat) audio directory is treated as
+    the same file — see the basename-matching rationale in
+    ``_sweep_orphaned_audio``."""
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    entry = tmp_path / "shared-name.opus"
+    entry.write_bytes(b"data")
+    _age(entry, _OLD_SECONDS)
+    unrelated_reference = str(Path("/some/other/data/dir/audio/shared-name.opus"))
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: {unrelated_reference})
+
+    retention._sweep_orphaned_audio()
+
+    assert entry.exists()
+
+
+def test_audio_sweep_removes_stale_file_with_merely_similar_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A referenced file with a different name must not shield an
+    unreferenced file that merely looks similar — basename matching is
+    exact, not fuzzy."""
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    orphan = tmp_path / "orphan.m4a"
+    orphan.write_bytes(b"data")
+    _age(orphan, _OLD_SECONDS)
+    referenced_elsewhere = str(tmp_path / "orphan-but-not-quite.m4a")
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: {referenced_elsewhere})
+
+    retention._sweep_orphaned_audio()
+
+    assert not orphan.exists()
+
+
+def test_audio_sweep_keeps_unreferenced_fresh_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    fresh = tmp_path / "fresh.m4a"
+    fresh.write_bytes(b"data")
+    _age(fresh, _FRESH_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: set())
+
+    retention._sweep_orphaned_audio()
+
+    assert fresh.exists()
+
+
+def test_audio_sweep_removes_unreferenced_old_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    orphan = tmp_path / "orphan.m4a"
+    orphan.write_bytes(b"data")
+    _age(orphan, _OLD_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: set())
+
+    retention._sweep_orphaned_audio()
+
+    assert not orphan.exists()
+
+
+def test_audio_sweep_keeps_chunk_dir_with_one_fresh_file_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tldr-chunks-* dir created two hours ago but with a chunk written a
+    minute ago is a live transcription, not a leak — judged by the newest
+    mtime found INSIDE it, not the directory's own timestamp."""
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    chunk_dir = tmp_path / "tldr-chunks-abc123"
+    chunk_dir.mkdir()
+    _age(chunk_dir, _OLD_SECONDS)
+    stale_chunk = chunk_dir / "chunk0.wav"
+    stale_chunk.write_bytes(b"data")
+    _age(stale_chunk, _OLD_SECONDS)
+    live_chunk = chunk_dir / "chunk1.wav"
+    live_chunk.write_bytes(b"data")
+    _age(live_chunk, _FRESH_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: set())
+
+    retention._sweep_orphaned_audio()
+
+    assert chunk_dir.is_dir()
+    assert live_chunk.exists()
+    assert stale_chunk.exists()
+
+
+def test_audio_sweep_removes_fully_stale_chunk_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    chunk_dir = tmp_path / "tldr-recut-def456"
+    chunk_dir.mkdir()
+    _age(chunk_dir, _OLD_SECONDS)
+    old_chunk = chunk_dir / "recut.wav"
+    old_chunk.write_bytes(b"data")
+    _age(old_chunk, _OLD_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: set())
+
+    retention._sweep_orphaned_audio()
+
+    assert not chunk_dir.exists()
+
+
+def test_audio_sweep_missing_audio_dir_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setattr(retention, "_audio_dir", lambda: missing)
+
+    def fail_referenced() -> set[str]:  # pragma: no cover - must not run
+        raise AssertionError("should not query the DB when the audio dir is missing")
+
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", fail_referenced)
+
+    retention._sweep_orphaned_audio()  # must not raise
+
+
+def test_audio_sweep_swallows_oserror_during_removal_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    broken = tmp_path / "broken.m4a"
+    broken.write_bytes(b"data")
+    _age(broken, _OLD_SECONDS)
+    other_orphan = tmp_path / "other.m4a"
+    other_orphan.write_bytes(b"data")
+    _age(other_orphan, _OLD_SECONDS)
+    monkeypatch.setattr(retention.repo, "all_referenced_audio_paths", lambda: set())
+
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self == broken:
+            raise OSError("permission denied")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    retention._sweep_orphaned_audio()  # must not raise
+
+    # broken's removal failed (logged, not raised) — the file is still
+    # there — but the other orphan was still cleaned up afterwards.
+    assert broken.exists()
+    assert not other_orphan.exists()
+
+
+@pytest.mark.asyncio
+async def test_retention_worker_runs_audio_sweep_every_cycle_even_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same DB/disk-consistency-check status as the frame-dir sweep —
+    disabling storage.retention_days must not disable it."""
+    _patch_config(monkeypatch, 0)
+    monkeypatch.setattr(retention.repo, "delete_jobs_older_than", lambda _c: 0)
+
+    sweep_calls = 0
+
+    def fake_sweep() -> None:
+        nonlocal sweep_calls
+        sweep_calls += 1
+
+    monkeypatch.setattr(retention, "_sweep_orphaned_audio", fake_sweep)
+    monkeypatch.setattr(retention.asyncio, "sleep", _stop_after(1))
+
+    with pytest.raises(_StopLoop):
+        await retention.retention_worker()
+
+    assert sweep_calls == 1
