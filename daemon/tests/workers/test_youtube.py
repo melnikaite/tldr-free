@@ -1008,3 +1008,114 @@ async def test_download_subtitles_still_retries_exceptions_when_no_track_disable
     )
     assert out == [{"start": 0.0, "duration": 1.0, "text": "recovered"}]
     assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# has_dedicated_extractor — real yt-dlp extractor registry, no network
+# ---------------------------------------------------------------------------
+
+
+def test_has_dedicated_extractor_true_for_youtube_url() -> None:
+    assert youtube.has_dedicated_extractor("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is True
+
+
+def test_has_dedicated_extractor_true_for_zdf_page_url() -> None:
+    assert youtube.has_dedicated_extractor(
+        "https://www.zdf.de/play/serien/spaeti-102/grumpy-elster-100"
+    ) is True
+
+
+def test_has_dedicated_extractor_false_for_bare_cdn_file() -> None:
+    assert youtube.has_dedicated_extractor(
+        "https://nrodlzdf-a.akamaihd.net/dach/zdf/25/04/250415_2145_sendung_sae/"
+        "1/250415_2145_sendung_sae_a1a2_4328k_p19v17.webm"
+    ) is False
+
+
+def test_has_dedicated_extractor_false_for_ordinary_blog_page() -> None:
+    assert youtube.has_dedicated_extractor("https://example.com/blog/post") is False
+
+
+def test_has_dedicated_extractor_swallows_registry_errors(monkeypatch) -> None:  # noqa: ANN001
+    """A yt-dlp internals change must never break job processing."""
+
+    def _boom() -> tuple[Any, ...]:
+        raise RuntimeError("registry exploded")
+
+    monkeypatch.setattr(youtube, "_extractor_classes", _boom)
+    assert youtube.has_dedicated_extractor("https://www.youtube.com/watch?v=xxxxxxxxxxx") is False
+
+
+# ---------------------------------------------------------------------------
+# fetch_video_metadata — extractor / is_playlist surfaced from extract_info
+# ---------------------------------------------------------------------------
+
+
+class _FakeMetadataYoutubeDL:
+    """Stand-in for yt_dlp.YoutubeDL for the metadata-only probe path."""
+
+    info: dict[str, Any] = {}
+
+    def __init__(self, opts: dict[str, Any]) -> None:
+        self.opts = opts
+
+    def __enter__(self) -> _FakeMetadataYoutubeDL:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def extract_info(self, url: str, download: bool):  # noqa: ANN001, ARG002
+        return dict(_FakeMetadataYoutubeDL.info)
+
+
+def _patch_fake_metadata_ydl(monkeypatch, info: dict[str, Any]) -> None:  # noqa: ANN001
+    _FakeMetadataYoutubeDL.info = info
+    monkeypatch.setattr("yt_dlp.YoutubeDL", _FakeMetadataYoutubeDL)
+    monkeypatch.setattr(youtube, "_ffmpeg_opt", lambda: {})
+    monkeypatch.setattr(youtube, "_jsruntime_opt", lambda: {})
+
+
+@pytest.mark.asyncio
+async def test_fetch_video_metadata_surfaces_extractor_and_is_playlist(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    _patch_fake_metadata_ydl(
+        monkeypatch,
+        {"title": "Grumpy Elster", "language": "deu", "duration": 1496, "extractor": "ZDF"},
+    )
+    out = await youtube.fetch_video_metadata(url="https://www.zdf.de/x", cookies=[], scratch_dir=tmp_path)
+    assert out["title"] == "Grumpy Elster"
+    assert out["extractor"] == "ZDF"
+    assert out["is_playlist"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_video_metadata_flags_playlist_result(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    _patch_fake_metadata_ydl(
+        monkeypatch,
+        {"title": "Some Playlist", "_type": "playlist", "extractor": "youtube:tab"},
+    )
+    out = await youtube.fetch_video_metadata(
+        url="https://www.youtube.com/playlist?list=x", cookies=[], scratch_dir=tmp_path,
+    )
+    assert out["is_playlist"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_video_metadata_generic_extractor_for_bare_file(
+    monkeypatch, tmp_path: Path,  # noqa: ANN001
+) -> None:
+    _patch_fake_metadata_ydl(
+        monkeypatch,
+        {"title": "250415_2145_sendung_sae_a1a2_4328k_p19v17", "extractor": "generic"},
+    )
+    out = await youtube.fetch_video_metadata(url="https://cdn.example/file.webm", cookies=[], scratch_dir=tmp_path)
+    assert out["extractor"] == "generic"
+    assert out["is_playlist"] is False
+
+
+def test_ydl_base_opts_sets_noplaylist() -> None:
+    assert youtube._ydl_base_opts(None)["noplaylist"] is True

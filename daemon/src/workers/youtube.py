@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -520,6 +521,11 @@ def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
         # solved by the bundled deno runtime. The yt-dlp-ejs package ships the
         # solver locally too; this stays as a fallback for deno's npm libs.
         "remote_components": ["ejs:github"],
+        # A page URL can point at a video that happens to sit inside a
+        # playlist (e.g. a "watch?v=...&list=..." link); without this yt-dlp
+        # resolves the whole playlist instead of the single video the caller
+        # actually asked about.
+        "noplaylist": True,
         **_ffmpeg_opt(),
         **_jsruntime_opt(),
     }
@@ -900,6 +906,49 @@ async def download_subtitles(
 
 
 # ---------------------------------------------------------------------------
+# Extractor suitability (does yt-dlp have dedicated site support for a URL?)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def _extractor_classes() -> tuple[Any, ...]:
+    """All yt-dlp extractor classes, imported lazily and cached once.
+
+    Importing ``yt_dlp.extractor`` walks ~1750 extractor modules, so this is
+    done at most once per process.
+    """
+    from yt_dlp.extractor import gen_extractor_classes
+
+    return tuple(gen_extractor_classes())
+
+
+def has_dedicated_extractor(url: str) -> bool:
+    """Whether yt-dlp has a dedicated (non-generic) extractor for ``url``.
+
+    Used to decide whether a page URL is worth handing to yt-dlp in
+    preference to a media element URL scraped straight out of the DOM: a
+    dedicated extractor (YouTube, ZDF, ARD, Vimeo, ...) knows the site's own
+    metadata and caption tracks, while yt-dlp's ``generic`` extractor just
+    downloads whatever file the URL points at.
+
+    Local-only: this walks yt-dlp's extractor registry and calls each
+    class's ``suitable(url)``, which is a pure string/regex check — no
+    network request is made. Swallows any exception and returns ``False`` so
+    a yt-dlp internals change can never break job processing.
+    """
+    try:
+        for ie in _extractor_classes():
+            if ie.ie_key() == "Generic":
+                continue
+            if ie.suitable(url):
+                return True
+        return False
+    except Exception:
+        log.warning("has_dedicated_extractor: suitability check failed for %s", url, exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Metadata probe (canonical title)
 # ---------------------------------------------------------------------------
 
@@ -918,6 +967,11 @@ def _fetch_video_metadata_sync(
             "title": info.get("title"),
             "language": info.get("language") or info.get("original_language"),
             "duration": info.get("duration"),
+            # Which yt-dlp extractor actually handled this URL — "generic"
+            # means yt-dlp found no dedicated site support, so its "title"
+            # is typically just a filename stem, not editorial metadata.
+            "extractor": info.get("extractor"),
+            "is_playlist": info.get("_type") == "playlist",
         }
     except Exception as exc:
         log.warning("yt-dlp metadata probe failed for %s: %s", url, exc)
@@ -953,4 +1007,5 @@ __all__ = [
     "extract_video_id",
     "fetch_transcript_with_retry",
     "fetch_video_metadata",
+    "has_dedicated_extractor",
 ]

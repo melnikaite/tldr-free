@@ -264,27 +264,64 @@ async function handleExtractedPage(msg, sourceTabId) {
 }
 
 /**
+ * De-duplicate two cookie lists (as produced by ``getCookiesForUrl``),
+ * keeping the first occurrence of any (name, domain, path) triple — that's
+ * the identity Chrome itself uses to distinguish otherwise-same-named
+ * cookies scoped to different domains/paths.
+ *
+ * @param {import("./lib/api-types.js").Cookie[]} primary
+ * @param {import("./lib/api-types.js").Cookie[]} extra
+ * @returns {import("./lib/api-types.js").Cookie[]}
+ */
+function _mergeCookies(primary, extra) {
+  const seen = new Set(primary.map((c) => `${c.name}\0${c.domain}\0${c.path}`));
+  const merged = primary.slice();
+  for (const c of extra) {
+    const key = `${c.name}\0${c.domain}\0${c.path}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(c);
+    }
+  }
+  return merged;
+}
+
+/**
  * Generic media discovered on a non-YouTube page (native <video>/<audio>
  * with a real URL, or an iframe embed from a known media host). The daemon
  * routes this to ``kind=media`` and feeds ``mediaUrl`` straight to yt-dlp,
  * which has site-specific extractors for hundreds of hosts plus a generic
- * fallback for direct mp4/HLS/DASH links.
+ * fallback for direct mp4/HLS/DASH links. On a site where the scraped
+ * ``mediaUrl`` is just a bare CDN file (e.g. a broadcaster's <video> src),
+ * yt-dlp may have no dedicated extractor for it even though it has one for
+ * the *page* — the daemon then routes through ``url`` instead (see
+ * pipeline.py's ``_run_media`` routing rule), so we can't assume in advance
+ * which of the two URLs yt-dlp will actually fetch.
  *
- * Cookies: we forward exactly the cookies a real HTTP request to
- * ``mediaUrl`` would carry (URL-scoped, via chrome.cookies.getAll({url})).
- * That covers session cookies for player auth, CDN signing tokens, etc.,
- * without leaking unrelated cookies from sibling subdomains.
+ * Cookies: we forward the union of what a real HTTP request to ``mediaUrl``
+ * would carry AND what one to ``url`` would carry (URL-scoped, via
+ * chrome.cookies.getAll({url}) for each), merged and de-duplicated by
+ * (name, domain, path). That covers session cookies for player auth, CDN
+ * signing tokens, and the page's own site auth, without leaking unrelated
+ * cookies from sibling subdomains.
  *
  * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], title?:string|null, text?:string}} msg
  * @param {number|null} sourceTabId
  */
 async function handleExtractedMedia(msg, sourceTabId) {
-  let cookies = [];
+  let mediaCookies = [];
   try {
-    cookies = await getCookiesForUrl(msg.mediaUrl);
+    mediaCookies = await getCookiesForUrl(msg.mediaUrl);
   } catch (err) {
     console.warn("[TLDR] cookies.getAll(url) failed", err);
   }
+  let pageCookies = [];
+  try {
+    pageCookies = await getCookiesForUrl(msg.url);
+  } catch (err) {
+    console.warn("[TLDR] cookies.getAll(url) failed", err);
+  }
+  const cookies = _mergeCookies(mediaCookies, pageCookies);
 
   // Convert extension-side {mediaUrl, kind, label} to the snake_case shape
   // the daemon expects. Drop alternates with the same URL as the primary —

@@ -507,19 +507,29 @@ async def _process_one(
         # "Original".
         whisper_language = whisper_result.language
 
-        # The DB row's title is whatever the extension scraped from a possibly
-        # stale SPA DOM — often just the video id. Fetch YouTube's own title
-        # (and language as a fallback), the same probe the caption fast path
-        # uses. Best-effort: a metadata hiccup must not break the summary.
-        # Reuse the early duration-probe's metadata when we already have it
-        # (kind=media, no cached audio) instead of probing yt-dlp twice.
+        # The DB row's title is whatever the extension scraped, and that can
+        # be wrong in two different ways: on YouTube it's a possibly-stale
+        # SPA DOM (often just the video id); on a generic media page (kind=
+        # media handed a bare CDN file yt-dlp can only reach via its
+        # ``generic`` extractor) yt-dlp's own "title" is just that file's
+        # name stem, no better than the extension's page-title/og:title
+        # scrape. So only trust yt-dlp's title when a dedicated site
+        # extractor produced it (YouTube, ZDF, ARD, Vimeo, …) — the same
+        # probe the caption fast path uses. When the extractor is ``generic``
+        # or unknown, keep the extension's title and only fill it in if it's
+        # missing entirely. Best-effort throughout: a metadata hiccup must
+        # not break the summary. Reuse the early duration-probe's metadata
+        # when we already have it (kind=media, no cached audio) instead of
+        # probing yt-dlp twice.
         if not metadata_fetched:
             metadata = await youtube.fetch_video_metadata(
                 url=task_url, cookies=task_cookies, scratch_dir=_audio_dir(),
             )
         meta_title = metadata.get("title")
         if isinstance(meta_title, str) and meta_title.strip():
-            title = meta_title.strip()
+            extractor = metadata.get("extractor")
+            if (extractor and extractor != "generic") or not (title and title.strip()):
+                title = meta_title.strip()
         if whisper_language is None:
             whisper_language = languages.short_lang_code(metadata.get("language"))
         # Last resort: guess from the transcript text itself (LocalAI Whisper

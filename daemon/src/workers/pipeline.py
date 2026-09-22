@@ -142,6 +142,7 @@ async def run_pipeline(
                 return
             await _run_media(
                 job_id,
+                url=url,
                 media_url=media_url,
                 page_title=page_title,
                 page_text=page_text,
@@ -457,12 +458,37 @@ async def _finish_caption_fast_path(
 # transcribe → summarize for any URL yt-dlp can extract from. The runner is
 # URL-agnostic — ``WhisperTask.url`` becomes the argument to
 # ``youtube.download_audio`` regardless of the original kind.
+#
+# Two URLs reach this function: the page ``url`` and the ``media_url`` the
+# extension scraped straight out of the DOM (a <video>/<audio> ``src`` or an
+# iframe embed). Which one is worth handing to yt-dlp is not always the same
+# one: on a broadcaster site like ZDF, the DOM element is a bare CDN file
+# (``https://nrodlzdf-a.akamaihd.net/.../250415_2145_sendung_sae_a1a2_4328k_
+# p19v17.webm``) that yt-dlp can only reach via its ``generic`` extractor —
+# no captions, and a "title" that is just that filename stem — while the
+# page URL (``https://www.zdf.de/play/serien/spaeti-102/grumpy-elster-100``)
+# hits yt-dlp's dedicated ``zdf`` extractor and gets the real title
+# ("Grumpy Elster") plus editorial subtitles. An iframe embed is the mirror
+# case: there the scraped ``media_url`` (e.g. a vimeo.com/… URL) is itself
+# what a dedicated extractor wants, and the page URL is just the
+# third-party site embedding it — so routing through the page URL there
+# would be a regression, not an improvement.
+#
+# The rule below picks the page URL only when it is both different from
+# ``media_url`` AND resolves (locally, via ``youtube.has_dedicated_extractor``)
+# to a real site extractor — then confirms that with one metadata probe,
+# since ``suitable()`` matching a URL pattern doesn't guarantee the probe
+# won't come back empty, hit a playlist, or still land on ``generic``.
+# Whichever URL wins is used for every downstream consumer (captions,
+# ``_finish_caption_fast_path``'s title probe, and the Whisper fallback) so
+# the transcript, captions and title all come from the same source.
 # ---------------------------------------------------------------------------
 
 
 async def _run_media(
     job_id: str,
     *,
+    url: str,
     media_url: str,
     page_title: str | None,
     page_text: str | None,
@@ -477,10 +503,30 @@ async def _run_media(
     # Pause checkpoint before the caption probe.
     await _checkpoint_pause(job_id, broker, "extracting")
 
+    # Resolve which URL to hand yt-dlp — see the block comment above.
+    source_url = media_url
+    probe_extractor: str | None = None
+    if url and url != media_url and youtube.has_dedicated_extractor(url):
+        probe = await youtube.fetch_video_metadata(
+            url=url, cookies=cookies, scratch_dir=_subtitles_dir(),
+        )
+        probe_extractor = probe.get("extractor") if probe else None
+        if (
+            probe
+            and not probe.get("is_playlist")
+            and probe_extractor
+            and probe_extractor != "generic"
+        ):
+            source_url = url
+    log.info(
+        "job %s: media source resolved to %s (page_url=%s, media_url=%s, extractor=%s)",
+        job_id, source_url, url, media_url, probe_extractor,
+    )
+
     broker.publish(job_id, stage_event("fetching_captions"))
     try:
         segments = await youtube.download_subtitles(
-            url=media_url,
+            url=source_url,
             cookies=cookies,
             dir=_subtitles_dir(),
             lang_preferences=cfg.youtube.subtitle_lang_preferences,
@@ -508,7 +554,7 @@ async def _run_media(
         )
         await _finish_caption_fast_path(
             job_id,
-            url=media_url,
+            url=source_url,
             cookies=cookies,
             segments=segments,
             transcript_source=TranscriptSource.SITE_CAPTIONS,
@@ -522,7 +568,7 @@ async def _run_media(
     # as always.
     try:
         await get_queue().put(
-            WhisperTask(job_id=job_id, url=media_url, cookies=cookies, page_text=page_text)
+            WhisperTask(job_id=job_id, url=source_url, cookies=cookies, page_text=page_text)
         )
     except Exception as exc:
         log.exception("failed to enqueue media job %s", job_id)

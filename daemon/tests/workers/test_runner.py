@@ -130,7 +130,9 @@ async def test_runner_processes_one_task_end_to_end(
             yield chunk
 
     async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
-        return {"title": "Canonical Title", "language": "en"}
+        # extractor="youtube" -> a dedicated site extractor, so its title is
+        # trusted over the DB row's (possibly stale SPA DOM) scrape.
+        return {"title": "Canonical Title", "language": "en", "extractor": "youtube"}
 
     monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
     monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
@@ -375,7 +377,13 @@ async def test_runner_media_long_probed_duration_normal_path(
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
     async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
-        return {"title": "Podcast Episode", "language": "en", "duration": 900.0}
+        # extractor="generic" -> yt-dlp found no dedicated site support for a
+        # bare .mp3 URL, so its "title" is untrustworthy (typically just a
+        # filename stem) and must NOT clobber the extension's page title.
+        return {
+            "title": "Podcast Episode", "language": "en", "duration": 900.0,
+            "extractor": "generic",
+        }
 
     async def fake_stream_summarize(
         text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
@@ -402,7 +410,190 @@ async def test_runner_media_long_probed_duration_normal_path(
     assert fake_repo.failed_calls == []
     done = fake_repo.done_calls[0]
     assert done["transcript_source"] == "whisper"
-    assert done["title"] == "Podcast Episode"
+    # generic extractor's title must not clobber the page-scraped title.
+    assert done["title"] == "Podcast Page"
+
+
+# ---------------------------------------------------------------------------
+# Title backfill rule: trust yt-dlp's title only from a dedicated (non-
+# generic) extractor; a generic-extractor title (typically just a filename
+# stem — the ZDF case that motivated this) may only fill an EMPTY title, and
+# must never clobber a non-empty one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runner_title_backfill_dedicated_extractor_overwrites_title(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_segments: list[dict[str, Any]],
+) -> None:
+    """A dedicated extractor (e.g. zdf) is trusted over the extension's
+    scraped title, same as YouTube always was."""
+    job = _FakeJob(
+        id="job_dedicated", url="https://www.zdf.de/play/serien/spaeti-102/grumpy-elster-100",
+        kind="media", title="250415_2145_sendung_sae_a1a2_4328k_p19v17",
+    )
+    fake_repo = _FakeRepo({"job_dedicated": job})
+
+    audio_file = tmp_path / "grumpy.opus"
+    audio_file.write_bytes(b"\x00" * 8)
+
+    async def fake_download_audio(
+        *, url: str, cookies: list[Any], dir: Path,
+    ) -> tuple[Path, float | None]:
+        return audio_file, 900.0
+
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
+        from src.workers.transcribe import TranscribeResult
+        return TranscribeResult(segments=fake_segments, language="de", duration_seconds=total_duration)
+
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+        return {
+            "title": "Grumpy Elster", "language": "de", "duration": 900.0,
+            "extractor": "zdf",
+        }
+
+    async def fake_stream_summarize(
+        text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
+    ):
+        yield "Summary."
+
+    monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
+    monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(runner_mod.youtube, "fetch_video_metadata", fake_metadata)
+    monkeypatch.setattr(runner_mod.llm_summary, "stream_summarize", fake_stream_summarize)
+    monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
+
+    q = WhisperQueue()
+    await q.put(
+        WhisperTask(job_id="job_dedicated", url=job.url, cookies=[], page_text="unused"),
+    )
+
+    worker = asyncio.create_task(runner_mod.whisper_worker(q, fake_repo))
+    await _wait_until(lambda: q.snapshot() == (0, 0) and bool(fake_repo.done_calls))
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert fake_repo.failed_calls == []
+    done = fake_repo.done_calls[0]
+    assert done["title"] == "Grumpy Elster"
+
+
+@pytest.mark.asyncio
+async def test_runner_title_backfill_generic_extractor_keeps_existing_title(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_segments: list[dict[str, Any]],
+) -> None:
+    """generic extractor's title (a filename stem, per the ZDF case) must
+    never overwrite a non-empty existing title."""
+    job = _FakeJob(
+        id="job_generic_keep", url="https://nrodlzdf-a.akamaihd.net/dach/zdf/clip.webm",
+        kind="media", title="Grumpy Elster",
+    )
+    fake_repo = _FakeRepo({"job_generic_keep": job})
+
+    audio_file = tmp_path / "clip.opus"
+    audio_file.write_bytes(b"\x00" * 8)
+
+    async def fake_download_audio(
+        *, url: str, cookies: list[Any], dir: Path,
+    ) -> tuple[Path, float | None]:
+        return audio_file, 900.0
+
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
+        from src.workers.transcribe import TranscribeResult
+        return TranscribeResult(segments=fake_segments, language="de", duration_seconds=total_duration)
+
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+        return {
+            "title": "250415_2145_sendung_sae_a1a2_4328k_p19v17",
+            "language": "de", "duration": 900.0, "extractor": "generic",
+        }
+
+    async def fake_stream_summarize(
+        text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
+    ):
+        yield "Summary."
+
+    monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
+    monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(runner_mod.youtube, "fetch_video_metadata", fake_metadata)
+    monkeypatch.setattr(runner_mod.llm_summary, "stream_summarize", fake_stream_summarize)
+    monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
+
+    q = WhisperQueue()
+    await q.put(
+        WhisperTask(job_id="job_generic_keep", url=job.url, cookies=[], page_text="unused"),
+    )
+
+    worker = asyncio.create_task(runner_mod.whisper_worker(q, fake_repo))
+    await _wait_until(lambda: q.snapshot() == (0, 0) and bool(fake_repo.done_calls))
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert fake_repo.failed_calls == []
+    done = fake_repo.done_calls[0]
+    assert done["title"] == "Grumpy Elster"
+
+
+@pytest.mark.asyncio
+async def test_runner_title_backfill_generic_extractor_fills_empty_title(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_segments: list[dict[str, Any]],
+) -> None:
+    """generic extractor's title is still better than nothing when the DB
+    row has no title at all."""
+    job = _FakeJob(
+        id="job_generic_fill", url="https://example.com/assets/clip.mp4",
+        kind="media", title=None,
+    )
+    fake_repo = _FakeRepo({"job_generic_fill": job})
+
+    audio_file = tmp_path / "clip.opus"
+    audio_file.write_bytes(b"\x00" * 8)
+
+    async def fake_download_audio(
+        *, url: str, cookies: list[Any], dir: Path,
+    ) -> tuple[Path, float | None]:
+        return audio_file, 900.0
+
+    async def fake_transcribe_audio(audio_path: Path, *, total_duration: float | None, **_kwargs: object):
+        from src.workers.transcribe import TranscribeResult
+        return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
+
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+        return {
+            "title": "clip", "language": "en", "duration": 900.0,
+            "extractor": "generic",
+        }
+
+    async def fake_stream_summarize(
+        text: str, *, title: Any, output_language: str, from_audio_transcript: bool = False
+    ):
+        yield "Summary."
+
+    monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
+    monkeypatch.setattr(runner_mod.transcribe, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(runner_mod.youtube, "fetch_video_metadata", fake_metadata)
+    monkeypatch.setattr(runner_mod.llm_summary, "stream_summarize", fake_stream_summarize)
+    monkeypatch.setattr(runner_mod, "_audio_dir", lambda: tmp_path)
+
+    q = WhisperQueue()
+    await q.put(
+        WhisperTask(job_id="job_generic_fill", url=job.url, cookies=[], page_text="unused"),
+    )
+
+    worker = asyncio.create_task(runner_mod.whisper_worker(q, fake_repo))
+    await _wait_until(lambda: q.snapshot() == (0, 0) and bool(fake_repo.done_calls))
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert fake_repo.failed_calls == []
+    done = fake_repo.done_calls[0]
+    assert done["title"] == "clip"
 
 
 @pytest.mark.asyncio
