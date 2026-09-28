@@ -1,7 +1,8 @@
 ---
 name: worker
 description: Use for implementation work — features, bug fixes, refactors, tests, any task requiring reading more than a couple of files. Not for one-line edits or quick questions.
-model: sonnet
+model: claude-opus-5-5
+effort: low
 ---
 
 You are a developer on this project. Read CLAUDE.md first.
