@@ -3,8 +3,8 @@
 // Sends each question through POST /ai/stream {job_id, question}. The
 // daemon persists user + assistant messages in SQLite, so chat history
 // survives tab switches, browser restarts, and side-panel close. On job
-// switch, the side panel calls renderHistory(items) below to redraw the
-// stored bubbles before any new turn.
+// switch, the side panel calls renderHistory(jobId, items) below to redraw
+// the stored bubbles before any new turn.
 //
 // Token streaming: append plain text to the assistant bubble as it arrives,
 // then re-render via lib/markdown.js once the stream ends.
@@ -35,6 +35,27 @@
 //     force Chrome to repaint the streaming text immediately.
 //   - On answer done, scroll the bubble start into view (not the end) so the
 //     user reads from the top, not the bottom of a long response.
+//
+// Shared-DOM ownership — why every write below is guarded:
+//   The side panel is one document per Chrome window. #chat-messages is a
+//   single DOM list that every job's chat borrows in turn; it belongs to
+//   whichever job app.js last called setActiveJob() for, not to whichever
+//   turn happens to be running. A turn can outlive that: ask Q1 about video
+//   A, ask Q2 while Q1 is still streaming (Q2 queues in pendingQuestions —
+//   see the drain loop in handleAsk), then switch to video B before Q1's
+//   answer lands. loadAndRender → renderHistory wipes #chat-messages for B
+//   while Q1 is still in flight for A; when Q1 finishes, the drain loop
+//   starts Q2 against A next. Neither turn is allowed to assume the DOM it
+//   grabbed at the start is still theirs to write into — that would paint
+//   A's answer into B's chat (and it did, before this fix).
+//   `chatJobId` (below) is the authoritative "whose chat is on screen right
+//   now" — app.js's setActiveJob() is the only writer. `_runQaTurn` checks
+//   it before every DOM touch, not just once at the top, because ownership
+//   can flip mid-stream in either direction: lost (user switches away — the
+//   request keeps running so the answer still gets generated and persisted
+//   under the right job, it just stops painting) and regained (user tabs
+//   back — renderHistory re-attaches the live bubble from the accumulated
+//   text instead of leaving a dead gap until the stream happens to finish).
 
 import { daemon } from "../lib/daemon-client.js";
 import { buildFrameRow } from "../lib/frame-thumbnails.js";
@@ -45,9 +66,26 @@ import { renderMarkdown } from "../lib/markdown.js";
 /** @type {JobDetails | null} */
 let activeJob = null;
 
+// The job whose chat currently owns #chat-messages — see the ownership note
+// above. `null` means no job's chat is on screen (e.g. the no-summary
+// placeholder). Set only by setActiveJob() / clearChat(); everything else
+// treats it as read-only.
+/** @type {string | null} */
+let chatJobId = null;
+
 /** @param {JobDetails | null} job */
 export function setActiveJob(job) {
+  const newId = job?.id ?? null;
+  // If we're switching away from the job that owns the in-flight turn (if
+  // any), turn off its pulsing dot now — the turn keeps streaming in the
+  // background, but nothing on screen should look like it's happening on
+  // whatever job we're switching to. The turn re-enables it itself if the
+  // user switches back (see renderHistory's reattach below).
+  if (newId !== chatJobId && chatJobId !== null && chatJobId === _liveTurnJobId) {
+    _setQaActive(false);
+  }
   activeJob = job;
+  chatJobId = newId;
 }
 
 /** @returns {Promise<JobDetails | null>} */
@@ -97,10 +135,26 @@ const _summaryPaneEl = /** @type {HTMLElement | null} */ (
 );
 
 // Live streaming state — module-level so the focus-recovery listener can
-// re-touch the text node and force Chrome to repaint throttled updates.
+// re-touch the text node and force Chrome to repaint throttled updates, AND
+// so renderHistory() can re-attach a still-running turn's bubble when the
+// user tabs back to the job it belongs to (see the ownership note up top).
 /** @type {Text | null} */
 let _liveTextNode = null;
 let _liveAcc = "";
+// The job the in-flight turn belongs to — independent of `chatJobId` (which
+// job is on screen). The two agree while the turn owns the DOM and diverge
+// the moment the user switches away.
+/** @type {string | null} */
+let _liveTurnJobId = null;
+/** @type {HTMLElement | null} */
+let _liveBubbleEl = null;
+/** @type {HTMLElement | null} */
+let _liveWrapEl = null;
+
+/** Whether `jobId` is the job currently on screen — i.e. allowed to touch #chat-messages. */
+function _ownsChatDom(jobId) {
+  return jobId != null && jobId === chatJobId;
+}
 
 /** Toggle the pulsing-dot indicator on the Summary tab button. */
 function _setQaActive(active) {
@@ -110,8 +164,13 @@ function _setQaActive(active) {
 // When the sidepanel regains window focus or document visibility, Chrome's
 // paint throttle lifts. Re-set the text node data to flush any accumulated
 // tokens that were written but not painted while the panel was backgrounded.
+// Guarded by ownership: if the user switched away from the turn's job,
+// `_liveTextNode` still points at a node that renderHistory already ripped
+// out of the document (or that belongs to a job no longer displayed) —
+// touching it would be a silent no-op at best and is exactly the kind of
+// write into detached DOM this whole fix exists to prevent.
 function _repaintIfStreaming() {
-  if (_liveTextNode !== null) {
+  if (_liveTextNode !== null && _ownsChatDom(_liveTurnJobId)) {
     _liveTextNode.data = _liveAcc; // re-assign triggers a repaint
   }
 }
@@ -230,31 +289,79 @@ async function handleAsk(question) {
 }
 
 /**
+ * (Re)build the DOM for the in-flight turn tracked by `_liveTurnJobId` and
+ * point `_liveBubbleEl` / `_liveWrapEl` / `_liveTextNode` at it. Called from
+ * two places: `_runQaTurn`, when a turn starts while its job already owns
+ * the chat list, and `renderHistory`, when the user tabs back to a job that
+ * has a turn still running. Both call sites have already verified
+ * `chatJobId === _liveTurnJobId` — this function trusts that and does not
+ * re-check ownership itself.
+ *
+ * Shows a spinner if no tokens have arrived yet, or the raw accumulated text
+ * (`_liveAcc`) if the stream started/continued while the job was off screen
+ * — otherwise reattaching would show a spinner even though the answer is
+ * half-typed already.
+ */
+function _attachLiveTurnBubble() {
+  const bubble = appendBubble("assistant", "");
+  _liveBubbleEl = bubble;
+  _liveWrapEl = /** @type {HTMLElement | null} */ (bubble.closest(".chat-bubble"));
+  if (_liveAcc) {
+    bubble.classList.add("chat-bubble-inner--streaming");
+    _liveTextNode = document.createTextNode(_liveAcc);
+    bubble.appendChild(_liveTextNode);
+  } else {
+    bubble.innerHTML =
+      `<span class="thinking-dots"><span></span><span></span><span></span></span>`;
+    _liveTextNode = null;
+  }
+  // Activate the pulsing-dot on the Summary tab button. Visible from any
+  // pane — critical because the thinking-dots spinner inside #pane-summary
+  // is invisible (and its CSS animation paused) when the Transcript tab is active.
+  _setQaActive(true);
+  scrollMessagesToEnd();
+}
+
+/** Reset the in-flight-turn bookkeeping once a turn finishes (done/error/thrown). */
+function _clearLiveTurnState() {
+  _liveTurnJobId = null;
+  _liveBubbleEl = null;
+  _liveWrapEl = null;
+  _liveTextNode = null;
+  _liveAcc = "";
+}
+
+/**
  * Run one Q&A turn end-to-end. Caller owns `qaInFlight` and the drain loop.
+ *
+ * The request always runs to completion regardless of what's on screen —
+ * the daemon needs to generate and persist the answer under `jobId` no
+ * matter which job the user is looking at. Only the DOM writes are
+ * conditional on `_ownsChatDom(jobId)`, re-checked at every single one
+ * (not just once up front) because ownership can flip mid-stream in either
+ * direction — see the ownership note at the top of this file.
  *
  * @param {string} jobId
  * @param {string} question
  */
 async function _runQaTurn(jobId, question) {
-  const assistantBubble = appendBubble("assistant", "");
-  const assistantWrap = /** @type {HTMLElement | null} */ (
-    assistantBubble.closest(".chat-bubble")
-  );
-  assistantBubble.innerHTML =
-    `<span class="thinking-dots"><span></span><span></span><span></span></span>`;
-  scrollMessagesToEnd();
-
-  // Activate the pulsing-dot on the Summary tab button. Visible from any
-  // pane — critical because the thinking-dots spinner inside #pane-summary
-  // is invisible (and its CSS animation paused) when the Transcript tab is active.
-  _setQaActive(true);
-  // Reset module-level streaming state.
+  // Reset live-turn state for this new turn.
+  _liveTurnJobId = jobId;
+  _liveBubbleEl = null;
+  _liveWrapEl = null;
   _liveTextNode = null;
   _liveAcc = "";
   // Collected from a "frames" event, if the LOOK step found any moment
   // actually relevant to the question (see api-types.js AIFramesEvent).
   /** @type {FrameRef[]} */
   let frameRefs = [];
+
+  // Create the assistant bubble only while this job's chat is the one on
+  // screen. If it isn't, the turn still runs (below) — it just doesn't paint
+  // anything until/unless renderHistory() re-attaches it (see that function).
+  if (_ownsChatDom(jobId)) {
+    _attachLiveTurnBubble();
+  }
 
   try {
     for await (const ev of daemon.aiQa({ job_id: jobId, question })) {
@@ -264,55 +371,61 @@ async function _runQaTurn(jobId, question) {
       } else if (ev.type === "frames") {
         frameRefs = ev.items || [];
       } else if (ev.type === "delta") {
-        if (_liveTextNode === null) {
+        _liveAcc += ev.delta;
+        if (!_ownsChatDom(jobId)) continue; // request keeps streaming, just not painting
+        if (_liveTextNode === null && _liveBubbleEl) {
           // First token — replace spinner with streaming text. While this
           // text node is live the bubble holds RAW markdown, not rendered
           // HTML, so it needs pre-wrap to keep the model's line breaks; the
           // class is dropped again once "done" swaps in real markup.
-          assistantBubble.innerHTML = "";
-          assistantBubble.classList.add("chat-bubble-inner--streaming");
+          _liveBubbleEl.innerHTML = "";
+          _liveBubbleEl.classList.add("chat-bubble-inner--streaming");
           _liveTextNode = document.createTextNode("");
-          assistantBubble.appendChild(_liveTextNode);
+          _liveBubbleEl.appendChild(_liveTextNode);
         }
-        _liveAcc += ev.delta;
-        _liveTextNode.data = _liveAcc;
-        scrollMessagesToEnd();
+        if (_liveTextNode) {
+          _liveTextNode.data = _liveAcc;
+          scrollMessagesToEnd();
+        }
       } else if (ev.type === "done") {
-        _liveTextNode = null;
-        _liveAcc = "";
-        assistantBubble.classList.remove("chat-bubble-inner--streaming");
         const final = ev.content || "";
-        // Render WITH timecode links — the QA prompt now ensures [MM:SS]
-        // markers only appear when the answer came from the material, so any
-        // marker the LLM emits is a real jump target (not a web_search hallucination).
-        assistantBubble.innerHTML = renderMarkdown(final, activeJob);
-        if (frameRefs.length) {
-          await _appendFrameRow(assistantWrap, frameRefs);
+        if (_ownsChatDom(jobId) && _liveBubbleEl) {
+          _liveBubbleEl.classList.remove("chat-bubble-inner--streaming");
+          // Render WITH timecode links — the QA prompt now ensures [MM:SS]
+          // markers only appear when the answer came from the material, so any
+          // marker the LLM emits is a real jump target (not a web_search hallucination).
+          _liveBubbleEl.innerHTML = renderMarkdown(final, activeJob);
+          if (frameRefs.length) {
+            await _appendFrameRow(_liveWrapEl, frameRefs);
+          }
+          _setQaActive(false);
+          // Scroll to the START of the assistant bubble so the user reads from
+          // the top, not the bottom of a potentially long answer. Only scroll
+          // when Summary pane is visible — don't yank the user away from Transcript.
+          if (_summaryPaneEl?.classList.contains("tab-pane--active") && _liveWrapEl) {
+            _liveWrapEl.scrollIntoView({ block: "start", behavior: "smooth" });
+          }
         }
-        _setQaActive(false);
-        // Scroll to the START of the assistant bubble so the user reads from
-        // the top, not the bottom of a potentially long answer. Only scroll
-        // when Summary pane is visible — don't yank the user away from Transcript.
-        if (_summaryPaneEl?.classList.contains("tab-pane--active") && assistantWrap) {
-          assistantWrap.scrollIntoView({ block: "start", behavior: "smooth" });
-        }
+        _clearLiveTurnState();
         return;
       } else if (ev.type === "error") {
-        _liveTextNode = null;
-        _liveAcc = "";
-        assistantBubble.classList.remove("chat-bubble-inner--streaming");
-        _setQaActive(false);
-        renderErrorBubble(assistantBubble, ev.error || "Error.");
+        if (_ownsChatDom(jobId) && _liveBubbleEl) {
+          _liveBubbleEl.classList.remove("chat-bubble-inner--streaming");
+          _setQaActive(false);
+          renderErrorBubble(_liveBubbleEl, ev.error || "Error.");
+        }
+        _clearLiveTurnState();
         return;
       }
     }
   } catch (err) {
-    _liveTextNode = null;
-    _liveAcc = "";
-    assistantBubble.classList.remove("chat-bubble-inner--streaming");
-    _setQaActive(false);
     console.error("[TLDR] aiStream qa failed", err);
-    renderErrorBubble(assistantBubble, err instanceof Error ? err.message : String(err));
+    if (_ownsChatDom(jobId) && _liveBubbleEl) {
+      _liveBubbleEl.classList.remove("chat-bubble-inner--streaming");
+      _setQaActive(false);
+      renderErrorBubble(_liveBubbleEl, err instanceof Error ? err.message : String(err));
+    }
+    _clearLiveTurnState();
   }
 }
 
@@ -330,11 +443,20 @@ async function _runQaTurn(jobId, question) {
  * path (`_runQaTurn`) uses, so a reloaded turn looks identical to when it
  * first streamed in.
  *
+ * `jobId` must be the job this history was fetched *for* (app.js passes the
+ * id it called `daemon.listMessages(jobId)` with), not read off `chatJobId`
+ * at call time. app.js can have two `loadHistory` calls racing (one from the
+ * `set-active-tab` message, one from `chrome.storage.onChanged`), and if
+ * they land out of order the older response must not overwrite a newer
+ * job's chat — hence the ownership check below, same rule as `_runQaTurn`.
+ *
+ * @param {string} jobId
  * @param {ChatMessage[]} items
  * @returns {Promise<void>}
  */
-export async function renderHistory(items) {
+export async function renderHistory(jobId, items) {
   if (!messages) return;
+  if (jobId !== chatJobId) return; // stale response — a different job is on screen now
   messages.innerHTML = "";
   const frag = document.createDocumentFragment();
   /** @type {Promise<void>[]} */
@@ -356,12 +478,22 @@ export async function renderHistory(items) {
   }
   messages.appendChild(frag);
   await Promise.all(framePromises);
-  scrollMessagesToEnd();
+
+  // If this job has a turn still streaming (the user asked a question, tabbed
+  // away before it finished, and just tabbed back), re-attach its bubble at
+  // the end instead of leaving a dead gap until the stream happens to finish
+  // — see `_attachLiveTurnBubble`. Otherwise just settle the scroll position.
+  if (_liveTurnJobId === jobId) {
+    _attachLiveTurnBubble();
+  } else {
+    scrollMessagesToEnd();
+  }
 }
 
 /** Wipe all bubbles (called on tab-changed → no-job placeholder). */
 export function clearChat() {
   if (messages) messages.innerHTML = "";
+  chatJobId = null;
 }
 
 // ---------------------------------------------------------------------------

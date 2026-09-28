@@ -224,9 +224,13 @@ lookup for the same article.
 Per Q&A turn: `chat.js` calls `daemon.aiStream({ job_id, question })` which
 (a) persists the user message, (b) streams answer tokens, (c) persists the
 assistant message. On job switch, `app.js` calls `daemon.listMessages(jobId)`
-and `chat.renderHistory(items)` — bubbles survive tab switches, browser
-restarts, side-panel close. No "clear chat" UI; deleting the Job from the
-Library drops its `Message` rows via FK cascade.
+and `chat.renderHistory(jobId, items)` — bubbles survive tab switches, browser
+restarts, side-panel close. `renderHistory` is a no-op if `jobId` is no longer
+the job on screen (guards against two racing `loadHistory` calls landing out
+of order) and re-attaches a still-streaming turn's bubble if one is in flight
+for that job — see the shared-DOM ownership note atop `chat.js`. No "clear
+chat" UI; deleting the Job from the Library drops its `Message` rows via FK
+cascade.
 
 ## In-flight badge — no polling
 

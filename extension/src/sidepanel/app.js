@@ -1644,10 +1644,10 @@ function abortActiveStream() {
 async function loadHistory(jobId) {
   try {
     const { items } = await daemon.listMessages(jobId);
-    renderHistory(items);
+    renderHistory(jobId, items);
   } catch (err) {
     console.warn("[TLDR] listMessages failed", err);
-    renderHistory([]);
+    renderHistory(jobId, []);
   }
 }
 
