@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import glob
 import json
 import logging
 import re
@@ -424,8 +425,37 @@ def _download_audio_sync(
         ydl_opts["http_headers"] = dict(http_headers)
 
     try:
+        # Resolve + select formats first (no download), so we can see whether
+        # the chosen format is a muxed HLS stream with no audio-only sibling.
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            probed = ydl.extract_info(url, download=False)
+        if probed is None:
+            raise RuntimeError(f"yt-dlp returned no info for {url}")
+
+        info: dict[str, Any] | None = None
+        if _needs_audio_only_download(probed):
+            # Let yt-dlp hand the m3u8 to ffmpeg (FFmpegFD) with output args
+            # that drop video: only the audio track is ever written to disk.
+            # FFmpegFD forwards http_headers (-headers), cookies (-cookies)
+            # and ffmpeg itself handles AES-128 keys, so nothing is lost.
+            audio_only_opts = {
+                **ydl_opts,
+                "external_downloader": {"m3u8": "ffmpeg"},
+                "external_downloader_args": {"ffmpeg_o": list(_AUDIO_ONLY_FFMPEG_OUT_ARGS)},
+            }
+            try:
+                with YoutubeDL(audio_only_opts) as ydl:
+                    info = ydl.process_ie_result(dict(probed), download=True)
+            except Exception as exc:  # noqa: BLE001 — never worse than before
+                log.warning(
+                    "audio-only HLS download failed for %s (%s); falling back to full download",
+                    url, exc,
+                )
+                _remove_partials(dir, probed.get("id"))
+                info = None
+        if info is None:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.process_ie_result(dict(probed), download=True)
 
         if info is None:
             raise RuntimeError(f"yt-dlp returned no info for {url}")
@@ -467,6 +497,49 @@ def _download_audio_sync(
                 cookie_path.unlink(missing_ok=True)
             except OSError:
                 log.warning("failed to unlink cookie file %s", cookie_path)
+
+
+# Output args appended to yt-dlp's FFmpegFD command for the audio-only branch.
+# FFmpegFD already emits ``-c copy`` and the container (``-f mp4`` for HLS);
+# these keep just the first audio stream and drop video.
+_AUDIO_ONLY_FFMPEG_OUT_ARGS = ("-vn", "-map", "0:a:0")
+
+_HLS_PROTOCOLS = frozenset({"m3u8", "m3u8_native"})
+
+
+def _has_codec(value: Any) -> bool:
+    return bool(value != "none")
+
+
+def _needs_audio_only_download(info: dict[str, Any]) -> bool:
+    """True when the selected format is a muxed HLS stream (video + audio) and
+    the media offers no audio-only format at all.
+
+    Then yt-dlp's fallback would write the whole video to disk before
+    extracting audio; we instead let ffmpeg drop video while downloading.
+    Unknown vcodec (``None``, a master without ``CODECS``) counts as "may have
+    video" — ``-map 0:a:0`` is harmless on an audio-only stream. A known
+    ``acodec == "none"`` (video-only) never qualifies.
+    """
+    if info.get("requested_formats"):
+        return False  # video+audio merge — a separate audio format exists
+    if info.get("protocol") not in _HLS_PROTOCOLS:
+        return False
+    if not _has_codec(info.get("vcodec")) or not _has_codec(info.get("acodec")):
+        return False
+    for fmt in info.get("formats") or []:
+        if fmt.get("vcodec") == "none" and _has_codec(fmt.get("acodec")):
+            return False
+    return True
+
+
+def _remove_partials(dir: Path, media_id: Any) -> None:
+    """Drop leftovers of a failed attempt (``<id>.mp4.part`` etc.)."""
+    if not media_id:
+        return
+    for p in dir.glob(f"{glob.escape(str(media_id))}.*"):
+        with contextlib.suppress(OSError):
+            p.unlink()
 
 
 async def download_audio(

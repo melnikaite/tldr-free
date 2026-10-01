@@ -15,6 +15,7 @@ import {
   lookupFrameTabs,
   pruneFrameTab,
   debugEntry,
+  shouldDebugRecord,
   pushDebug,
   summarizeDebug,
 } from "../src/lib/stream-sniff.js";
@@ -201,4 +202,12 @@ test("pushDebug keeps the newest cap entries; summarizeDebug renders lines", () 
   const lines = summarizeDebug(ring);
   assert.equal(lines.length, 3);
   assert.match(lines[2], /\[sw\] h\/4/);
+});
+
+test("shouldDebugRecord: only service-worker or sub-frame requests", () => {
+  assert.equal(shouldDebugRecord({ frameId: 0, viaSW: false }), false);
+  assert.equal(shouldDebugRecord({ frameId: 3, viaSW: false }), true);
+  assert.equal(shouldDebugRecord({ frameId: -1, viaSW: true }), true);
+  assert.equal(shouldDebugRecord({ frameId: 0, viaSW: true }), true);
+  assert.equal(shouldDebugRecord({ frameId: undefined, viaSW: false }), false);
 });

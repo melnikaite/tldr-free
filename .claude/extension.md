@@ -111,7 +111,9 @@ info, so it can be misattributed until the other tab's frame reloads).
 Pure helpers: `recordFrame`/`lookupFrameTabs`/`pruneFrameTab`.
 
 **Debug ring.** Requests `classifyStream` rejected (xhr/media/other, minus
-images/fonts/css/js) go to `chrome.storage.session["sniffdbg:<tabId>"]`
+images/fonts/css/js) from player contexts only — service-worker requests
+(`viaSW`) or sub-frames (`frameId > 0`); top-frame requests are dropped by a
+sync check before attribution or storage access (`shouldDebugRecord`) — go to `chrome.storage.session["sniffdbg:<tabId>"]`
 (newest 40, `{host, pathTail, ext, contentType, status, viaSW, ts}`, never
 the query string), cleared together with `sniff:`. When `handleExtractedPage`
 falls back to a page job, it `console.info`s that ring and the sniff list.

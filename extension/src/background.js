@@ -12,6 +12,7 @@ import { setPanelBehavior, openSidePanel } from "./lib/browser-compat.js";
 import {
   classifyStream,
   debugEntry,
+  shouldDebugRecord,
   headerValue,
   lookupFrameTabs,
   pickSniffedMedia,
@@ -235,10 +236,13 @@ async function onSniffHeadersReceived(details) {
   // requesting origin, good enough to derive Origin/Referer fallbacks.
   const d = /** @type {{documentUrl?: string}} */ (details);
   const viaSW = details.tabId < 0;
-  const tabId = viaSW ? await attributeSwRequest(details) : details.tabId;
-  if (tabId === null) return;
   const contentType = headerValue(details.responseHeaders, "Content-Type");
   const kind = classifyStream(details.url, contentType);
+  // Cheap, sync gate: rejected top-frame requests never reach the debug ring,
+  // so skip attribution and storage entirely for them.
+  if (!kind && !shouldDebugRecord({ frameId: details.frameId, viaSW })) return;
+  const tabId = viaSW ? await attributeSwRequest(details) : details.tabId;
+  if (tabId === null) return;
   const now = Date.now();
   if (!kind) {
     const dbg = debugEntry(details.url, contentType, details.statusCode, viaSW, now);

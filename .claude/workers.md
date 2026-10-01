@@ -225,6 +225,19 @@ is in-memory only for the same reason, like cookies. It reaches yt-dlp's
 download — and only when yt-dlp is fed `media_url` itself, not the page URL.
 They are ALSO persisted (`Job.media_headers_json`, v13) for frame fetches.
 
+**Audio-only download of muxed HLS (`youtube._download_audio_sync`).**
+yt-dlp first resolves + selects formats with `download=False`. If the
+selected format is HLS with (possibly) video and audio and NO audio-only
+format exists (`_needs_audio_only_download`), the download goes through
+yt-dlp's `FFmpegFD` (`external_downloader={"m3u8": "ffmpeg"}`) with
+`ffmpeg_o` args `-vn -map 0:a:0` (on top of FFmpegFD's `-c copy`), so the
+multi-GB video track never hits disk. FFmpegFD still passes headers
+(`-headers`) and cookies (`-cookies`); ffmpeg does AES-128 itself. Any
+failure there deletes `<id>.*` leftovers and reruns the normal yt-dlp
+download. YouTube / anything with an audio-only format is unaffected;
+frames (`workers/frames.py`) don't use this path. Covered by
+`tests/workers/test_audio_only_hls.py` (synthetic encrypted HLS on localhost).
+
 **Sniffed streams (`workers/stream_resolve.py`).** When the extension
 sends `sniffed_streams`, `pipeline._resolve_sniffed` runs first in
 `_run_media`: it fetches the sniffed HLS playlists (most recent 30, 2 MB

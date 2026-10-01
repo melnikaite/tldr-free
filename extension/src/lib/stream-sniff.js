@@ -316,6 +316,17 @@ export function pruneFrameTab(map, tabId) {
 
 export const SNIFF_DEBUG_CAP = 40;
 
+/**
+ * Whether a rejected request belongs in the debug ring: only player contexts,
+ * i.e. service-worker requests or sub-frames. Top-frame (frameId 0) never.
+ *
+ * @param {{frameId?: number, viaSW: boolean}} req
+ * @returns {boolean}
+ */
+export function shouldDebugRecord({ frameId, viaSW }) {
+  return viaSW || (typeof frameId === "number" && frameId > 0);
+}
+
 const DEBUG_NOISE_EXTS = new Set([
   "jpg", "jpeg", "png", "webp", "gif", "svg", "ico", "avif", "bmp",
   "woff", "woff2", "ttf", "otf", "eot", "css", "js", "mjs", "map",
