@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -120,6 +120,20 @@ class MediaCandidate(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+SNIFFED_STREAMS_MAX = 100
+SNIFFED_URL_MAX_LEN = 4096
+
+
+class SniffedStream(BaseModel):
+    """One network request the extension recorded for the tab: a streaming
+    manifest (``hls``/``dash``; for HLS that can be the master OR any
+    rendition playlist) or a direct subtitle file. Times are ms epoch."""
+    url: str
+    kind: Literal["hls", "dash", "subtitle"]
+    first_seen: float
+    last_seen: float
+
+
 class JobCreateRequest(BaseModel):
     url: str
     kind: Literal["page", "youtube", "media", "pdf", "auto"] = "auto"
@@ -143,6 +157,83 @@ class JobCreateRequest(BaseModel):
     # the daemon fetches the URL with the cookies below.
     pdf_bytes_b64: str | None = None
     cookies: list[Cookie] | None = None
+    # Request headers the browser sent when the page's player fetched
+    # ``media_url`` — set by the extension's network sniffer for streams it
+    # found via webRequest (player in a cross-origin iframe), where the CDN
+    # typically refuses requests without the player frame's Referer/Origin.
+    # Allow-listed to MEDIA_HEADER_ALLOWLIST (anything else is dropped, so
+    # this can't smuggle Cookie/Authorization past the cookies field) and
+    # forwarded to yt-dlp as ``http_headers``. Like cookies: lives only for
+    # the request's pipeline run, never persisted.
+    media_headers: dict[str, str] | None = None
+    # Every HLS/DASH manifest and subtitle file the extension's network
+    # sniffer saw the tab fetch (see extension/src/lib/stream-sniff.js).
+    # The extension can't tell a master playlist from a rendition one
+    # without the body, so ``media_url`` is only its best guess; the daemon
+    # fetches these playlists and picks the actual master, the audio
+    # rendition and the subtitle track the user last switched to (see
+    # workers/stream_resolve.py). Only meaningful for kind=media. Trimmed to
+    # SNIFFED_STREAMS_MAX (most recently seen kept), http(s) URLs only.
+    sniffed_streams: list[SniffedStream] | None = None
+
+    @field_validator("sniffed_streams")
+    @classmethod
+    def _trim_sniffed_streams(
+        cls, v: list[SniffedStream] | None
+    ) -> list[SniffedStream] | None:
+        if not v:
+            return None
+        kept = [
+            s for s in v
+            if s.url.lower().startswith(("http://", "https://"))
+            and len(s.url) <= SNIFFED_URL_MAX_LEN
+        ]
+        kept.sort(key=lambda s: s.last_seen)
+        return kept[-SNIFFED_STREAMS_MAX:] or None
+
+    @field_validator("media_headers")
+    @classmethod
+    def _allowlist_media_headers(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return sanitize_media_headers(v)
+
+
+# Canonical casing of the only headers ``media_headers`` may carry.
+MEDIA_HEADER_ALLOWLIST: dict[str, str] = {
+    "referer": "Referer",
+    "origin": "Origin",
+    "user-agent": "User-Agent",
+}
+MEDIA_HEADER_MAX_LEN = 2048
+
+
+def sanitize_media_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
+    """Keep only allow-listed headers (case-insensitive, canonical casing),
+    drop empty values and anything with CR/LF, cap value length. Returns
+    ``None`` when nothing survives."""
+    if not headers:
+        return None
+    out: dict[str, str] = {}
+    for name, value in headers.items():
+        canonical = MEDIA_HEADER_ALLOWLIST.get(str(name).strip().lower())
+        if canonical is None or not isinstance(value, str):
+            continue
+        value = value.strip()[:MEDIA_HEADER_MAX_LEN]
+        if not value or "\r" in value or "\n" in value:
+            continue
+        out[canonical] = value
+    return out or None
+
+
+class MediaSelection(BaseModel):
+    """Which renditions ``workers/stream_resolve.py`` chose for a sniffed
+    stream. Every field optional: a master without EXT-X-MEDIA audio has no
+    audio choice, a page without subtitles has no subtitle choice."""
+    audio_name: str | None = None
+    audio_language: str | None = None
+    subtitle_name: str | None = None
+    subtitle_language: str | None = None
+    # True when the subtitle track (not ASR) became the transcript.
+    subtitles_used: bool = False
 
 
 class JobCreateResponse(BaseModel):
@@ -338,6 +429,10 @@ class JobDetails(JobSummary):
     # one candidate. Backfilled as ``[]`` for legacy jobs created before
     # this field existed.
     alt_media_candidates: list[MediaCandidate] = []
+    # What the daemon picked out of the extension's sniffed streams for a
+    # kind=media job (audio dub, subtitle track used as the transcript) —
+    # None when nothing was sniffed or no choice was made.
+    media_selection: MediaSelection | None = None
     # Mirrors Job.queued_reason (storage/db.py). Only meaningful when
     # status == "queued" — one of DeferredReason's three codes explaining
     # why the transcript fast path deferred this job to the Whisper queue.

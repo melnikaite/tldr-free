@@ -199,6 +199,7 @@ async def _process_one(
     task_job_id: str,
     repo_module: object,
     task_page_text: str | None = None,
+    task_http_headers: dict[str, str] | None = None,
 ) -> None:
     """Process a single task. Raises on any failure — caller handles ``mark_failed``.
 
@@ -274,6 +275,7 @@ async def _process_one(
             if is_media:
                 metadata = await youtube.fetch_video_metadata(
                     url=task_url, cookies=task_cookies, scratch_dir=_audio_dir(),
+                    http_headers=task_http_headers,
                 )
                 metadata_fetched = True
                 known_duration = _known_duration(metadata.get("duration"))
@@ -333,6 +335,7 @@ async def _process_one(
                 url=task_url,
                 cookies=task_cookies,
                 dir=_audio_dir(),
+                http_headers=task_http_headers,
             )
             download_succeeded = True
             try:
@@ -524,6 +527,7 @@ async def _process_one(
         if not metadata_fetched:
             metadata = await youtube.fetch_video_metadata(
                 url=task_url, cookies=task_cookies, scratch_dir=_audio_dir(),
+                http_headers=task_http_headers,
             )
         meta_title = metadata.get("title")
         if isinstance(meta_title, str) and meta_title.strip():
@@ -614,6 +618,14 @@ async def _process_one(
             summary_md=summary,
             transcript_source=TranscriptSource.WHISPER.value,
             title=title,
+            # Real media duration (yt-dlp info, else ffprobe of the file) —
+            # unless the sniffed-stream resolver already stored the HLS
+            # playlist's EXTINF sum, which wins (see stream_resolve).
+            duration_seconds=(
+                round(audio_duration)
+                if audio_duration and getattr(job, "duration_seconds", None) is None
+                else None
+            ),
             video_id=video_id,
             transcript_language=whisper_language,
             raw_segments_json=raw_segments_json,
@@ -674,6 +686,7 @@ async def whisper_worker(queue: WhisperQueue, repo_module: object) -> None:
                 task_job_id=task.job_id,
                 repo_module=repo_module,
                 task_page_text=task.page_text,
+                task_http_headers=task.http_headers,
             )
         except asyncio.CancelledError:
             log.info("whisper worker cancelled")

@@ -45,7 +45,7 @@ from src.llm import languages
 from src.llm import summary as llm_summary
 from src.llm import vision as llm_vision
 from src.storage import repo
-from src.workers import deixis, page, timecodes, youtube
+from src.workers import deixis, page, stream_resolve, timecodes, youtube
 from src.workers import frames as frames_mod
 from src.workers import pdf as pdf_worker
 from src.workers.broker import (
@@ -110,6 +110,8 @@ async def run_pipeline(
     media_url: str | None,
     pdf_bytes: bytes | None,
     cookies: list[Any],
+    media_headers: dict[str, str] | None = None,
+    sniffed_streams: list[Any] | None = None,
 ) -> None:
     """Top-level pipeline runner. Decides the path based on kind + extraction.
 
@@ -147,6 +149,8 @@ async def run_pipeline(
                 page_title=page_title,
                 page_text=page_text,
                 cookies=cookies,
+                media_headers=media_headers,
+                sniffed_streams=sniffed_streams,
             )
         elif kind == JobKind.PDF:
             await _run_pdf(
@@ -360,6 +364,9 @@ async def _finish_caption_fast_path(
     video_id: str | None,
     page_title: str | None,
     cfg: Any,
+    transcript_language: str | None = None,
+    http_headers: dict[str, str] | None = None,
+    media_duration: float | None = None,
 ) -> None:
     """Build [MM:SS]-marked text, resolve title/language, persist, summarize.
 
@@ -368,6 +375,11 @@ async def _finish_caption_fast_path(
     whether those segments came from youtube-transcript-api, yt-dlp captions
     on YouTube, or yt-dlp captions on a generic site. ``video_id`` is
     YouTube-only (``None`` for generic media); nothing here branches on it.
+    ``transcript_language`` is the caption track's own language when the
+    caller knows it (sniffed subtitle renditions); it beats yt-dlp's
+    metadata, which describes the audio, not these captions.
+    ``media_duration`` (HLS EXTINF sum for sniffed streams) beats yt-dlp's
+    duration; the caption timing itself is never used as the duration.
     """
     broker = get_broker()
 
@@ -405,6 +417,7 @@ async def _finish_caption_fast_path(
     # title only if the probe fails.
     metadata = await youtube.fetch_video_metadata(
         url=url, cookies=cookies, scratch_dir=_subtitles_dir(),
+        http_headers=http_headers,
     )
     title = metadata.get("title") or page_title
     # yt-dlp's metadata probe already returns the video's primary language
@@ -413,7 +426,8 @@ async def _finish_caption_fast_path(
     # because the caption track we picked may differ (e.g. auto-translated
     # captions in another language). Best-effort only — None falls through
     # cleanly and the UI shows "Original".
-    transcript_language = languages.short_lang_code(metadata.get("language"))
+    if transcript_language is None:
+        transcript_language = languages.short_lang_code(metadata.get("language"))
     # Last resort when metadata carries no language: guess from the captions.
     if transcript_language is None:
         transcript_language = languages.detect_language(raw_text)
@@ -439,7 +453,106 @@ async def _finish_caption_fast_path(
         raw_segments_json=raw_segments_json,
         cfg=cfg,
         cookies=cookies,
+        duration_seconds=media_duration or _known_float(metadata.get("duration")),
     )
+
+
+def _known_float(value: Any) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+async def _resolve_sniffed(
+    job_id: str,
+    *,
+    sniffed_streams: list[Any],
+    media_url: str,
+    media_headers: dict[str, str] | None,
+    cookies: list[Any],
+    page_title: str | None,
+    cfg: Any,
+) -> str | None:
+    """Resolve sniffed streams (see workers/stream_resolve.py), persist the
+    choice, and finish the job from subtitles when they cover the media.
+
+    Returns the URL the rest of ``_run_media`` should download (audio
+    rendition playlist, master, or the extension's ``media_url``), or
+    ``None`` when the job was already finished from subtitles. Never
+    raises: any resolution failure just keeps ``media_url``.
+    """
+    try:
+        res = await stream_resolve.resolve(
+            sniffed_streams, default_url=media_url, headers=media_headers, cookies=cookies,
+        )
+    except Exception:
+        log.exception("job %s: sniffed stream resolution failed", job_id)
+        return media_url
+    log.info(
+        "job %s: sniffed streams resolved — master=%s download=%s audio=%r/%r "
+        "subtitle=%s (%r/%r) duration=%s",
+        job_id, res.master_url, res.download_url,
+        res.audio.name if res.audio else None,
+        res.audio.language if res.audio else None,
+        res.subtitle.url if res.subtitle else None,
+        res.subtitle.name if res.subtitle else None,
+        res.subtitle.language if res.subtitle else None,
+        res.duration,
+    )
+
+    def _persist(subtitles_used: bool) -> None:
+        try:
+            repo.set_media_resolution(
+                job_id,
+                media_frame_url=res.master_url or res.download_url,
+                duration_seconds=round(res.duration) if res.duration else None,
+                media_selection_json=json.dumps(
+                    res.selection(subtitles_used=subtitles_used),
+                    ensure_ascii=False, separators=(",", ":"),
+                ),
+            )
+        except Exception:
+            log.exception("job %s: persisting media resolution failed", job_id)
+
+    if res.subtitle is not None:
+        broker = get_broker()
+        broker.publish(job_id, stage_event("fetching_captions"))
+        try:
+            segments = await stream_resolve.fetch_subtitle_segments(
+                res.subtitle, res, headers=media_headers, cookies=cookies,
+            )
+        except Exception:
+            log.exception("job %s: sniffed subtitle fetch failed", job_id)
+            segments = None
+        if stream_resolve.subtitles_cover(segments, res.duration):
+            assert segments is not None
+            log.info(
+                "job %s: using %d sniffed subtitle cues as the transcript",
+                job_id, len(segments),
+            )
+            _persist(subtitles_used=True)
+            await _finish_caption_fast_path(
+                job_id,
+                url=res.download_url,
+                cookies=cookies,
+                segments=segments,
+                transcript_source=TranscriptSource.SITE_CAPTIONS,
+                video_id=None,
+                page_title=page_title,
+                cfg=cfg,
+                transcript_language=res.subtitle.language,
+                http_headers=media_headers,
+                media_duration=res.duration,
+            )
+            return None
+        log.info(
+            "job %s: sniffed subtitles too short/empty (%d cues, media %ss) — ASR",
+            job_id, len(segments or []), res.duration,
+        )
+    _persist(subtitles_used=False)
+    return res.download_url
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +606,8 @@ async def _run_media(
     page_title: str | None,
     page_text: str | None,
     cookies: list[Any],
+    media_headers: dict[str, str] | None = None,
+    sniffed_streams: list[Any] | None = None,
 ) -> None:
     broker = get_broker()
     cfg = get_config()
@@ -502,6 +617,23 @@ async def _run_media(
 
     # Pause checkpoint before the caption probe.
     await _checkpoint_pause(job_id, broker, "extracting")
+
+    # Network-sniffed streams (player in a cross-origin iframe): pick the
+    # master / audio dub / subtitle track the user last switched to, and
+    # use a subtitle track as the transcript when it's complete enough.
+    if sniffed_streams:
+        download_url = await _resolve_sniffed(
+            job_id,
+            sniffed_streams=sniffed_streams,
+            media_url=media_url,
+            media_headers=media_headers,
+            cookies=cookies,
+            page_title=page_title,
+            cfg=cfg,
+        )
+        if download_url is None:
+            return  # finished from the subtitle track
+        media_url = download_url
 
     # Resolve which URL to hand yt-dlp — see the block comment above.
     source_url = media_url
@@ -522,6 +654,9 @@ async def _run_media(
         "job %s: media source resolved to %s (page_url=%s, media_url=%s, extractor=%s)",
         job_id, source_url, url, media_url, probe_extractor,
     )
+    # The sniffed player headers belong to ``media_url``'s CDN; when a
+    # dedicated extractor takes the page URL instead, let it build its own.
+    http_headers = media_headers if source_url == media_url else None
 
     broker.publish(job_id, stage_event("fetching_captions"))
     try:
@@ -542,6 +677,7 @@ async def _run_media(
             # case for nothing. Real transient failures (exceptions) still
             # retry up to max_attempts regardless of this flag.
             retry_on_no_track=False,
+            http_headers=http_headers,
         )
     except Exception:
         log.exception("caption probe failed for media job %s", job_id)
@@ -568,7 +704,10 @@ async def _run_media(
     # as always.
     try:
         await get_queue().put(
-            WhisperTask(job_id=job_id, url=source_url, cookies=cookies, page_text=page_text)
+            WhisperTask(
+                job_id=job_id, url=source_url, cookies=cookies, page_text=page_text,
+                http_headers=http_headers,
+            )
         )
     except Exception as exc:
         log.exception("failed to enqueue media job %s", job_id)
@@ -881,6 +1020,7 @@ async def _summarize_and_finish(
     raw_segments_json: str | None = None,
     cfg: Any,
     cookies: list[Any],
+    duration_seconds: float | None = None,
 ) -> None:
     """Run streaming summarization and mark the job done.
 
@@ -1013,6 +1153,9 @@ async def _summarize_and_finish(
         summary_md=summary_md,
         transcript_source=transcript_source.value,
         title=title,
+        # Media duration, never derived from transcript/caption timing —
+        # the side panel matches it against the page's <video>.
+        duration_seconds=round(duration_seconds) if duration_seconds else None,
         video_id=video_id,
         transcript_language=transcript_language,
         raw_segments_json=raw_segments_json,

@@ -77,6 +77,7 @@ def create_job(
     progress_stage: str | None = None,
     alt_media_candidates_json: str | None = None,
     media_url: str | None = None,
+    media_headers_json: str | None = None,
 ) -> Job:
     """Insert a fresh Job row in ``status='running'`` and return it.
 
@@ -103,6 +104,7 @@ def create_job(
         progress_stage=progress_stage,
         alt_media_candidates_json=alt_media_candidates_json,
         media_url=media_url,
+        media_headers_json=media_headers_json,
         created_at=now,
         added_at=now,
         updated_at=now,
@@ -520,6 +522,30 @@ def set_audio(
         if audio_duration_seconds is not None or audio_path is None:
             job.audio_duration_seconds = audio_duration_seconds
         job.updated_at = now
+        session.add(job)
+
+
+def set_media_resolution(
+    job_id: str,
+    *,
+    media_frame_url: str | None,
+    media_selection_json: str | None,
+    duration_seconds: int | None = None,
+) -> None:
+    """Persist what ``workers/stream_resolve.py`` picked for a sniffed
+    stream (migration v13): the URL frame fetches should use and the chosen
+    audio/subtitle renditions. Does NOT emit a job event — the next
+    status/extracted update publishes the row anyway.
+    """
+    with session_scope() as session:
+        job = session.get(Job, job_id)
+        if job is None:
+            raise KeyError(f"Job {job_id} not found")
+        job.media_frame_url = media_frame_url
+        job.media_selection_json = media_selection_json
+        if duration_seconds is not None:
+            job.duration_seconds = duration_seconds
+        job.updated_at = utcnow()
         session.add(job)
 
 

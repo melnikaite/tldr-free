@@ -9,6 +9,19 @@ import { getCookiesForDomain, getCookiesForUrl } from "./lib/cookies.js";
 import { normalizeUrl } from "./lib/url.js";
 import { stringifyError } from "./lib/utils.js";
 import { setPanelBehavior, openSidePanel } from "./lib/browser-compat.js";
+import {
+  classifyStream,
+  debugEntry,
+  headerValue,
+  lookupFrameTabs,
+  pickSniffedMedia,
+  pruneFrameTab,
+  pushDebug,
+  recordFrame,
+  summarizeDebug,
+  toSniffedStreams,
+  upsertStream,
+} from "./lib/stream-sniff.js";
 
 /** @import {
  *   JobCreateRequest,
@@ -42,6 +55,250 @@ chrome.runtime.onInstalled.addListener(() => {
   // (No-op on Firefox — see lib/browser-compat.js.)
   setPanelBehavior().catch(console.error);
 });
+
+// ---------------------------------------------------------------------------
+// Network stream sniffer. Players inside cross-origin iframes (hls.js /
+// MediaSource, blob: src) are invisible to the content script, but their
+// manifests cross the network. Record HLS/DASH manifests and subtitle files
+// per tab so handleExtractedPage can fall back to a media job. Listeners are
+// registered at top level so a request wakes the service worker; the lists
+// live in chrome.storage.session to survive SW sleep.
+// ---------------------------------------------------------------------------
+
+const SNIFF_KEY_PREFIX = "sniff:";
+const SNIFF_TYPES = /** @type {chrome.webRequest.ResourceType[]} */ ([
+  "xmlhttprequest",
+  "media",
+  "other",
+]);
+
+/** @param {number} tabId */
+const sniffKey = (tabId) => `${SNIFF_KEY_PREFIX}${tabId}`;
+/** @param {number} tabId */
+const sniffDebugKey = (tabId) => `sniffdbg:${tabId}`;
+const FRAME_ORIGINS_KEY = "sniffFrames";
+
+// requestId → request headers seen in onSendHeaders, consumed by
+// onHeadersReceived (which is where the Content-Type and status are known).
+// In memory only: both events fire within one request, and a lost entry
+// just means a record without Referer/Origin (mediaHeadersFor falls back).
+/** @type {Map<string, {referer: string|null, origin: string|null, userAgent: string|null}>} */
+const pendingRequestHeaders = new Map();
+
+// Serialise read-modify-write of each tab's list — manifests and subtitle
+// files often arrive in bursts.
+/** @type {Map<number, Promise<void>>} */
+const sniffWriteChains = new Map();
+
+/**
+ * @param {number} tabId
+ * @param {(list: import("./lib/stream-sniff.js").SniffedStream[]) => import("./lib/stream-sniff.js").SniffedStream[] | null} update
+ *   returns the new list, or null to delete the key
+ */
+function updateSniffed(tabId, update) {
+  const prev = sniffWriteChains.get(tabId) || Promise.resolve();
+  const next = prev
+    .then(async () => {
+      const key = sniffKey(tabId);
+      const stored = await chrome.storage.session.get(key);
+      const list = update(stored[key] || []);
+      if (list === null) await chrome.storage.session.remove(key);
+      else await chrome.storage.session.set({ [key]: list });
+    })
+    .catch((err) => console.warn("[TLDR] sniff store", err))
+    .finally(() => {
+      if (sniffWriteChains.get(tabId) === next) sniffWriteChains.delete(tabId);
+    });
+  sniffWriteChains.set(tabId, next);
+  return next;
+}
+
+/**
+ * Debug ring of rejected requests per tab (see "Network stream sniffing" in
+ * .claude/extension.md). Shares the per-tab write chain with the sniff list.
+ *
+ * @param {number} tabId
+ * @param {(ring: import("./lib/stream-sniff.js").SniffDebugEntry[]) => import("./lib/stream-sniff.js").SniffDebugEntry[] | null} update
+ */
+function updateSniffDebug(tabId, update) {
+  const prev = sniffWriteChains.get(tabId) || Promise.resolve();
+  const next = prev
+    .then(async () => {
+      const key = sniffDebugKey(tabId);
+      const stored = await chrome.storage.session.get(key);
+      const ring = update(stored[key] || []);
+      if (ring === null) await chrome.storage.session.remove(key);
+      else await chrome.storage.session.set({ [key]: ring });
+    })
+    .catch((err) => console.warn("[TLDR] sniff debug store", err))
+    .finally(() => {
+      if (sniffWriteChains.get(tabId) === next) sniffWriteChains.delete(tabId);
+    });
+  sniffWriteChains.set(tabId, next);
+  return next;
+}
+
+/** @param {number} tabId */
+function clearSniffed(tabId) {
+  updateSniffed(tabId, () => null);
+  updateSniffDebug(tabId, () => null);
+}
+
+// Frame origin → tabs hosting a frame of that origin (most recent first).
+// Lets us attribute service-worker requests (tabId -1) — some players
+// register their own SW and fetch playlists from it. In memory for speed,
+// mirrored to chrome.storage.session because the extension SW sleeps.
+/** @type {import("./lib/stream-sniff.js").FrameOriginMap | null} */
+let frameOrigins = null;
+/** @type {Promise<import("./lib/stream-sniff.js").FrameOriginMap> | null} */
+let frameOriginsLoad = null;
+/** @type {Promise<void>} */
+let frameOriginsWrite = Promise.resolve();
+
+/** @returns {Promise<import("./lib/stream-sniff.js").FrameOriginMap>} */
+function loadFrameOrigins() {
+  if (frameOrigins) return Promise.resolve(frameOrigins);
+  frameOriginsLoad ||= chrome.storage.session
+    .get(FRAME_ORIGINS_KEY)
+    .then((stored) => {
+      frameOrigins ||= stored[FRAME_ORIGINS_KEY] || {};
+      return /** @type {import("./lib/stream-sniff.js").FrameOriginMap} */ (frameOrigins);
+    })
+    .catch(() => (frameOrigins ||= {}));
+  return frameOriginsLoad;
+}
+
+/** @param {(map: import("./lib/stream-sniff.js").FrameOriginMap) => import("./lib/stream-sniff.js").FrameOriginMap} update */
+function updateFrameOrigins(update) {
+  frameOriginsWrite = frameOriginsWrite
+    .then(async () => {
+      const map = update(await loadFrameOrigins());
+      frameOrigins = map;
+      await chrome.storage.session.set({ [FRAME_ORIGINS_KEY]: map });
+    })
+    .catch((err) => console.warn("[TLDR] frame origins store", err));
+}
+
+/**
+ * Tab a service-worker request (tabId -1) belongs to: the most recently
+ * seen still-open tab hosting a frame with the request's origin.
+ *
+ * @param {{initiator?: string, documentUrl?: string}} details
+ * @returns {Promise<number | null>}
+ */
+async function attributeSwRequest(details) {
+  const origin = details.documentUrl || details.initiator;
+  if (!origin) return null;
+  await frameOriginsWrite;
+  for (const tabId of lookupFrameTabs(await loadFrameOrigins(), origin)) {
+    try {
+      await chrome.tabs.get(tabId);
+      return tabId;
+    } catch {
+      // Tab is gone (onRemoved missed while the SW slept) — try the next.
+    }
+  }
+  return null;
+}
+
+/** @param {number} tabId @returns {Promise<import("./lib/stream-sniff.js").SniffedStream[]>} */
+async function getSniffed(tabId) {
+  await sniffWriteChains.get(tabId);
+  const key = sniffKey(tabId);
+  const stored = await chrome.storage.session.get(key);
+  return stored[key] || [];
+}
+
+/** @param {chrome.webRequest.WebRequestHeadersDetails} details */
+function onSniffSendHeaders(details) {
+  // tabId -1 (service-worker requests) is kept too: the requestId pairs it
+  // with onHeadersReceived, which does the tab attribution.
+  // Can't classify yet (Content-Type comes with the response), so keep
+  // every request's headers until onHeadersReceived/onErrorOccurred.
+  pendingRequestHeaders.set(details.requestId, {
+    referer: headerValue(details.requestHeaders, "Referer"),
+    origin: headerValue(details.requestHeaders, "Origin"),
+    userAgent: headerValue(details.requestHeaders, "User-Agent"),
+  });
+  // Safety valve for requests that never reach onHeadersReceived.
+  if (pendingRequestHeaders.size > 500) {
+    const oldest = pendingRequestHeaders.keys().next().value;
+    if (oldest !== undefined) pendingRequestHeaders.delete(oldest);
+  }
+}
+
+/** @param {chrome.webRequest.WebResponseHeadersDetails} details */
+async function onSniffHeadersReceived(details) {
+  const sent = pendingRequestHeaders.get(details.requestId) || null;
+  pendingRequestHeaders.delete(details.requestId);
+  // documentUrl is Chrome 106+ only on some event types; initiator is the
+  // requesting origin, good enough to derive Origin/Referer fallbacks.
+  const d = /** @type {{documentUrl?: string}} */ (details);
+  const viaSW = details.tabId < 0;
+  const tabId = viaSW ? await attributeSwRequest(details) : details.tabId;
+  if (tabId === null) return;
+  const contentType = headerValue(details.responseHeaders, "Content-Type");
+  const kind = classifyStream(details.url, contentType);
+  const now = Date.now();
+  if (!kind) {
+    const dbg = debugEntry(details.url, contentType, details.statusCode, viaSW, now);
+    if (dbg) updateSniffDebug(tabId, (ring) => pushDebug(ring, dbg));
+    return;
+  }
+  if (details.statusCode < 200 || details.statusCode >= 300) return;
+  const entry = {
+    url: details.url,
+    kind,
+    frameUrl: d.documentUrl || details.initiator || null,
+    referer: sent?.referer ?? null,
+    origin: sent?.origin ?? null,
+    userAgent: sent?.userAgent ?? null,
+    firstSeen: now,
+    lastSeen: now,
+  };
+  updateSniffed(tabId, (list) => upsertStream(list, entry));
+}
+
+{
+  const filter = { urls: ["<all_urls>"], types: SNIFF_TYPES };
+  try {
+    // "extraHeaders" is what exposes Referer/Origin in Chrome.
+    chrome.webRequest.onSendHeaders.addListener(onSniffSendHeaders, filter, [
+      "requestHeaders",
+      "extraHeaders",
+    ]);
+  } catch {
+    // Firefox has no "extraHeaders" (and exposes those headers without it).
+    chrome.webRequest.onSendHeaders.addListener(onSniffSendHeaders, filter, [
+      "requestHeaders",
+    ]);
+  }
+  chrome.webRequest.onHeadersReceived.addListener(onSniffHeadersReceived, filter, [
+    "responseHeaders",
+  ]);
+  // A new top-level document means a new page: forget the old streams and
+  // the old page's frames. Every frame (top or sub) is remembered by origin
+  // for service-worker attribution.
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (details.tabId < 0) return;
+      const now = Date.now();
+      if (details.type === "main_frame") {
+        clearSniffed(details.tabId);
+        updateFrameOrigins((map) =>
+          recordFrame(pruneFrameTab(map, details.tabId), details.url, details.tabId, now),
+        );
+      } else {
+        updateFrameOrigins((map) => recordFrame(map, details.url, details.tabId, now));
+      }
+    },
+    { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+  );
+  chrome.webRequest.onErrorOccurred.addListener(
+    (details) => pendingRequestHeaders.delete(details.requestId),
+    filter,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Entry points: toolbar click + Summarize button in the side panel both call
@@ -253,6 +510,47 @@ async function handleSummarizeActiveTab() {
  *   panel (only when the user is still on that tab).
  */
 async function handleExtractedPage(msg, sourceTabId) {
+  // No media in the DOM — but a player in a cross-origin iframe may still
+  // have fetched an HLS/DASH manifest. Prefer that over the page text.
+  if (sourceTabId !== null) {
+    let sniffed = null;
+    let sniffedStreams = null;
+    try {
+      const list = await getSniffed(sourceTabId);
+      sniffed = pickSniffedMedia(list);
+      sniffedStreams = toSniffedStreams(list);
+    } catch (err) {
+      console.warn("[TLDR] sniffed streams lookup failed", err);
+    }
+    if (!sniffed) {
+      try {
+        const stored = await chrome.storage.session.get(sniffDebugKey(sourceTabId));
+        console.info(
+          `[TLDR] no manifest sniffed for tab ${sourceTabId}; ` +
+            `sniffed=${sniffedStreams?.length ?? 0}, recent unclassified requests:`,
+          summarizeDebug(stored[sniffDebugKey(sourceTabId)] || []),
+          sniffedStreams,
+        );
+      } catch {
+        // diagnostics only
+      }
+    }
+    if (sniffed) {
+      await handleExtractedMedia(
+        {
+          url: msg.url,
+          mediaUrl: sniffed.mediaUrl,
+          altCandidates: sniffed.altCandidates,
+          mediaHeaders: sniffed.mediaHeaders,
+          sniffedStreams,
+          title: msg.title,
+          text: msg.text,
+        },
+        sourceTabId,
+      );
+      return;
+    }
+  }
   /** @type {JobCreateRequest} */
   const req = {
     url: normalizeUrl(msg.url),
@@ -305,7 +603,11 @@ function _mergeCookies(primary, extra) {
  * signing tokens, and the page's own site auth, without leaking unrelated
  * cookies from sibling subdomains.
  *
- * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], title?:string|null, text?:string}} msg
+ * ``mediaHeaders`` is set only for network-sniffed streams (see
+ * handleExtractedPage): the Referer/Origin/User-Agent the player sent,
+ * which pirate-ish CDNs check.
+ *
+ * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], mediaHeaders?:Record<string,string>|null, sniffedStreams?:import("./lib/api-types.js").SniffedStream[]|null, title?:string|null, text?:string}} msg
  * @param {number|null} sourceTabId
  */
 async function handleExtractedMedia(msg, sourceTabId) {
@@ -348,6 +650,8 @@ async function handleExtractedMedia(msg, sourceTabId) {
     // workers/runner.py's page-text fallback).
     page_text: msg.text || "",
     cookies,
+    media_headers: msg.mediaHeaders || null,
+    sniffed_streams: msg.sniffedStreams?.length ? msg.sniffedStreams : null,
   };
   await submitJob(req, sourceTabId);
 }
@@ -527,6 +831,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   lastSyncedUrlByTab.delete(tabId);
+  clearSniffed(tabId);
+  updateFrameOrigins((map) => pruneFrameTab(map, tabId));
 });
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {

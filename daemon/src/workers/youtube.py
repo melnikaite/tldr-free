@@ -344,6 +344,7 @@ def _download_audio_sync(
     url: str,
     cookies: list[Cookie],
     dir: Path,
+    http_headers: dict[str, str] | None = None,
 ) -> tuple[Path, float | None]:
     """Run yt-dlp synchronously inside this thread.
 
@@ -419,6 +420,8 @@ def _download_audio_sync(
     }
     if cookie_path is not None:
         ydl_opts["cookiefile"] = str(cookie_path)
+    if http_headers:
+        ydl_opts["http_headers"] = dict(http_headers)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -471,14 +474,19 @@ async def download_audio(
     url: str,
     cookies: list[Cookie],
     dir: Path,
+    http_headers: dict[str, str] | None = None,
 ) -> tuple[Path, float | None]:
     """Async wrapper around the blocking yt-dlp call.
 
     Returns the path to the downloaded audio file plus its duration in
-    seconds (``None`` if yt-dlp didn't report it).
+    seconds (``None`` if yt-dlp didn't report it). ``http_headers`` (the
+    job's allow-listed ``media_headers``) go to yt-dlp's ``http_headers``
+    option, which it applies to every request of the download — manifest,
+    segments and HLS keys alike.
     """
     return await asyncio.to_thread(
-        _download_audio_sync, url=url, cookies=cookies, dir=dir
+        _download_audio_sync, url=url, cookies=cookies, dir=dir,
+        http_headers=http_headers,
     )
 
 
@@ -511,7 +519,9 @@ def _jsruntime_opt() -> dict[str, dict[str, dict[str, str]]]:
     return deno_runtime_opt()
 
 
-def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
+def _ydl_base_opts(
+    cookie_path: Path | None, http_headers: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Common yt-dlp opts for our YouTube callers (deno + EJS solver, quiet)."""
     opts: dict[str, Any] = {
         "quiet": True,
@@ -531,6 +541,8 @@ def _ydl_base_opts(cookie_path: Path | None) -> dict[str, Any]:
     }
     if cookie_path is not None:
         opts["cookiefile"] = str(cookie_path)
+    if http_headers:
+        opts["http_headers"] = dict(http_headers)
     return opts
 
 
@@ -653,7 +665,14 @@ def _parse_subtitle_vtt(path: Path) -> list[dict[str, Any]]:
     ``REGION`` blocks) have no ``-->`` timing line and are silently
     skipped, as are cues with no text.
     """
-    raw = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    return parse_subtitle_vtt_text(path.read_text(encoding="utf-8-sig"))
+
+
+def parse_subtitle_vtt_text(raw: str) -> list[dict[str, Any]]:
+    """Text-in variant of ``_parse_subtitle_vtt`` (same output shape) — for
+    callers that fetched the subtitle themselves (workers/stream_resolve.py).
+    Also accepts SRT: its numeric cue ids are skipped like VTT cue ids."""
+    raw = raw.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\n+", raw)
     out: list[dict[str, Any]] = []
     for block in blocks:
@@ -705,6 +724,7 @@ def _download_subtitles_sync(
     dir: Path,
     lang_preferences: list[str],
     output_language: str | None = None,
+    http_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Probe available caption tracks, pick a language, download json3, parse.
 
@@ -720,7 +740,7 @@ def _download_subtitles_sync(
     try:
         # Pass 1: probe — what languages does yt-dlp see?
         probe_opts = {
-            **_ydl_base_opts(cookie_path),
+            **_ydl_base_opts(cookie_path, http_headers),
             "skip_download": True,
             "writesubtitles": False,
             "writeautomaticsub": False,
@@ -758,7 +778,7 @@ def _download_subtitles_sync(
         # which parser runs.
         out_template = str(dir / "%(id)s.%(ext)s")
         dl_opts = {
-            **_ydl_base_opts(cookie_path),
+            **_ydl_base_opts(cookie_path, http_headers),
             "skip_download": True,
             "writesubtitles": chosen in manual,
             "writeautomaticsub": chosen not in manual,
@@ -820,6 +840,7 @@ async def download_subtitles(
     max_attempts: int = 1,
     backoff_seconds: list[int] | None = None,
     retry_on_no_track: bool = True,
+    http_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Retry-wrapped async caption fetch — probe, download json3/vtt, parse.
 
@@ -867,6 +888,7 @@ async def download_subtitles(
                 dir=dir,
                 lang_preferences=lang_preferences,
                 output_language=output_language,
+                http_headers=http_headers,
             )
         except Exception:
             log.exception(
@@ -954,14 +976,17 @@ def has_dedicated_extractor(url: str) -> bool:
 
 
 def _fetch_video_metadata_sync(
-    *, url: str, cookies: list[Cookie], scratch_dir: Path
+    *, url: str, cookies: list[Cookie], scratch_dir: Path,
+    http_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     from yt_dlp import YoutubeDL
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
     cookie_path = write_netscape_cookie_file(cookies, scratch_dir) if cookies else None
     try:
-        with YoutubeDL({**_ydl_base_opts(cookie_path), "skip_download": True}) as ydl:
+        with YoutubeDL(
+            {**_ydl_base_opts(cookie_path, http_headers), "skip_download": True}
+        ) as ydl:
             info = ydl.extract_info(url, download=False) or {}
         return {
             "title": info.get("title"),
@@ -983,7 +1008,8 @@ def _fetch_video_metadata_sync(
 
 
 async def fetch_video_metadata(
-    *, url: str, cookies: list[Cookie], scratch_dir: Path
+    *, url: str, cookies: list[Cookie], scratch_dir: Path,
+    http_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Lightweight yt-dlp probe for the canonical video title (and a few
     incidental fields). Returns ``{}`` on any failure — we never want a
@@ -998,6 +1024,7 @@ async def fetch_video_metadata(
         url=url,
         cookies=cookies,
         scratch_dir=scratch_dir,
+        http_headers=http_headers,
     )
 
 

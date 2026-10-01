@@ -870,7 +870,7 @@ async def test_download_subtitles_retries_then_succeeds(monkeypatch) -> None:  #
     than conceding to Whisper after the first miss."""
     calls: list[dict[str, Any]] = []
 
-    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None, http_headers=None):  # noqa: ANN001
         calls.append({"cookies": cookies})
         if len(calls) == 1:
             return None  # first attempt: no usable track
@@ -904,7 +904,7 @@ async def test_download_subtitles_retries_on_exception(monkeypatch) -> None:  # 
     to Whisper."""
     calls = {"n": 0}
 
-    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None, http_headers=None):  # noqa: ANN001
         calls["n"] += 1
         if calls["n"] == 1:
             raise json.JSONDecodeError("boom", "doc", 0)
@@ -928,7 +928,7 @@ async def test_download_subtitles_retries_on_exception(monkeypatch) -> None:  # 
 async def test_download_subtitles_gives_up_after_max_attempts(monkeypatch) -> None:  # noqa: ANN001
     calls = {"n": 0}
 
-    def _always_fails(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+    def _always_fails(*, url, cookies, dir, lang_preferences, output_language=None, http_headers=None):  # noqa: ANN001
         calls["n"] += 1
         return None
 
@@ -960,7 +960,7 @@ async def test_download_subtitles_no_track_not_retried_when_disabled(monkeypatch
     probes + backoff sleeps on the common captionless case."""
     calls = {"n": 0}
 
-    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None, http_headers=None):  # noqa: ANN001
         calls["n"] += 1
         return None  # clean "no track" outcome, every time
 
@@ -989,7 +989,7 @@ async def test_download_subtitles_still_retries_exceptions_when_no_track_disable
     ... still are [retried]" half of the policy."""
     calls = {"n": 0}
 
-    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None):  # noqa: ANN001
+    def _fake_sync(*, url, cookies, dir, lang_preferences, output_language=None, http_headers=None):  # noqa: ANN001
         calls["n"] += 1
         if calls["n"] == 1:
             raise json.JSONDecodeError("boom", "doc", 0)

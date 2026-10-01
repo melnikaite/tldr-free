@@ -68,6 +68,56 @@ no-media `extracted-page` branch has always used) and includes it as a
 so the daemon has something to summarize instead of audio if the media turns
 out not to be speech, or Whisper returns nothing.
 
+## Network stream sniffing (players in cross-origin iframes)
+
+`extract.js` only sees the top frame, and hls.js/dash.js players play from a
+`blob:` src, so a player inside a cross-origin iframe yields `extracted-page`.
+`background.js` therefore records, via `chrome.webRequest` (listeners at SW top
+level so requests wake it), every HLS/DASH manifest and subtitle file each
+tab fetches — classification/dedup/selection are pure functions in
+`lib/stream-sniff.js` (tested in `tests/stream-sniff.test.mjs`). Request
+headers (Referer/Origin/User-Agent, needs `extraHeaders`) come from
+`onSendHeaders`; Content-Type and status from `onHeadersReceived`, which is
+the single recording point (non-2xx and segments are never recorded). Lists
+live in `chrome.storage.session` under `sniff:<tabId>` (cap 40, oldest
+dropped), cleared on a `main_frame` request and on tab close.
+
+`handleExtractedPage` checks that list first: if it has a manifest, it
+submits a `kind=media` job instead (earliest manifest = `media_url`, the
+others as `alt_media_candidates` "Stream N (HLS/DASH)"), with
+`media_headers` built from the recorded headers (frame origin as fallback).
+Subtitle entries are recorded but not yet used — they'd be wrong in the
+"wrong source?" picker, which hands its pick to yt-dlp as media.
+
+The extension can't tell a master playlist from a rendition playlist (all
+`.m3u8`), so the whole sniffed list also goes to the daemon as
+`sniffed_streams` and the daemon makes the real choice (master, audio dub,
+subtitle track — see `.claude/workers.md`). `media_url` is just a default:
+the latest-seen manifest whose name looks like a master
+(`looksLikeMaster`), else the earliest. The 40-entry cap is per group
+(manifests vs subtitles) so WebVTT segment spam can't evict the master.
+
+**Service-worker requests.** Some embedded players (hls.js in a cross-origin
+iframe) register their own Service Worker and fetch playlists from it; webRequest
+reports those with `tabId -1`. `onBeforeRequest` for `main_frame`/`sub_frame`
+records origin → tabs hosting a frame of that origin (most recent first;
+in memory, mirrored to `chrome.storage.session["sniffFrames"]` because the
+extension SW sleeps). A tab's entries are pruned on its `main_frame`
+navigation and on tab close. `onHeadersReceived` attributes a `tabId -1`
+request by `documentUrl`/`initiator` origin to the latest-seen tab that
+`chrome.tabs.get` still finds; otherwise it's dropped. Two tabs with the same
+player origin: the latest-seen frame wins (a SW request carries no tab
+info, so it can be misattributed until the other tab's frame reloads).
+Pure helpers: `recordFrame`/`lookupFrameTabs`/`pruneFrameTab`.
+
+**Debug ring.** Requests `classifyStream` rejected (xhr/media/other, minus
+images/fonts/css/js) go to `chrome.storage.session["sniffdbg:<tabId>"]`
+(newest 40, `{host, pathTail, ext, contentType, status, viaSW, ts}`, never
+the query string), cleared together with `sniff:`. When `handleExtractedPage`
+falls back to a page job, it `console.info`s that ring and the sniff list.
+To inspect: `chrome://extensions` → TLDR → "service worker" → Console, then
+`chrome.storage.session.get(null)`.
+
 ## PDF tabs bypass content-script extraction
 
 Chrome's built-in PDF viewer is a `chrome-extension://…` page that
@@ -101,22 +151,47 @@ which doubles as the click target for seeking (handled by the same
 `app.js` handler as the summary's timecode links) AND as the anchor
 for live-highlight via binary search.
 
-Live highlight: every 500 ms while the tab is visible + the source
-media is playing, the controller calls `chrome.scripting.executeScript
-({allFrames: true})` to read `<video, audio>.currentTime` from any
-frame (including cross-origin iframes like YouTube embeds — extension's
-host permissions cover those). Binary search picks the matching line,
-applies `tx-line--current`, scrolls into view if media is playing.
+Main-media selection (`lib/media-frames.js`): timecode seeks, live
+highlight and captions all target the page's *main* media element.
+`probeMedia` runs via `executeScript({allFrames: true})` (host permissions
+reach cross-origin player iframes), each frame marks its best
+`<video, audio>` with `data-tldr-main` and reports it; `pickBestFrame`
+ranks frames (longest finite duration → larger area → playing), and the
+action runs only in the winning `frameIds: [id]`. Duration-first is what
+skips VAST pre-/mid-roll ads living in a second `<video>`. When the
+expected duration is known (`expectedRange`: job `duration_seconds` ±3 s;
+else 0.8× the transcript's last marker as a loose lower bound),
+a duration-matching element wins outright, and captions bind *only* to a
+matching element — during a pre-roll the film may not exist yet or have
+unknown duration, so nothing binds until the poll's rebind sees it. Injected funcs
+must stay self-contained (serialized via `toString()`); the in-page
+comparator mirrors the tested `compareMedia`.
 
-`<track>` injection (WebVTT): on language switch, the controller builds
-a VTT body from the displayed text and injects a `<track>` into the
-page's first `<video>` via `executeScript({world: "MAIN"})`. World
-`MAIN` because the blob URL holding the VTT must resolve in the page's
-context; the extension's ISOLATED-world blobs can't be loaded by
-page-context `<video>`. Skipped for `<audio>` (no native captions UI)
-and for iframe-embedded players (we can't inject into their internal
-DOM safely — the sidepanel transcript itself serves as the captions
-surface).
+Live highlight: every 500 ms while the tab is visible the controller
+probes as above and binary-searches the main element's `currentTime` to
+the matching line, applies `tx-line--current`, scrolls into view if media
+is playing.
+
+Captions: on language switch the displayed `[MM:SS]` lines become plain
+`{start,end,text}` cues passed as args (no blob URLs → no page-CSP
+issues) to `installCaptions`, which renders a closed-shadow-DOM overlay
+(pointer-events none, max z-index) positioned over the main `<video>`
+inside its parent, re-laid out on `timeupdate`/`seeked`/resize/
+`ResizeObserver`/`fullscreenchange`. Custom players often hide native
+text tracks, hence self-rendering — for YouTube too. When the `<video>`
+itself is the fullscreen element (nothing can overlay it) a native
+`addTextTrack` track is shown instead until exit. The overlay hides
+while the bound element's duration drops below half of the expected
+minimum (or of the max seen, if unknown) — an ad loaded into the same
+element. State lives on the ISOLATED world's
+`window`; the probe reports `captionsBound`, and the poll re-injects
+(throttled, 3 s) when the player swapped its `<video>` or the page
+reloaded — but only with a known duration, a matching element, and in the
+same frame URL as the last bind (`canAutoRebind`); explicit injections
+(language pick) reset that frame. A `currentSrc` change on the bound
+element (episode/dub switch, reload) destroys the overlay immediately.
+With a known duration and no matching element the time-read returns null
+(highlight stops following); seek falls back to the plain ranking. Skipped for `<audio>`.
 
 The language switcher is a sticky-positioned bar with chips for cached
 languages (source + each translation) plus a free-form input. Enter
@@ -404,6 +479,8 @@ library writes — storage is what a freshly opened panel reads on boot.
 - `chrome.storage.session.transcriptSearchHandoff` — one-shot
   `{jobId, query}` from the library, consumed by the side panel (see
   "Find in transcript")
+- `chrome.storage.session["sniff:<tabId>"]` — network-sniffed manifests/subtitles for that tab (see "Network stream sniffing")
+- `chrome.storage.session["sniffdbg:<tabId>"]` / `["sniffFrames"]` — sniffer debug ring / frame-origin → tab map for service-worker attribution
 - `chrome.storage.local.daemonUrl` — daemon endpoint (default `http://localhost:8765`)
 - `chrome.storage.local.daemonEverReachable` — set `true` by
   `daemon.health()` (lib/daemon-client.js) on its first-ever successful

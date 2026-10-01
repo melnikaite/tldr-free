@@ -13,10 +13,9 @@
 //     via binary search; auto-scroll into view.
 //   - Find-in-transcript: highlight query hits with <mark> inside the
 //     rendered lines (see the "Search" section below).
-//   - Inject WebVTT <track> into the page's first <video> on language
-//     click (track creation in main world so the blob URL resolves in
-//     the page's context). Skip injection for audio-only pages (HTML5
-//     <audio> has no native captions UI surface).
+//   - Render the displayed text as a caption overlay over the page's main
+//     <video> (chosen across all frames, see lib/media-frames.js) on
+//     language click. Skipped for audio-only pages.
 //
 // State is module-local and reset on job switch. transcript.js doesn't
 // know about job lifecycle directly — app.js calls onJobChange / onTabShow.
@@ -27,6 +26,13 @@ import {
   buildFrameRow,
   MOMENT_MATCH_TOLERANCE_SECONDS,
 } from "../lib/frame-thumbnails.js";
+import {
+  cuesFromText,
+  canAutoRebind,
+  expectedRange,
+  installCaptionsInTab,
+  probeTab,
+} from "../lib/media-frames.js";
 import { findMatches, foldQuery, foldWithMap } from "../lib/text-search.js";
 import { resolveVideoId } from "../lib/url.js";
 import { formatApproxDuration, stringifyError } from "../lib/utils.js";
@@ -224,8 +230,7 @@ _eventStream.subscribe((event) => {
     }
     // Self-heal: text is rendered but polling didn't start (source tab
     // wasn't open when we first tried) — retry inject + poll. Idempotent:
-    // _injectCaptionsIntoTab removes the prior <track> before adding the
-    // new one; _startPoll is a no-op when _pollId is set.
+    // _injectCaptionsIntoTab replaces the prior overlay; _startPoll is a no-op when _pollId is set.
     if (
       _opened
       && _cues.length > 0
@@ -260,6 +265,8 @@ export function setJob(job) {
     // Real switch — tear down everything.
     _stopPoll();
     _textCache.clear();
+    _captionsData = null;
+    _boundFrameUrl = null;
     _pendingKeys.clear();
     _cues = [];
     _lastCueIdx = -1;
@@ -1257,29 +1264,23 @@ async function _pollOnce() {
 }
 
 /**
- * executeScript into every frame, return {currentTime, paused} from the
- * first frame that has a <video> or <audio>. Returns null if no tab /
- * no media found (e.g. user reloaded the source page, killing playback).
+ * Probe every frame and return the state of the page's main media element
+ * (longest finite duration across frames — the film, not an ad; see
+ * lib/media-frames.js). Returns null if no tab / no media found (e.g. user
+ * reloaded the source page, killing playback).
  *
  * @param {number} tabId
- * @returns {Promise<{currentTime: number, paused: boolean} | null>}
+ * @returns {Promise<import("../lib/media-frames.js").MediaInfo | null>}
  */
 async function _readMediaState(tabId) {
   try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: () => {
-        const m = document.querySelector("video, audio");
-        if (!m) return null;
-        return {
-          currentTime: m.currentTime,
-          paused: m.paused,
-        };
-      },
-    });
-    for (const r of results) {
-      if (r.result) return r.result;
-    }
+    const best = await probeTab(tabId, expectedMediaRange());
+    if (!best) return null;
+    _maybeRebindCaptions(best.info);
+    // Known duration but nothing matches (ad, another video, different
+    // rip): stop following rather than track the wrong media.
+    if (!best.info.matches && expectedMediaRange()) return null;
+    return best.info;
   } catch {
     // Tab gone or extension lost permission — silently stop polling
     // so we don't spam the console.
@@ -1561,100 +1562,81 @@ function _stripFragment(url) {
 // WebVTT injection
 // ---------------------------------------------------------------------------
 
+/** Transcript currently shown as captions in the source tab (null = none). @type {TranscriptResponse | null} */
+let _captionsData = null;
+let _lastRebindAt = 0;
+/** Frame URL of the last successful bind; auto-rebind stays in it. @type {string | null} */
+let _boundFrameUrl = null;
+const REBIND_MIN_INTERVAL_MS = 3000;
+
 /**
- * Convert ``text`` (one [MM:SS] line per cue) into WebVTT and inject a
- * <track> into the source tab's first <video>. Audio-only tabs and
- * iframe-embedded players are skipped (we can't surface captions in
- * those — for those cases the user reads the transcript here).
+ * Render ``data.text`` as a caption overlay over the source tab's main
+ * <video>, in whichever frame it lives (cross-origin iframes included).
+ * Self-rendered rather than a native <track> because custom players often
+ * hide native text-track rendering. Audio-only pages are skipped — the
+ * side-panel transcript is the captions surface there.
+ *
+ * Explicit calls (language pick, render) bind to whatever is eligible and
+ * reset the remembered frame; ``auto`` (poll rebind) is confined to it.
  *
  * @param {TranscriptResponse} data
+ * @param {boolean} [auto]
  */
-async function _injectCaptionsIntoTab(data) {
+async function _injectCaptionsIntoTab(data, auto = false) {
   if (!_job) return;
   const tabId = await _findSourceTab();
   if (tabId == null) return;
-  const vtt = _toVtt(data.text);
-  if (!vtt) return;
-  const langCode = data.language_code || "x-tldr";
-
+  const cues = cuesFromText(data.text);
+  if (!cues.length) return;
+  _captionsData = data;
+  if (!auto) _boundFrameUrl = null;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      // MAIN world so the blob URL we create lives in the page's
-      // context — a <track src=…> loaded by the page's <video> element
-      // can't resolve extension-context blob URLs.
-      world: "MAIN",
-      func: (vttText, lang) => {
-        const video = document.querySelector("video");
-        if (!video) return false;
-        // Remove any prior TLDR track so reapply is idempotent.
-        for (const t of [...video.querySelectorAll('track[data-tldr]')]) {
-          try {
-            URL.revokeObjectURL(/** @type {HTMLTrackElement} */ (t).src);
-          } catch {}
-          t.remove();
-        }
-        const blob = new Blob([vttText], { type: "text/vtt" });
-        const url = URL.createObjectURL(blob);
-        const track = document.createElement("track");
-        track.kind = "subtitles";
-        track.label = `TLDR (${lang})`;
-        track.srclang = lang;
-        track.src = url;
-        track.default = true;
-        track.setAttribute("data-tldr", "1");
-        video.appendChild(track);
-        // Force-show — many players default new tracks to "disabled".
-        const tt = video.textTracks[video.textTracks.length - 1];
-        if (tt) tt.mode = "showing";
-        return true;
-      },
-      args: [vtt, langCode],
-    });
+    const bound = await installCaptionsInTab(
+      tabId,
+      cues,
+      data.language_code || "x-tldr",
+      expectedRange(_job.duration_seconds, cues[cues.length - 1].start),
+      auto ? _boundFrameUrl : null,
+    );
+    if (bound) _boundFrameUrl = bound;
   } catch {
-    // Permission denied (cross-origin iframe), no <video>, page CSP
-    // blocked blob: — all expected on some sites. Silent.
+    // Tab gone / restricted page (chrome://, Web Store). Silent.
   }
 }
 
 /**
- * Convert ``[MM:SS] text`` lines into a WebVTT body. Each cue spans
- * marker → next marker (last cue extends a generous +60s so the final
- * line stays visible during late playback). Marker parsing tolerates
- * [HH:MM:SS] too.
+ * Expected duration window of the current job's media (see
+ * lib/media-frames.js expectedRange): the job's duration, else the last
+ * rendered transcript marker as a lower bound. null = unknown. app.js uses
+ * it so a timecode click during a pre-roll ad seeks the film.
  *
- * @param {string} text
- * @returns {string}
+ * @returns {import("../lib/media-frames.js").DurationRange | null}
  */
-function _toVtt(text) {
-  const re = /\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]\s*([^\n]*)/g;
-  const cues = [];
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const h = m[1] ? Number(m[1]) : 0;
-    const mm = Number(m[2]);
-    const ss = Number(m[3]);
-    cues.push({ start: h * 3600 + mm * 60 + ss, text: (m[4] || "").trim() });
-  }
-  if (!cues.length) return "";
-  const lines = ["WEBVTT", ""];
-  for (let i = 0; i < cues.length; i++) {
-    const start = cues[i].start;
-    const end = i + 1 < cues.length ? cues[i + 1].start : start + 60;
-    lines.push(`${_vttTime(start)} --> ${_vttTime(end)}`);
-    lines.push(cues[i].text);
-    lines.push("");
-  }
-  return lines.join("\n");
+export function expectedMediaRange() {
+  if (!_job) return null;
+  return expectedRange(
+    _job.duration_seconds,
+    _cues.length ? _cues[_cues.length - 1].sec : 0,
+  );
 }
 
-function _vttTime(totalSec) {
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = Math.floor(totalSec % 60);
-  return (
-    String(h).padStart(2, "0") + ":" +
-    String(m).padStart(2, "0") + ":" +
-    String(s).padStart(2, "0") + ".000"
-  );
+/**
+ * Called from the poll with the main media's state: if captions are wanted
+ * but the overlay isn't bound to that element (player swapped its <video>
+ * after an ad, page reloaded), re-inject if canAutoRebind allows. Throttled so a page where
+ * installation can't succeed doesn't get hammered every 500 ms.
+ *
+ * @param {import("../lib/media-frames.js").MediaInfo} info
+ */
+function _maybeRebindCaptions(info) {
+  // Never for unknown duration, a non-matching element (ad, other video,
+  // other rip) or a different player frame — see canAutoRebind.
+  if (!_captionsData) return;
+  if (!canAutoRebind(info, expectedMediaRange(), _boundFrameUrl)) return;
+  const key = `${_job?.id}::${_currentLang ?? ""}`;
+  if (_textCache.get(key) !== _captionsData) return;
+  const now = Date.now();
+  if (now - _lastRebindAt < REBIND_MIN_INTERVAL_MS) return;
+  _lastRebindAt = now;
+  _injectCaptionsIntoTab(_captionsData, true).catch(() => {});
 }

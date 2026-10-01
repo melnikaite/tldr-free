@@ -37,6 +37,7 @@ import {
   MOMENT_MATCH_TOLERANCE_SECONDS,
 } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
+import { seekTab } from "../lib/media-frames.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
   setActiveJob as _chatSetActiveJob,
@@ -302,13 +303,13 @@ async function _focusTab(tab) {
 /**
  * Seek to ``seconds`` on the source page if it's open, else open a new tab.
  *
- * For YouTube: lookup is by video id (handled inside ``_findTab``), seek
- * targets ``video`` only.
- * For generic media: lookup is by canonical page URL, seek targets the first
- * ``video, audio`` element — covers HTML5 audio players, podcast pages,
- * direct .mp4/.webm files. Iframe-embedded players (YouTube-in-iframe,
- * Vimeo, etc.) won't seek because the iframe is a separate document scope;
- * we don't try to message-pass into them.
+ * For YouTube: lookup is by video id (handled inside ``_findTab``).
+ * For generic media: lookup is by canonical page URL.
+ * Either way the seek targets the page's *main* media element, chosen
+ * across all frames by ``seekTab`` (lib/media-frames.js): longest finite
+ * duration wins, so iframe-embedded players are reached and pre-roll ads
+ * in a second <video> are skipped (when the job's duration is known, a
+ * duration-matching element wins outright). Play state is left as-is.
  *
  * @param {{ videoId: string, mediaPageUrl: string, seconds: number, fallbackUrl: string }} opts
  */
@@ -317,16 +318,7 @@ async function _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }) {
   const existing = await _findTab(lookupUrl);
   if (existing?.id !== undefined) {
     await _focusTab(existing);
-    await chrome.scripting.executeScript({
-      target: { tabId: existing.id },
-      func: (t) => {
-        const media = /** @type {HTMLMediaElement | null} */ (
-          document.querySelector("video, audio")
-        );
-        if (media) media.currentTime = t;
-      },
-      args: [seconds],
-    });
+    await seekTab(existing.id, seconds, transcript.expectedMediaRange());
     return;
   }
   // No matching tab — open a new one at the correct timestamp.

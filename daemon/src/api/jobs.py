@@ -45,6 +45,7 @@ from src.api.schemas import (
     JobStatus,
     JobSummary,
     LowConfidenceRange,
+    MediaSelection,
     MessagesListResponse,
     MissingRange,
     MomentFinding,
@@ -383,6 +384,17 @@ def _derive_moment_findings(moment_findings_json: str | None) -> list[MomentFind
     return findings
 
 
+def _parse_media_selection(job: Any) -> MediaSelection | None:
+    raw = getattr(job, "media_selection_json", None)
+    if not raw:
+        return None
+    try:
+        return MediaSelection(**json.loads(raw))
+    except Exception:
+        log.warning("api: malformed media_selection_json for job %s", job.id)
+        return None
+
+
 def _to_details(job: Any) -> JobDetails:
     # Include in-flight buffer for running jobs so reconnecting clients can
     # replay buffered content without waiting for future delta events.
@@ -432,6 +444,7 @@ def _to_details(job: Any) -> JobDetails:
         missing_ranges=_derive_missing_ranges(getattr(job, "diagnostics_json", None)),
         non_speech_ranges=_derive_non_speech_ranges(getattr(job, "diagnostics_json", None)),
         alt_media_candidates=alt_candidates,
+        media_selection=_parse_media_selection(job),
         queued_reason=getattr(job, "queued_reason", None),
         whisper_queue_position=get_queue().position(job.id),
         moment_findings=_derive_moment_findings(getattr(job, "moment_findings_json", None)),
@@ -559,6 +572,12 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             progress_stage="extracting",
             alt_media_candidates_json=alt_candidates_json,
             media_url=req.media_url,
+            # Persisted (unlike cookies) so later frame fetches can replay
+            # them — see migration v13.
+            media_headers_json=(
+                json.dumps(req.media_headers, separators=(",", ":"))
+                if req.media_headers else None
+            ),
         )
 
     # Spawn outside the lock — pipeline runs for minutes, holding the lock
@@ -573,6 +592,8 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
             media_url=req.media_url,
             pdf_bytes=pdf_bytes,
             cookies=list(req.cookies or []),
+            media_headers=req.media_headers,
+            sniffed_streams=list(req.sniffed_streams or []),
         )
     )
 
@@ -1126,6 +1147,7 @@ async def fetch_moment_frames(job_id: str, req: FrameFetchRequest) -> FrameFetch
             url=url,
             timestamp_seconds=match.timestamp,
             max_height_px=max_height,
+            http_headers=frames.resolve_frame_http_headers(job),
             # Forwarded from this request's own body, never persisted on
             # Job — the rule that cookies don't survive the request that
             # carried them is unchanged; this route just stopped being the

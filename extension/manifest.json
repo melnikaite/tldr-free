@@ -10,7 +10,8 @@
     "activeTab",
     "cookies",
     "scripting",
-    "storage"
+    "storage",
+    "webRequest"
   ],
   "host_permissions": [
     "http://localhost/*",

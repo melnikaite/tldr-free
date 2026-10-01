@@ -372,7 +372,7 @@ async def test_download_video_section_uses_fresh_subdir_per_attempt(
     seen_dirs: list[Path] = []
 
     def fake_sync(*, url: str, start: float, end: float, cookies: list[Any],
-                  dir: Path, max_height: int) -> Path:
+                  dir: Path, max_height: int, http_headers: Any = None) -> Path:
         seen_dirs.append(dir)
         # Leave a partial file behind, exactly like a failed real attempt
         # would (see docstring) — must not affect the next attempt.
@@ -955,3 +955,19 @@ def test_resolve_frame_source_url_uses_url_for_non_media_kinds(kind: str) -> Non
         media_url="https://cdn.example.com/should-be-ignored.mp4",
     )
     assert frames.resolve_frame_source_url(job) == "https://example.com/original"
+
+
+def test_frame_source_and_headers_prefer_resolved_stream() -> None:
+    from types import SimpleNamespace
+
+    job = SimpleNamespace(
+        kind="media", url="https://site/page", media_url="https://cdn/a.m3u8",
+        media_frame_url="https://cdn/master.m3u8",
+        media_headers_json='{"Referer":"https://p/","Cookie":"x=1"}',
+    )
+    assert frames.resolve_frame_source_url(job) == "https://cdn/master.m3u8"
+    assert frames.resolve_frame_http_headers(job) == {"Referer": "https://p/"}
+    job.media_frame_url = None
+    job.media_headers_json = "not json"
+    assert frames.resolve_frame_source_url(job) == "https://cdn/a.m3u8"
+    assert frames.resolve_frame_http_headers(job) is None

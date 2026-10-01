@@ -218,6 +218,43 @@ adds no new gap. (`media_url` itself no longer works this way — see
 about is unaffected either way, since `re_enqueue_pending` never resumes a
 media job regardless of what's on the row.)
 
+`WhisperTask.http_headers` (the request's allow-listed `media_headers`:
+Referer/Origin/User-Agent only, see `api.schemas.sanitize_media_headers`)
+is in-memory only for the same reason, like cookies. It reaches yt-dlp's
+`http_headers` option for the caption probe, metadata probe and audio
+download — and only when yt-dlp is fed `media_url` itself, not the page URL.
+They are ALSO persisted (`Job.media_headers_json`, v13) for frame fetches.
+
+**Sniffed streams (`workers/stream_resolve.py`).** When the extension
+sends `sniffed_streams`, `pipeline._resolve_sniffed` runs first in
+`_run_media`: it fetches the sniffed HLS playlists (most recent 30, 2 MB
+cap, 15 s timeout, failures ignored) with `media_headers` + cookies and
+picks: master = most recently seen master; audio = the master's
+`TYPE=AUDIO` rendition fetched most recently, else `DEFAULT=YES`, else the
+first — its playlist (audio-only) is what gets downloaded; no audio
+renditions → the master; no master → the extension's `media_url`.
+Subtitle = the most recently fetched of a direct `.vtt`/`.srt`, a
+`TYPE=SUBTITLES` rendition playlist, or a standalone WebVTT-segment
+playlist (segments are concatenated with X-TIMESTAMP-MAP offsets
+normalised to the first segment). It becomes the transcript via
+`_finish_caption_fast_path` (language: rendition LANGUAGE, else a language
+word in NAME, else detected from text) only if `subtitles_cover` holds
+(≥ 5 cues, last cue ends ≥ 70 % into the downloaded playlist's EXTINF
+duration) — otherwise ASR runs: a wrong transcript beats a hole.
+The choice lands in `Job.media_selection_json` (→ `JobDetails.media_selection`)
+and `Job.media_frame_url` (the master, which has video), and
+`Job.media_headers_json` is persisted at create time (migration v13) — so
+frame fetches replay the headers (`frames.resolve_frame_http_headers`)
+even though cookies stay request-only. DASH is passed through untouched.
+
+`Job.duration_seconds` is the real media duration — the side panel binds
+the caption overlay only to a `<video>` within ±3 s of it. Sniffed HLS: the
+EXTINF sum of the chosen media playlist (audio rendition, else a video
+variant), only for `#EXT-X-ENDLIST` playlists. Otherwise yt-dlp metadata
+(caption fast path) or the downloaded file's yt-dlp/ffprobe duration
+(Whisper path, which never overwrites an EXTINF value). Never derived from
+caption/transcript timing; unknown stays null.
+
 ## Media and PDF jobs are ephemeral on restart
 
 YouTube jobs are recoverable: `Job.url` is the canonical URL and

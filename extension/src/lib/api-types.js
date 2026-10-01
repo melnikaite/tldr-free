@@ -42,6 +42,28 @@
  * @property {string} label   - Human-readable: <title> attr / aria-label / filename / "Video 2"
  */
 
+/**
+ * One request recorded by the extension's network sniffer
+ * (lib/stream-sniff.js). Times are ms epoch.
+ *
+ * @typedef {object} SniffedStream
+ * @property {string} url
+ * @property {"hls" | "dash" | "subtitle"} kind
+ * @property {number} first_seen
+ * @property {number} last_seen
+ */
+
+/**
+ * What the daemon chose out of the sniffed streams (JobDetails.media_selection).
+ *
+ * @typedef {object} MediaSelection
+ * @property {string | null} [audio_name]
+ * @property {string | null} [audio_language]
+ * @property {string | null} [subtitle_name]
+ * @property {string | null} [subtitle_language]
+ * @property {boolean} [subtitles_used]   - subtitle track became the transcript (no ASR)
+ */
+
 // ---------------------------------------------------------------------------
 // POST /jobs (always async — 202 Accepted; client subscribes via /ai/stream)
 // ---------------------------------------------------------------------------
@@ -56,6 +78,8 @@
  * @property {MediaCandidate[] | null} [alt_media_candidates]  - other playable sources on the same page; populates JobDetails.alt_media_candidates for the "wrong source?" picker
  * @property {string | null} [pdf_bytes_b64]   - base64 PDF bytes (file:// only; http(s) PDFs are fetched daemon-side)
  * @property {Cookie[] | null} [cookies]
+ * @property {SniffedStream[] | null} [sniffed_streams]  - every manifest/subtitle the tab fetched (network sniffer); daemon picks master, audio rendition and subtitle track from these. Max 100 kept (most recent), http(s) only
+ * @property {Record<string, string> | null} [media_headers]  - Referer/Origin/User-Agent the player sent for media_url (network-sniffed streams); daemon allow-lists these three and forwards them to yt-dlp, never persisted
  */
 
 /**
@@ -163,6 +187,7 @@
  *   missing_ranges: MissingRange[],
  *   non_speech_ranges: NonSpeechRange[],
  *   alt_media_candidates: MediaCandidate[],
+ *   media_selection?: MediaSelection | null,
  *   queued_reason?: ("transcript_unavailable"|"transcript_blocked"|"network_error") | null,
  *   whisper_queue_position?: number | null,
  *   moment_findings?: MomentFinding[]

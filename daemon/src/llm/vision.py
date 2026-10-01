@@ -552,6 +552,7 @@ async def fetch_moment_frames(
         timestamp_seconds=candidate.timestamp,
         cookies=cookies,
         max_height_px=max_height,
+        http_headers=_frames.resolve_frame_http_headers(job),
     )
 
 

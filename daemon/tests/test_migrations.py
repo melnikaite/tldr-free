@@ -51,7 +51,7 @@ def _trigger_names(engine) -> set[str]:
 def test_migrations_create_core_tables(fresh_engine) -> None:
     """All migrations applied on a fresh DB produce the expected schema."""
     applied = run_migrations(fresh_engine)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
     tables = _table_names(fresh_engine)
     for required in ("job", "message", "transcript_translation", "_migrations"):
@@ -95,7 +95,7 @@ def test_migrations_create_core_tables(fresh_engine) -> None:
 def test_migration_runner_is_idempotent(fresh_engine) -> None:
     first = run_migrations(fresh_engine)
     second = run_migrations(fresh_engine)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     assert second == []  # nothing new to apply
 
     tables = _table_names(fresh_engine)
@@ -153,7 +153,7 @@ def test_v6_applies_alone_on_a_db_already_at_v5(fresh_engine) -> None:
 
     # The upgrade: v6 through v12 are all new from this v5 baseline.
     applied = run_migrations(fresh_engine)
-    assert applied == [6, 7, 8, 9, 10, 11, 12]
+    assert applied == [6, 7, 8, 9, 10, 11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -250,7 +250,7 @@ def test_v7_backfills_added_at_to_each_rows_own_created_at_on_a_v6_db(
     assert "added_at" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [7, 8, 9, 10, 11, 12]
+    assert applied == [7, 8, 9, 10, 11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -309,7 +309,7 @@ def test_v8_applies_alone_on_a_db_already_at_v7(fresh_engine) -> None:
     assert "transcript_missing_seconds" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [8, 9, 10, 11, 12]
+    assert applied == [8, 9, 10, 11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -384,7 +384,7 @@ def test_v9_applies_alone_on_a_db_already_at_v8(fresh_engine) -> None:
     assert "queued_reason" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [9, 10, 11, 12]
+    assert applied == [9, 10, 11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -457,7 +457,7 @@ def test_v10_applies_alone_on_a_db_already_at_v9(fresh_engine) -> None:
     assert "diagnostics_json" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [10, 11, 12]
+    assert applied == [10, 11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -531,7 +531,7 @@ def test_v11_applies_alone_on_a_db_already_at_v10(fresh_engine) -> None:
     assert "moment_findings_json" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [11, 12]
+    assert applied == [11, 12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -618,7 +618,7 @@ def test_v12_applies_alone_on_a_db_already_at_v11(fresh_engine) -> None:
     assert "media_url" not in cols_before
 
     applied = run_migrations(fresh_engine)
-    assert applied == [12]
+    assert applied == [12, 13]
 
     raw = fresh_engine.raw_connection()
     try:
@@ -667,3 +667,51 @@ def test_pragmas_are_applied(fresh_engine) -> None:
         assert int(cur.fetchone()[0]) == 1
     finally:
         raw.close()
+
+
+def test_v13_applies_alone_on_a_db_already_at_v12(fresh_engine) -> None:
+    """A DB at v12 picks up only v13; the sniffed-stream columns read back
+    NULL on old rows and round-trip through the repo write paths."""
+    raw = fresh_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(_MIGRATIONS_TABLE_DDL)
+        cur.close()
+        for version, migration in MIGRATIONS:
+            if version <= 12:
+                migration(raw)
+                _record_applied(raw, version)
+        cur = raw.cursor()
+        cur.execute(
+            "INSERT INTO job (id, url, kind, status, created_at, updated_at) "
+            "VALUES ('legacy13', 'https://example.com/p', 'media', 'done', "
+            "'2024-01-01T00:00:00', '2024-01-01T00:00:00')"
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    assert run_migrations(fresh_engine) == [13]
+
+    legacy = repo.get_job("legacy13")
+    assert legacy is not None
+    assert legacy.media_headers_json is None
+    assert legacy.media_frame_url is None
+    assert legacy.media_selection_json is None
+
+    job = repo.create_job(
+        url="https://example.com/movie",
+        kind="media",
+        media_url="https://cdn.example/a/index.m3u8",
+        media_headers_json='{"Referer":"https://player.example/"}',
+    )
+    repo.set_media_resolution(
+        job.id,
+        media_frame_url="https://cdn.example/master.m3u8",
+        media_selection_json='{"audio_name":"German Original"}',
+    )
+    reloaded = repo.get_job(job.id)
+    assert reloaded is not None
+    assert json.loads(reloaded.media_headers_json or "{}") == {"Referer": "https://player.example/"}
+    assert reloaded.media_frame_url == "https://cdn.example/master.m3u8"
+    assert json.loads(reloaded.media_selection_json or "{}")["audio_name"] == "German Original"

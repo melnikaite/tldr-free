@@ -188,6 +188,14 @@ class Job(SQLModel, table=True):
     # read as "nothing to use". Deliberately excluded from the export
     # bundle (storage/bundle.py) — see migration v12's docstring for why.
     media_url: str | None = None
+    # Migration v13 — see its comment for the full rationale. JSON object of
+    # allow-listed request headers for ``media_url``'s CDN (set at create
+    # time); the resolved master/stream URL frames should use; and the
+    # chosen audio/subtitle renditions (``api.schemas.MediaSelection``).
+    # Excluded from the export bundle, like ``media_url``.
+    media_headers_json: str | None = None
+    media_frame_url: str | None = None
+    media_selection_json: str | None = None
 
 
 class Message(SQLModel, table=True):

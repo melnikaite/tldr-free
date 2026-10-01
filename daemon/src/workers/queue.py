@@ -55,6 +55,10 @@ class WhisperTask:
     # — a restart already marks in-flight media jobs failed regardless (see
     # ``re_enqueue_pending`` below), so this adds no new gap.
     page_text: str | None = None
+    # Allow-listed request headers (Referer/Origin/User-Agent) for the media
+    # URL — see ``JobCreateRequest.media_headers``. Same lifetime as
+    # ``cookies``/``page_text``: in memory only, gone on restart.
+    http_headers: dict[str, str] | None = None
 
 
 class WhisperQueue:

@@ -72,6 +72,7 @@ async def test_short_job_completes_before_long_job_with_pool_of_two(
         task_job_id: str,
         repo_module: object,
         task_page_text: str | None = None,
+        task_http_headers: dict[str, str] | None = None,
     ) -> None:
         if task_job_id == "long":
             for _ in range(5):
@@ -126,6 +127,7 @@ async def test_pool_of_one_still_processes_both_jobs_without_deadlock(
         task_job_id: str,
         repo_module: object,
         task_page_text: str | None = None,
+        task_http_headers: dict[str, str] | None = None,
     ) -> None:
         await asyncio.sleep(0.01)
         completions.append(task_job_id)

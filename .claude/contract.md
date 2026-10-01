@@ -79,6 +79,9 @@ formatting: they're what stops a hostile zip from writing outside a job's
 own frame directory. Widen them only with the containment check in
 `_copy_frames` in mind.
 
+Migration v13's columns (`media_headers_json`, `media_frame_url`,
+`media_selection_json`) are kept out of the bundle, like `media_url`.
+
 ## URL normalization
 
 The extension normalizes every URL through `lib/url.js#normalizeUrl` before

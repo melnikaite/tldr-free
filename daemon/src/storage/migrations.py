@@ -528,6 +528,43 @@ def _migration_v12(conn: Any) -> None:  # noqa: ANN401
 
 
 # ---------------------------------------------------------------------------
+# v13 — network-sniffed streams (players in cross-origin iframes).
+#
+# ``media_headers_json``: the allow-listed Referer/Origin/User-Agent the
+# player sent (``JobCreateRequest.media_headers``). Pirate-ish CDNs refuse
+# requests without them, so the later frame fetch (workers/frames.py) needs
+# them as much as the original download did. Unlike cookies these aren't
+# credentials, so they are persisted — but, like ``media_url``, kept out of
+# the export bundle.
+#
+# ``media_frame_url``: the stream ``workers/stream_resolve.py`` resolved to
+# (the master playlist, which carries video) — preferred over ``media_url``
+# by ``frames.resolve_frame_source_url``. The audio download itself may use
+# an audio-only rendition playlist, which has no pixels to sample.
+#
+# ``media_selection_json``: the chosen audio/subtitle rendition names and
+# languages (``api.schemas.MediaSelection``), shown via JobDetails.
+#
+# All NULL for pre-existing rows and for jobs without sniffed streams.
+# ---------------------------------------------------------------------------
+
+_V13_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE job ADD COLUMN media_headers_json TEXT",
+    "ALTER TABLE job ADD COLUMN media_frame_url TEXT",
+    "ALTER TABLE job ADD COLUMN media_selection_json TEXT",
+)
+
+
+def _migration_v13(conn: Any) -> None:  # noqa: ANN401
+    cursor = conn.cursor()
+    try:
+        for stmt in _V13_STATEMENTS:
+            cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry + runner
 # ---------------------------------------------------------------------------
 
@@ -545,6 +582,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (10, _migration_v10),
     (11, _migration_v11),
     (12, _migration_v12),
+    (13, _migration_v13),
 ]
 
 

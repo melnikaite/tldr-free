@@ -162,6 +162,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import shutil
 import subprocess
@@ -169,7 +170,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from src.api.schemas import Cookie, JobKind
+from src.api.schemas import Cookie, JobKind, sanitize_media_headers
 from src.config import get_config
 from src.storage.cookies import write_netscape_cookie_file
 from src.workers.errors import FrameExtractionError
@@ -382,6 +383,7 @@ def _download_section_sync(
     cookies: list[Cookie],
     dir: Path,
     max_height: int,
+    http_headers: dict[str, str] | None = None,
 ) -> Path:
     """Download ONLY the ``[start, end]`` span of ``url`` (video, no audio
     track needed) via yt-dlp's ``--download-sections`` equivalent.
@@ -423,6 +425,8 @@ def _download_section_sync(
     }
     if cookie_path is not None:
         ydl_opts["cookiefile"] = str(cookie_path)
+    if http_headers:
+        ydl_opts["http_headers"] = dict(http_headers)
 
     log.info(
         "frames: downloading section %s of %s (height<=%d)",
@@ -447,6 +451,7 @@ def _download_full_sync(
     dir: Path,
     max_height: int,
     max_filesize_bytes: int,
+    http_headers: dict[str, str] | None = None,
 ) -> Path:
     """Opt-in fallback: download the whole video (no ``download_ranges``) for
     sites whose extractor doesn't support sectioned downloads.
@@ -475,6 +480,8 @@ def _download_full_sync(
     }
     if cookie_path is not None:
         ydl_opts["cookiefile"] = str(cookie_path)
+    if http_headers:
+        ydl_opts["http_headers"] = dict(http_headers)
 
     log.info("frames: full-download fallback for %s (height<=%d)", url, max_height)
     try:
@@ -491,6 +498,7 @@ def _download_full_sync(
 
 async def _download_video_section(
     *, url: str, start: float, end: float, cookies: list[Cookie], dir: Path, max_height: int,
+    http_headers: dict[str, str] | None = None,
 ) -> Path:
     """Download the ``[start, end]`` section, retrying up to
     ``SECTION_DOWNLOAD_MAX_ATTEMPTS`` times on failure — see module
@@ -522,6 +530,7 @@ async def _download_video_section(
                 _download_section_sync,
                 url=url, start=start, end=end, cookies=cookies,
                 dir=attempt_dir, max_height=max_height,
+                http_headers=http_headers,
             )
         except Exception as exc:
             last_exc = exc
@@ -539,11 +548,13 @@ async def _download_video_section(
 
 async def _download_full_video(
     *, url: str, cookies: list[Cookie], dir: Path, max_height: int, max_filesize_bytes: int,
+    http_headers: dict[str, str] | None = None,
 ) -> Path:
     return await asyncio.to_thread(
         _download_full_sync,
         url=url, cookies=cookies, dir=dir,
         max_height=max_height, max_filesize_bytes=max_filesize_bytes,
+        http_headers=http_headers,
     )
 
 
@@ -673,10 +684,30 @@ def resolve_frame_source_url(job: Any) -> str | None:
     ``job.url`` themselves — falling back would silently resurrect the
     original bug this function exists to fix (yt-dlp probing a page with no
     video on it, which cannot work regardless of cookies).
+
+    For a sniffed stream, ``job.media_frame_url`` (migration v13) — the
+    resolved master playlist, which carries video even when the transcript
+    came from an audio-only rendition — wins over ``media_url``.
     """
     if getattr(job, "kind", None) == JobKind.MEDIA.value:
-        return getattr(job, "media_url", None)
+        return getattr(job, "media_frame_url", None) or getattr(job, "media_url", None)
     return getattr(job, "url", None)
+
+
+def resolve_frame_http_headers(job: Any) -> dict[str, str] | None:
+    """The job's persisted allow-listed request headers (migration v13) for
+    replaying the player's Referer/Origin/User-Agent on frame fetches;
+    ``None`` when there are none or the column is malformed."""
+    raw = getattr(job, "media_headers_json", None)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return sanitize_media_headers({str(k): v for k, v in parsed.items() if isinstance(v, str)})
 
 
 async def fetch_frames(
@@ -690,6 +721,7 @@ async def fetch_frames(
     allow_full_download: bool = False,
     full_download_max_bytes: int = FULL_DOWNLOAD_MAX_BYTES,
     reuse_existing: bool = False,
+    http_headers: dict[str, str] | None = None,
 ) -> list[Path]:
     """Fetch a handful of JPEG frames from around ``timestamp_seconds`` in
     ``url``, for a multimodal LLM (or the user, directly) to inspect. Never
@@ -769,6 +801,7 @@ async def fetch_frames(
             video_path = await _download_video_section(
                 url=url, start=start, end=end, cookies=cookies,
                 dir=scratch_dir, max_height=max_height_px,
+                http_headers=http_headers,
             )
             seek_start, seek_duration = None, None
         except Exception as exc:
@@ -787,6 +820,7 @@ async def fetch_frames(
                     url=url, cookies=cookies, dir=scratch_dir,
                     max_height=FULL_DOWNLOAD_MAX_HEIGHT_PX,
                     max_filesize_bytes=full_download_max_bytes,
+                    http_headers=http_headers,
                 )
             except Exception as full_exc:
                 raise FrameExtractionError(

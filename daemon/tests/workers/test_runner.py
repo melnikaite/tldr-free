@@ -97,7 +97,7 @@ async def test_runner_processes_one_task_end_to_end(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url, "dir": dir})
         return audio_file, 90.0
@@ -129,7 +129,7 @@ async def test_runner_processes_one_task_end_to_end(
         for chunk in ("## Summary\n\n", "Seen ", "[00:00] [00:30] [01:00]."):
             yield chunk
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # extractor="youtube" -> a dedicated site extractor, so its title is
         # trusted over the DB row's (possibly stale SPA DOM) scrape.
         return {"title": "Canonical Title", "language": "en", "extractor": "youtube"}
@@ -205,7 +205,7 @@ async def test_runner_marks_failed_on_download_error(
     fake_repo = _FakeRepo({"job2": job})
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         raise RuntimeError("yt-dlp boom")
 
@@ -248,7 +248,7 @@ async def test_runner_deletes_audio_even_on_transcribe_error(
     guard = _CleanupGuard(tmp_path)
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return guard.file, 60.0
 
@@ -300,12 +300,12 @@ async def test_runner_media_short_probed_duration_skips_download_uses_page_text(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         raise AssertionError("download_audio must not be called for a too-short probe")
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {"title": None, "language": None, "duration": 1.5}
 
     summarize_calls: list[dict[str, Any]] = []
@@ -367,7 +367,7 @@ async def test_runner_media_long_probed_duration_normal_path(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         return audio_file, 900.0
@@ -376,7 +376,7 @@ async def test_runner_media_long_probed_duration_normal_path(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # extractor="generic" -> yt-dlp found no dedicated site support for a
         # bare .mp3 URL, so its "title" is untrustworthy (typically just a
         # filename stem) and must NOT clobber the extension's page title.
@@ -440,7 +440,7 @@ async def test_runner_title_backfill_dedicated_extractor_overwrites_title(
     audio_file.write_bytes(b"\x00" * 8)
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return audio_file, 900.0
 
@@ -448,7 +448,7 @@ async def test_runner_title_backfill_dedicated_extractor_overwrites_title(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="de", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {
             "title": "Grumpy Elster", "language": "de", "duration": 900.0,
             "extractor": "zdf",
@@ -498,7 +498,7 @@ async def test_runner_title_backfill_generic_extractor_keeps_existing_title(
     audio_file.write_bytes(b"\x00" * 8)
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return audio_file, 900.0
 
@@ -506,7 +506,7 @@ async def test_runner_title_backfill_generic_extractor_keeps_existing_title(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="de", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {
             "title": "250415_2145_sendung_sae_a1a2_4328k_p19v17",
             "language": "de", "duration": 900.0, "extractor": "generic",
@@ -556,7 +556,7 @@ async def test_runner_title_backfill_generic_extractor_fills_empty_title(
     audio_file.write_bytes(b"\x00" * 8)
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return audio_file, 900.0
 
@@ -564,7 +564,7 @@ async def test_runner_title_backfill_generic_extractor_fills_empty_title(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {
             "title": "clip", "language": "en", "duration": 900.0,
             "extractor": "generic",
@@ -615,7 +615,7 @@ async def test_runner_media_probe_failure_falls_through_to_normal_path(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         return audio_file, 120.0
@@ -624,7 +624,7 @@ async def test_runner_media_probe_failure_falls_through_to_normal_path(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {}  # probe failed entirely — no title, no language, no duration
 
     async def fake_stream_summarize(
@@ -677,7 +677,7 @@ async def test_runner_media_empty_transcript_falls_back_to_page_text(
     audio_file.write_bytes(b"\x00" * 8)
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return audio_file, 30.0
 
@@ -686,7 +686,7 @@ async def test_runner_media_empty_transcript_falls_back_to_page_text(
         # No segments -> build_marked_text produces "" -> empty transcript.
         return TranscribeResult(segments=[], language=None, duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # Duration is above threshold, so the EARLY probe doesn't reject —
         # this exercises the separate empty-transcript trigger.
         return {"title": None, "language": None, "duration": 30.0}
@@ -745,12 +745,12 @@ async def test_runner_media_short_duration_no_page_text_marks_failed(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         raise AssertionError("download_audio must not be called for a too-short probe")
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {"title": None, "language": None, "duration": 0.5}
 
     monkeypatch.setattr(runner_mod.youtube, "download_audio", fake_download_audio)
@@ -793,7 +793,7 @@ async def test_runner_youtube_job_ignores_media_only_fallback(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         return audio_file, 90.0
@@ -802,7 +802,7 @@ async def test_runner_youtube_job_ignores_media_only_fallback(
         from src.workers.transcribe import TranscribeResult
         return TranscribeResult(segments=fake_segments, language="en", duration_seconds=total_duration)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # Tiny "duration" — must be ignored entirely for kind=youtube.
         return {"title": "Real Title", "language": "en", "duration": 1.0}
 
@@ -861,7 +861,7 @@ async def test_runner_media_static_asset_post_download_probe_skips_whisper(
     audio_file = tmp_path / "notification.mp3"
     audio_file.write_bytes(b"\x00" * 48)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # Plain static-asset URL: yt-dlp's generic extractor reports no
         # duration at all, confirmed live.
         return {"duration": None}
@@ -872,7 +872,7 @@ async def test_runner_media_static_asset_post_download_probe_skips_whisper(
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         return audio_file, None  # yt-dlp's own probe doesn't know duration either
@@ -948,7 +948,7 @@ async def test_runner_media_static_asset_post_download_probe_confirms_long_durat
     audio_file = tmp_path / "podcast.mp3"
     audio_file.write_bytes(b"\x00" * 626)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         return {"duration": None}
 
     async def fake_probe_url_duration(url: str, *, timeout: float = 5.0):
@@ -957,7 +957,7 @@ async def test_runner_media_static_asset_post_download_probe_confirms_long_durat
     download_calls: list[dict[str, Any]] = []
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         download_calls.append({"url": url})
         return audio_file, None
@@ -1027,14 +1027,14 @@ async def test_runner_media_annotation_only_transcript_falls_back_to_page_text(
     audio_file = tmp_path / "clip3.opus"
     audio_file.write_bytes(b"\x00" * 8)
 
-    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path):
+    async def fake_metadata(*, url: str, cookies: list[Any], scratch_dir: Path, http_headers: Any = None):
         # Duration known and comfortably above threshold — this test is
         # specifically about the post-Whisper transcript-quality gate, not
         # the duration gate.
         return {"title": None, "language": None, "duration": 15.0}
 
     async def fake_download_audio(
-        *, url: str, cookies: list[Any], dir: Path,
+        *, url: str, cookies: list[Any], dir: Path, http_headers: Any = None,
     ) -> tuple[Path, float | None]:
         return audio_file, 15.0
 
