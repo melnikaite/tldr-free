@@ -645,7 +645,16 @@ async function openInSidePanel(id) {
   // toast-on-failure path still works. (The Chrome path inside the shim
   // resolves the current window itself, same as before.)
   const opening = openSidePanel();
-  await chrome.storage.session.set({ activeJobId: id });
+  // A non-empty library search rides along as a one-shot hand-over: the
+  // side panel opens the Transcript tab with it prefilled (sidepanel/app.js
+  // _receiveSearchHandoff). Written in the same set() as activeJobId so the
+  // panel sees both in one storage.onChanged event.
+  const query = filterSearch?.value.trim() || "";
+  await chrome.storage.session.set(
+    query
+      ? { activeJobId: id, transcriptSearchHandoff: { jobId: id, query } }
+      : { activeJobId: id },
+  );
   // Try to broadcast so an open side panel switches.
   try {
     // shouldSwitch=true: Library "open in side panel" / "retry" is an

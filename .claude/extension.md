@@ -371,10 +371,39 @@ Invariants if you touch this:
   update this doc and decide then whether `classifyError` needs its own
   branch, rather than silently duplicating `describeQueuedDetail`'s logic.
 
+### Find in transcript
+
+A find bar (`#transcript-search`, in the sticky lang-bar row) searches
+whatever `_renderLines` last rendered — original or the selected
+translation — and re-runs after every re-render. Matching is
+case-insensitive and accent-folding (NFD, marks stripped, ß→ss) via the
+pure helpers in `lib/text-search.js` (`foldWithMap` keeps a folded →
+original offset map so highlights land on the right characters; unit
+tests: `task test:extension`). Only `span.tx-text` (the line's spoken
+text) is searched and rewritten with `<mark>`s — never the `[MM:SS]`
+link, ⚠ flag, frame rows or gap rows — so clearing restores the exact
+DOM and `_cues` / click-to-seek are untouched. While a query is active
+the playing line is still highlighted but not auto-scrolled to. Cmd/Ctrl+F
+in the panel is claimed only when the job has a transcript. The query is
+cleared on every real job switch.
+
+**Library → panel hand-over:** opening a job from a library list with a
+non-empty search box writes `transcriptSearchHandoff = {jobId, query}`
+into `chrome.storage.session` in the same `set()` as `activeJobId`. The
+panel (`_receiveSearchHandoff` in `sidepanel/app.js`) removes the key on
+read (one-shot), waits until `setActiveJob` shows that job, then opens the
+Transcript tab with the query prefilled; it is applied after the lazy
+transcript render. Ignored for page / pdf jobs. Storage rather than the
+`job-created` message because the panel is often not open yet when the
+library writes — storage is what a freshly opened panel reads on boot.
+
 ## State (chrome.storage)
 
 - `chrome.storage.session.activeJobId` — currently shown job (clears on browser close)
 - `chrome.storage.session.activeUrl` — last normalized URL synced
+- `chrome.storage.session.transcriptSearchHandoff` — one-shot
+  `{jobId, query}` from the library, consumed by the side panel (see
+  "Find in transcript")
 - `chrome.storage.local.daemonUrl` — daemon endpoint (default `http://localhost:8765`)
 - `chrome.storage.local.daemonEverReachable` — set `true` by
   `daemon.health()` (lib/daemon-client.js) on its first-ever successful

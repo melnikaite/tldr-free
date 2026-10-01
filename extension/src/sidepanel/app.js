@@ -79,6 +79,14 @@ function setActiveJob(job) {
     // "just kicked off processing" path — leave the tab choice alone.
     if (!wasNoJob && typeof switchTab === "function") switchTab("summary");
   }
+  // Library hand-over waiting for exactly this job — apply it now, AFTER
+  // the summary-tab reset above (and after transcript.setJob cleared any
+  // previous query), so it isn't immediately undone.
+  if (newId && _pendingSearchHandoff?.jobId === newId) {
+    const handoff = _pendingSearchHandoff;
+    _pendingSearchHandoff = null;
+    _applySearchHandoff(handoff);
+  }
 }
 
 // Sidepanel needs every event type — stage/delta drive the active job's
@@ -147,6 +155,57 @@ function switchTab(which) {
 
 summaryTabBtn?.addEventListener("click", () => switchTab("summary"));
 transcriptTabBtn?.addEventListener("click", () => switchTab("transcript"));
+
+// Cmd+F (Ctrl+F off-mac) while the panel has focus → find in transcript.
+// Only claimed when the shown job has a transcript; otherwise the browser
+// keeps its own find-in-page behaviour.
+const _isMac = /Mac|iPhone|iPad/i.test(navigator.platform);
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "f" && ev.key !== "F") return;
+  const mod = _isMac ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
+  if (!mod || ev.altKey || ev.shiftKey) return;
+  if (!transcript.canSearch()) return;
+  ev.preventDefault();
+  if (!transcriptPaneEl?.classList.contains("tab-pane--active")) switchTab("transcript");
+  transcript.focusSearch();
+});
+
+// ---------------------------------------------------------------------------
+// Library → side panel search hand-over
+//
+// Opening a job from a filtered library list also writes
+// chrome.storage.session.transcriptSearchHandoff = {jobId, query} in the
+// SAME storage.set as activeJobId (library/app.js openInSidePanel). It is
+// one-shot: removed from storage as soon as the panel reads it, then held
+// here until setActiveJob shows that job (or applied at once if it is
+// already shown). Jobs without a transcript (page / pdf) ignore it.
+// ---------------------------------------------------------------------------
+
+/** @type {{jobId: string, query: string} | null} */
+let _pendingSearchHandoff = null;
+
+/** @param {unknown} raw */
+async function _receiveSearchHandoff(raw) {
+  // Park the hand-over synchronously, before any await, so it is pending
+  // even if setActiveJob for that job runs while the remove() is in flight.
+  const h = /** @type {{jobId?: unknown, query?: unknown} | null} */ (raw);
+  if (h && typeof h.jobId === "string" && typeof h.query === "string" && h.query.trim()) {
+    const handoff = { jobId: h.jobId, query: h.query };
+    if (_lastBroadcastJobId === handoff.jobId) {
+      _applySearchHandoff(handoff);
+    } else {
+      _pendingSearchHandoff = handoff;
+    }
+  }
+  await chrome.storage.session.remove("transcriptSearchHandoff");
+}
+
+/** @param {{jobId: string, query: string}} handoff */
+function _applySearchHandoff(handoff) {
+  if (!transcript.canSearch()) return;  // page / pdf — silently ignored
+  switchTab("transcript");
+  transcript.setSearchQuery(handoff.query);
+}
 
 // ---------------------------------------------------------------------------
 // Timecode link handler — click on a [MM:SS] link in the summary.
@@ -468,6 +527,13 @@ async function patchActiveJobIfMatches(event) {
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  // Read before the activeJobId branch kicks off loadAndRender, so the
+  // hand-over is pending by the time setActiveJob runs for that job.
+  if (area === "session" && changes.transcriptSearchHandoff?.newValue) {
+    _receiveSearchHandoff(changes.transcriptSearchHandoff.newValue).catch((e) =>
+      console.error("[TLDR] search hand-over", e),
+    );
+  }
   if (area === "session" && changes.activeJobId) {
     const id = changes.activeJobId.newValue;
     if (id) {
@@ -482,10 +548,13 @@ bootstrap().catch((e) => {
 });
 
 async function bootstrap() {
-  const { activeJobId, activeUrl } = await chrome.storage.session.get([
+  const { activeJobId, activeUrl, transcriptSearchHandoff } = await chrome.storage.session.get([
     "activeJobId",
     "activeUrl",
+    "transcriptSearchHandoff",
   ]);
+  // Panel opened by the library click itself — pick the hand-over up here.
+  if (transcriptSearchHandoff) await _receiveSearchHandoff(transcriptSearchHandoff);
   await seedBadge();
   if (activeJobId) {
     // An existing job takes precedence over the health gate below — if it's

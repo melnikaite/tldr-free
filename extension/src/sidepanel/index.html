@@ -73,6 +73,22 @@
           aria-label="Export this transcript"
           disabled
         ><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><polyline points="7 10 12 15 17 10"></polyline><path d="M4 19h16"></path></svg></button>
+        <!-- Find-in-transcript (transcript.js "Search" section). Lives in
+             the sticky row so it stays reachable while the body scrolls;
+             shown only for jobs that have a transcript. -->
+        <div id="transcript-search" class="transcript-search hidden" role="search">
+          <input
+            id="transcript-search-input"
+            type="search"
+            placeholder="Find in transcript"
+            aria-label="Find in transcript"
+            autocomplete="off"
+            spellcheck="false"
+          >
+          <span id="transcript-search-count" class="transcript-search-count" aria-live="polite"></span>
+          <button id="transcript-search-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>&#x2191;</button>
+          <button id="transcript-search-next" type="button" title="Next match (Enter)" aria-label="Next match" disabled>&#x2193;</button>
+        </div>
       </div>
       <div id="transcript-source-notice" class="transcript-source-notice hidden">
         <!-- rendered by transcript.js's _renderSourceNotice() when

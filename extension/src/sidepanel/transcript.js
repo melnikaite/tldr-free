@@ -11,6 +11,8 @@
 //     frames (covers iframe-embedded players) every 500ms while the tab
 //     is visible AND the media is playing. Highlight the matching line
 //     via binary search; auto-scroll into view.
+//   - Find-in-transcript: highlight query hits with <mark> inside the
+//     rendered lines (see the "Search" section below).
 //   - Inject WebVTT <track> into the page's first <video> on language
 //     click (track creation in main world so the blob URL resolves in
 //     the page's context). Skip injection for audio-only pages (HTML5
@@ -25,6 +27,7 @@ import {
   buildFrameRow,
   MOMENT_MATCH_TOLERANCE_SECONDS,
 } from "../lib/frame-thumbnails.js";
+import { findMatches, foldQuery, foldWithMap } from "../lib/text-search.js";
 import { resolveVideoId } from "../lib/url.js";
 import { formatApproxDuration, stringifyError } from "../lib/utils.js";
 
@@ -75,6 +78,21 @@ const saveDiagnosticsBtn = /** @type {HTMLButtonElement | null} */ (
 );
 const diagnosticsReportEl = /** @type {HTMLTextAreaElement | null} */ (
   document.getElementById("diagnostics-report")
+);
+const searchBarEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("transcript-search")
+);
+const searchInputEl = /** @type {HTMLInputElement | null} */ (
+  document.getElementById("transcript-search-input")
+);
+const searchCountEl = /** @type {HTMLElement | null} */ (
+  document.getElementById("transcript-search-count")
+);
+const searchPrevBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("transcript-search-prev")
+);
+const searchNextBtn = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("transcript-search-next")
 );
 let _lastDiagnosticsText = "";
 
@@ -247,6 +265,9 @@ export function setJob(job) {
     _lastCueIdx = -1;
     _opened = false;
     _currentLang = null;
+    // A query never survives a job switch — a library hand-over is
+    // re-applied by app.js right after this call (setSearchQuery).
+    _clearSearch();
   }
   _job = job;
   _syncTabVisibility();
@@ -305,6 +326,9 @@ function _shouldShowTab() {
 }
 
 function _syncTabVisibility() {
+  // The find bar exists only for a real job with a transcript — the
+  // no-job "Process this page" state has nothing to search.
+  searchBarEl?.classList.toggle("hidden", !canSearch());
   if (!tabBtn) return;
   tabBtn.classList.toggle("hidden", !_shouldShowTab());
 }
@@ -664,7 +688,8 @@ function _renderLines(rawText) {
       a.rel = "noopener";
       a.textContent = `[${m[0].slice(1, m[0].indexOf("]"))}]`;
       p.appendChild(a);
-      p.appendChild(document.createTextNode(" " + (m[4] || "")));
+      p.appendChild(document.createTextNode(" "));
+      p.appendChild(_buildTextSpan(m[4] || ""));
       if (_isLowConfidence(sec)) {
         const flag = document.createElement("span");
         flag.className = "tx-low-mark";
@@ -675,7 +700,7 @@ function _renderLines(rawText) {
         p.appendChild(flag);
       }
     } else {
-      p.textContent = trimmed;
+      p.appendChild(_buildTextSpan(trimmed));
     }
     frag.appendChild(p);
   }
@@ -698,6 +723,22 @@ function _renderLines(rawText) {
   // Defensive sort — build_marked_text already emits in order but bad
   // input shouldn't break the binary search invariant.
   _cues.sort((a, b) => a.sec - b.sec);
+  _onLinesRendered();
+}
+
+/**
+ * The searchable part of a line: just its spoken text, never the [MM:SS]
+ * marker, the ⚠ flag, or any interleaved frame/gap row. Find-in-transcript
+ * only ever rewrites the children of these spans, so the rest of the line
+ * (seek link, data-tx-seconds, _cues element identity) is never touched.
+ *
+ * @param {string} text
+ */
+function _buildTextSpan(text) {
+  const span = document.createElement("span");
+  span.className = "tx-text";
+  span.textContent = text;
+  return span;
 }
 
 /**
@@ -1199,6 +1240,13 @@ async function _pollOnce() {
   // anything to scroll to.
   const forceScroll = _scrollOnNextHighlight;
   _scrollOnNextHighlight = false;
+  // An active find-in-transcript query owns the scroll position: keep
+  // marking the playing line, but never yank the viewport away from the
+  // match the user is looking at. Clearing the query resumes auto-scroll.
+  if (_searchQuery) {
+    _highlight(result.currentTime, /* scroll */ false);
+    return;
+  }
   if (result.paused && !forceScroll) {
     // Paused → don't autoscroll; just leave the current highlight as it
     // is so the user can read freely.
@@ -1239,6 +1287,194 @@ async function _readMediaState(tabId) {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Search (find in transcript)
+// ---------------------------------------------------------------------------
+//
+// Searches whatever _renderLines last rendered (original or translation).
+// The folded text of every line is cached once per render (_searchIndex,
+// built lazily on the first query after a render) so a keystroke only
+// re-runs indexOf over cached strings. Highlighting rewrites only the
+// children of `span.tx-text`; clearing puts the plain text back, so the
+// DOM is exactly what _renderLines produced.
+
+const SEARCH_DEBOUNCE_MS = 150;
+
+/** Folded query currently applied ("" = no search). */
+let _searchQuery = "";
+/** Per-line folded cache for the current render; null = rebuild on next use.
+ *  @type {Array<{ span: HTMLElement, text: string, folded: import("../lib/text-search.js").FoldedText }> | null} */
+let _searchIndex = null;
+/** Spans currently holding <mark>s → their plain text, restored on the
+ *  next run / clear. @type {Map<HTMLElement, string>} */
+const _markedSpans = new Map();
+/** Every <mark> of the current query, in document order. @type {HTMLElement[]} */
+let _searchHits = [];
+let _searchCurrent = -1;
+let _searchDebounceId = /** @type {number | null} */ (null);
+
+/**
+ * Whether find-in-transcript applies to the current job (app.js uses this
+ * to decide whether Cmd/Ctrl+F is ours or the browser's).
+ * @returns {boolean}
+ */
+export function canSearch() {
+  return !!_job && _shouldShowTab();
+}
+
+/** Focus the find input and select its text (Cmd/Ctrl+F). */
+export function focusSearch() {
+  if (!searchInputEl || !canSearch()) return;
+  searchInputEl.focus();
+  searchInputEl.select();
+}
+
+/**
+ * Prefill the query (library → side panel hand-over) and select the first
+ * match. Before the transcript has rendered this just stores the query —
+ * `_onLinesRendered` applies it, and scrolls to the first match, once the
+ * lazy load finishes.
+ * @param {string} query
+ */
+export function setSearchQuery(query) {
+  if (!searchInputEl || !canSearch()) return;
+  searchInputEl.value = query;
+  _cancelSearchDebounce();
+  _runSearch(query);
+}
+
+/** Called at the end of every _renderLines: fresh DOM, stale cache. */
+function _onLinesRendered() {
+  _searchIndex = null;
+  _markedSpans.clear();
+  _searchHits = [];
+  _searchCurrent = -1;
+  if (_searchQuery) _applySearch();
+}
+
+function _cancelSearchDebounce() {
+  if (_searchDebounceId !== null) {
+    clearTimeout(_searchDebounceId);
+    _searchDebounceId = null;
+  }
+}
+
+/** Drop the query and every highlight (Esc, job switch). */
+function _clearSearch() {
+  _cancelSearchDebounce();
+  if (searchInputEl) searchInputEl.value = "";
+  _runSearch("");
+}
+
+/** @param {string} raw */
+function _runSearch(raw) {
+  _searchQuery = foldQuery(raw);
+  _applySearch();
+}
+
+function _buildSearchIndex() {
+  if (_searchIndex) return _searchIndex;
+  _searchIndex = [];
+  if (!bodyEl) return _searchIndex;
+  for (const el of bodyEl.querySelectorAll("p.tx-line > span.tx-text")) {
+    const span = /** @type {HTMLElement} */ (el);
+    const text = span.textContent || "";
+    _searchIndex.push({ span, text, folded: foldWithMap(text) });
+  }
+  return _searchIndex;
+}
+
+/** Re-highlight every hit of `_searchQuery` and select the first one. */
+function _applySearch() {
+  for (const [span, text] of _markedSpans) span.textContent = text;
+  _markedSpans.clear();
+  _searchHits = [];
+  _searchCurrent = -1;
+  if (_searchQuery) {
+    for (const entry of _buildSearchIndex()) {
+      const ranges = findMatches(entry.folded, _searchQuery);
+      if (ranges.length === 0) continue;
+      const frag = document.createDocumentFragment();
+      let pos = 0;
+      for (const [start, end] of ranges) {
+        if (start > pos) frag.appendChild(document.createTextNode(entry.text.slice(pos, start)));
+        const mark = document.createElement("mark");
+        mark.className = "tx-hit";
+        mark.textContent = entry.text.slice(start, end);
+        frag.appendChild(mark);
+        _searchHits.push(mark);
+        pos = end;
+      }
+      if (pos < entry.text.length) frag.appendChild(document.createTextNode(entry.text.slice(pos)));
+      entry.span.replaceChildren(frag);
+      _markedSpans.set(entry.span, entry.text);
+    }
+  }
+  if (_searchHits.length > 0) _selectHit(0);
+  _renderSearchCount();
+}
+
+/** @param {number} idx */
+function _selectHit(idx) {
+  if (_searchHits.length === 0) return;
+  const n = _searchHits.length;
+  const next = ((idx % n) + n) % n;
+  _searchHits[_searchCurrent]?.classList.remove("tx-hit--current");
+  _searchCurrent = next;
+  const mark = _searchHits[next];
+  mark.classList.add("tx-hit--current");
+  mark.scrollIntoView({ block: "center" });
+  _renderSearchCount();
+}
+
+function _renderSearchCount() {
+  const n = _searchHits.length;
+  if (searchCountEl) {
+    searchCountEl.textContent = !_searchQuery
+      ? ""
+      : n === 0
+        ? "No matches"
+        : `${_searchCurrent + 1} / ${n}`;
+  }
+  if (searchPrevBtn) searchPrevBtn.disabled = n === 0;
+  if (searchNextBtn) searchNextBtn.disabled = n === 0;
+}
+
+searchInputEl?.addEventListener("input", () => {
+  _cancelSearchDebounce();
+  const raw = searchInputEl.value;
+  // Emptying the box (incl. the native ✕ of type=search) clears at once.
+  if (!raw.trim()) {
+    _runSearch("");
+    return;
+  }
+  _searchDebounceId = window.setTimeout(() => {
+    _searchDebounceId = null;
+    _runSearch(raw);
+  }, SEARCH_DEBOUNCE_MS);
+});
+
+searchInputEl?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    // Enter right after typing: apply the pending query now instead of
+    // stepping through stale hits.
+    if (_searchDebounceId !== null || foldQuery(searchInputEl.value) !== _searchQuery) {
+      _cancelSearchDebounce();
+      _runSearch(searchInputEl.value);
+      if (ev.shiftKey && _searchHits.length > 0) _selectHit(-1);
+      return;
+    }
+    _selectHit(_searchCurrent + (ev.shiftKey ? -1 : 1));
+  } else if (ev.key === "Escape") {
+    ev.preventDefault();
+    _clearSearch();
+  }
+});
+
+searchPrevBtn?.addEventListener("click", () => _selectHit(_searchCurrent - 1));
+searchNextBtn?.addEventListener("click", () => _selectHit(_searchCurrent + 1));
 
 /**
  * Binary search ``_cues`` for the line that covers ``currentSec`` and

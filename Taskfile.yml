@@ -84,3 +84,8 @@ tasks:
       - docker compose run --rm daemon ruff check src/
       - docker compose run --rm daemon mypy src/
       - docker compose run --rm daemon pytest
+
+  test:extension:
+    desc: Run the extension's pure-JS unit tests (host node, no deps)
+    cmds:
+      - node --test "extension/tests/*.test.mjs"

@@ -802,8 +802,56 @@ body {
   background: var(--bg);
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 0.3rem;
+}
+/* Find-in-transcript row — wraps onto its own full-width line under the
+   language chips + export icon (flex-basis 100% in a wrapping row). */
+.transcript-search {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0 0.6rem 0.4rem;
+}
+.transcript-search.hidden { display: none; }
+.transcript-search input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.transcript-search input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.transcript-search-count {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.transcript-search button {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1;
+  padding: 0.2rem 0.4rem;
+  cursor: pointer;
+}
+.transcript-search button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 .lang-bar {
   flex: 1;
@@ -1025,6 +1073,18 @@ body {
 }
 .tx-line--current {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+/* Find-in-transcript hits. The current hit gets a stronger, distinct
+   colour so it reads apart from the playing-line highlight above. */
+.tx-line mark.tx-hit {
+  background: color-mix(in srgb, #fbbc04 45%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+.tx-line mark.tx-hit--current {
+  background: #fbbc04;
+  color: #1a1a1a;
+  outline: 1px solid #e37400;
 }
 
 /* In-progress translation: hide the body, show the spinner block. The body
