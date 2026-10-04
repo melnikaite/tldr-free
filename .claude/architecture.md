@@ -138,9 +138,9 @@ rows on daemon startup.
 
 ### Generic media (site captions, else deferred to Whisper)
 
-`JobKind.MEDIA` covers any audio/video the extension finds in the DOM —
-native `<video>`/`<audio>` or an iframe-embed (whitelist lives in
-`extension/src/content/extract.js`). The pipeline branch mirrors
+`JobKind.MEDIA` covers any audio/video the extension offers as a side-panel
+video chip — native `<video>`/`<audio>`, an iframe-embed (whitelist lives in
+`extension/src/lib/page-videos.js`) or a network-sniffed HLS/DASH player. The pipeline branch mirrors
 YouTube-without-the-transcript-API: it probes for the site's own subtitle
 track first (`youtube.download_subtitles`, format-negotiated between
 YouTube's json3 and WebVTT — most non-YouTube sites with captions serve vtt,

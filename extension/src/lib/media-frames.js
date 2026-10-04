@@ -168,12 +168,30 @@ export function cuesFromText(text) {
  * Probe every frame of ``tabId`` and return the frame holding the main
  * media element (marked in-page), or null when there's none.
  *
+ * ``frameIds`` (a video chip's frame) restricts the probe to those frames;
+ * if they are gone (iframe reloaded) it falls back to all frames.
+ *
  * @param {number} tabId
  * @param {DurationRange | null} [range]
+ * @param {number[] | null} [frameIds]
  * @returns {Promise<{ frameId: number, info: MediaInfo } | null>}
  */
-export async function probeTab(tabId, range = null) {
-  const results = await chrome.scripting.executeScript({
+export async function probeTab(tabId, range = null, frameIds = null) {
+  /** @type {chrome.scripting.InjectionResult<any>[] | null} */
+  let results = null;
+  if (frameIds && frameIds.length) {
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId, frameIds },
+        func: probeMedia,
+        args: [range],
+      });
+      if (!results.some((r) => r && r.result)) results = null;
+    } catch {
+      results = null;
+    }
+  }
+  results ||= await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     func: probeMedia,
     args: [range],
@@ -191,10 +209,11 @@ export async function probeTab(tabId, range = null) {
  * @param {number} tabId
  * @param {number} seconds
  * @param {DurationRange | null} [range]
+ * @param {number[] | null} [frameIds] preferred frames (see probeTab)
  * @returns {Promise<boolean>}
  */
-export async function seekTab(tabId, seconds, range = null) {
-  const best = await probeTab(tabId, range);
+export async function seekTab(tabId, seconds, range = null, frameIds = null) {
+  const best = await probeTab(tabId, range, frameIds);
   if (!best) return false;
   const [r] = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [best.frameId] },
@@ -217,6 +236,7 @@ export async function seekTab(tabId, seconds, range = null) {
  *   picks the film up once its metadata loads
  * @param {string | null} [frameUrl] when set, bind only in a frame at
  *   this URL (auto-rebind into the originally bound player)
+ * @param {number[] | null} [frameIds] preferred frames (see probeTab)
  * @returns {Promise<string | null>} bound frame's URL, null = not bound
  */
 export async function installCaptionsInTab(
@@ -225,8 +245,9 @@ export async function installCaptionsInTab(
   lang,
   range = null,
   frameUrl = null,
+  frameIds = null,
 ) {
-  const best = await probeTab(tabId, range);
+  const best = await probeTab(tabId, range, frameIds);
   if (!best || !best.info.isVideo) return null;
   if (range && !best.info.matches) return null;
   if (frameUrl != null && best.info.frameUrl !== frameUrl) return null;

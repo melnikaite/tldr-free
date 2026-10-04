@@ -35,38 +35,66 @@ pipelines stalls subsequent fetches in DevTools-invisible ways. The global
 `/events` stream with a client-side `job_id` filter gets the same per-job
 view over one socket.
 
-## Media detection: duration-based reject, not visibility-based
+## Toolbar = page; videos are chips
 
-`content/extract.js`'s `collectNativeMedia()` accepts any `<video>`/`<audio>`
-with a resolvable src — including elements with no `controls` attribute and
-zero on-screen size. That's deliberate: a hidden `<audio>` driven entirely by
-its own JS is the NORMAL way real audio players are built (SoundCloud,
-Bandcamp, any custom podcast widget), and filtering on visibility/`controls`
-would break exactly the sites the audio path exists for.
+The toolbar button (and the panel's "Summarize this page") always makes the
+**page** job, keyed by `normalizeUrl(tab.url)`: `content/extract.js` is just
+Readability → `extracted-page`. The only exception is a YouTube watch page
+(`youtube.js`, kind=youtube — the page IS the video). Videos on a page are
+offered separately as **video chips** in the side panel (see "Video chips"
+below); `background.js`'s `handleAnalyzeVideo` (message `analyze-video`
+`{tabId, chip}`) creates their jobs.
 
-The one filter that IS applied to both `<video>` and `<audio>` is
-**duration**: `MIN_MEDIA_DURATION_SECONDS` (12s) rejects an element only when
-`el.duration` is a **known finite number** below the threshold. `NaN` /
-`Infinity` / unset (e.g. `preload="none"`, never played — normal for a
-script-driven hidden player) is never rejected on this basis — an unplayed
-element simply hasn't reported a duration yet, which is not evidence it's
-short. This exists to stop invisible zero-duration UI sounds ("ding" on
-notification, click, etc.) from being treated as summarizable content; the
-existing on-screen-size filter for `<video>` (area/videoWidth check) is
-unrelated and untouched.
+## Video chips
 
-The daemon has a matching, independently-gated probe before it ever
-downloads a `kind=media` job's audio — see [workers.md](workers.md).
+`sidepanel/app.js` ("Video chips" section) shows a chip bar under the topbar:
+**Page** + one chip per video live in the current tab (hidden while there are
+none). Each chip is an independent job — own summary, transcript, chat,
+captions, seek. Pure logic in `lib/page-videos.js` (tests:
+`tests/page-videos.test.mjs`).
 
-Because a hidden/short media element can still slip past this filter (a
-probe run server-side can disagree with the DOM value, or duration is simply
-unknown client-side), `extract.js` now also does a best-effort page-text
-extraction (`extractPageText()`, the same Readability-or-innerText logic the
-no-media `extracted-page` branch has always used) and includes it as a
-`text` field on the `extracted-media` message. `background.js`'s
-`handleExtractedMedia` forwards it as `page_text` on the `JobCreateRequest`
-so the daemon has something to summarize instead of audio if the media turns
-out not to be speech, or Whisper returns nothing.
+Sources, rebuilt by `refreshChips()` from an `executeScript({allFrames})`
+of `scanFrame` plus `sniff:<tabId>`:
+
+- whitelisted embed iframes (`EMBED_PATTERNS`, incl. `youtube(-nocookie).com/embed/<id>`);
+  a frame whose own URL is such an embed only enriches that chip (duration,
+  playing, frameId) — never a second chip;
+- native `<video>/<audio>` with an http(s) src, any frame;
+- `blob:` (MSE) players in a frame for which the sniffer recorded a manifest
+  from the same origin (on kinogo-like sites: only after the user presses play).
+
+Known duration < 60 s → dropped (ads, VAST pre-rolls, UI sounds). Native and
+sniffed items need a known duration (it's in their key); an embed with an
+unknown duration is kept. Visibility/`controls` are deliberately not used
+(hidden script-driven `<audio>` is how real audio players are built).
+
+**Key = job URL** (identity; POST /jobs and `listJobs({url})` dedup on it):
+
+- YouTube embed → `https://www.youtube.com/watch?v=<id>`, a normal kind=youtube job;
+- other embed → normalized embed URL as both `url` and `media_url`, kind=media;
+- native / sniffed → `${normalizeUrl(pageUrl)}#tldr-video=${Math.round(duration)}`
+  (iframe/manifest URLs carry per-load tokens, duration doesn't; it also
+  separates trailer from film). `normalizeUrl` strips fragments, so this key is
+  passed as `jobUrl` and sent verbatim — never re-normalize it. Sniffed
+  chips get `media_url`/`media_headers`/`sniffed_streams` from the frame
+  origin's entries (whole tab list if none match), as the old sniff path did.
+
+No DB restore: a vanished video's chip just disappears; its job stays a
+normal Library row. Refresh: on panel open, tab switch, `sniff:<tabId>`
+change (debounced 300 ms), and a 3 s poll while the panel is visible. Job
+ids per key are cached (`_jobIdByKey`, filled via `listJobs`, updated by
+`job-created` / deletes); a chip without a job is dashed and opens a CTA
+("Analyze this video"); the playing element's chip gets a green dot.
+
+Selection follows the shown job: `setActiveJob` → `_syncChipsToJob` picks
+the chip whose key equals `job.url` (so a job created from a chip lands on
+it when background flips `activeJobId`). A selected video chip becomes
+`transcript.setMediaTarget({tabId, frameId, duration})`: source-tab lookup,
+probe/seek/captions (`probeTab`/`seekTab`/`installCaptionsInTab` take
+preferred `frameIds`, falling back to all frames) and the expected-duration
+fallback all use it — so an embed's kind=youtube job seeks inside the
+iframe instead of navigating to youtube.com. The selected chip is remembered
+per tabId in memory and restored after a tab switch.
 
 ## Network stream sniffing (players in cross-origin iframes)
 
@@ -82,10 +110,13 @@ the single recording point (non-2xx and segments are never recorded). Lists
 live in `chrome.storage.session` under `sniff:<tabId>` (cap 40, oldest
 dropped), cleared on a `main_frame` request and on tab close.
 
-`handleExtractedPage` checks that list first: if it has a manifest, it
-submits a `kind=media` job instead (earliest manifest = `media_url`, the
+The list feeds the side panel's video chips (a `blob:` player in a frame
+whose origin has a sniffed manifest → a chip; see "Video chips"). When such a
+chip is analyzed, `handleAnalyzeVideo` submits a `kind=media` job: the
+frame origin's manifests via `pickSniffedMedia` (default `media_url`, the
 others as `alt_media_candidates` "Stream N (HLS/DASH)"), with
 `media_headers` built from the recorded headers (frame origin as fallback).
+The toolbar no longer turns a sniffed manifest into a media job.
 Subtitle entries are recorded but not yet used — they'd be wrong in the
 "wrong source?" picker, which hands its pick to yt-dlp as media.
 
@@ -109,16 +140,6 @@ request by `documentUrl`/`initiator` origin to the latest-seen tab that
 player origin: the latest-seen frame wins (a SW request carries no tab
 info, so it can be misattributed until the other tab's frame reloads).
 Pure helpers: `recordFrame`/`lookupFrameTabs`/`pruneFrameTab`.
-
-**Debug ring.** Requests `classifyStream` rejected (xhr/media/other, minus
-images/fonts/css/js) from player contexts only — service-worker requests
-(`viaSW`) or sub-frames (`frameId > 0`); top-frame requests are dropped by a
-sync check before attribution or storage access (`shouldDebugRecord`) — go to `chrome.storage.session["sniffdbg:<tabId>"]`
-(newest 40, `{host, pathTail, ext, contentType, status, viaSW, ts}`, never
-the query string), cleared together with `sniff:`. When `handleExtractedPage`
-falls back to a page job, it `console.info`s that ring and the sniff list.
-To inspect: `chrome://extensions` → TLDR → "service worker" → Console, then
-`chrome.storage.session.get(null)`.
 
 ## PDF tabs bypass content-script extraction
 
@@ -284,6 +305,14 @@ in active tab), `windows.onFocusChanged`. On any of those:
 
 - `jobId` resolved → `loadAndRender(jobId)`
 - `jobId === null` → render the "no summary yet" placeholder with the URL
+
+The lookup is an exact `url` match, so it only ever finds the **page** job
+(video-chip jobs are keyed `<page>#tldr-video=N` / embed URLs). Messages
+carry `tabId`; while a video chip of the same tab + page is shown, the panel
+ignores `set-active-tab` and the matching `activeJobId` storage change (focus
+returning to the tab must not yank it back to the page job). A real tab
+switch resets the chips to that tab (Page selected, then the remembered chip
+if it is still live).
 
 **Non-summarizable tabs are skipped**: `chrome-extension://` (including our
 own Library), `chrome://`, `about:blank`, `file://`. Glancing at the Library
@@ -482,7 +511,7 @@ library writes — storage is what a freshly opened panel reads on boot.
   `{jobId, query}` from the library, consumed by the side panel (see
   "Find in transcript")
 - `chrome.storage.session["sniff:<tabId>"]` — network-sniffed manifests/subtitles for that tab (see "Network stream sniffing")
-- `chrome.storage.session["sniffdbg:<tabId>"]` / `["sniffFrames"]` — sniffer debug ring / frame-origin → tab map for service-worker attribution
+- `chrome.storage.session["sniffFrames"]` — frame-origin → tab map for service-worker attribution
 - `chrome.storage.local.daemonUrl` — daemon endpoint (default `http://localhost:8765`)
 - `chrome.storage.local.daemonEverReachable` — set `true` by
   `daemon.health()` (lib/daemon-client.js) on its first-ever successful

@@ -11,18 +11,15 @@ import { stringifyError } from "./lib/utils.js";
 import { setPanelBehavior, openSidePanel } from "./lib/browser-compat.js";
 import {
   classifyStream,
-  debugEntry,
-  shouldDebugRecord,
   headerValue,
   lookupFrameTabs,
   pickSniffedMedia,
   pruneFrameTab,
-  pushDebug,
   recordFrame,
-  summarizeDebug,
   toSniffedStreams,
   upsertStream,
 } from "./lib/stream-sniff.js";
+import { scopeSniffed } from "./lib/page-videos.js";
 
 /** @import {
  *   JobCreateRequest,
@@ -61,7 +58,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // Network stream sniffer. Players inside cross-origin iframes (hls.js /
 // MediaSource, blob: src) are invisible to the content script, but their
 // manifests cross the network. Record HLS/DASH manifests and subtitle files
-// per tab so handleExtractedPage can fall back to a media job. Listeners are
+// per tab so the side panel can offer those players as video chips. Listeners are
 // registered at top level so a request wakes the service worker; the lists
 // live in chrome.storage.session to survive SW sleep.
 // ---------------------------------------------------------------------------
@@ -75,8 +72,6 @@ const SNIFF_TYPES = /** @type {chrome.webRequest.ResourceType[]} */ ([
 
 /** @param {number} tabId */
 const sniffKey = (tabId) => `${SNIFF_KEY_PREFIX}${tabId}`;
-/** @param {number} tabId */
-const sniffDebugKey = (tabId) => `sniffdbg:${tabId}`;
 const FRAME_ORIGINS_KEY = "sniffFrames";
 
 // requestId → request headers seen in onSendHeaders, consumed by
@@ -114,35 +109,9 @@ function updateSniffed(tabId, update) {
   return next;
 }
 
-/**
- * Debug ring of rejected requests per tab (see "Network stream sniffing" in
- * .claude/extension.md). Shares the per-tab write chain with the sniff list.
- *
- * @param {number} tabId
- * @param {(ring: import("./lib/stream-sniff.js").SniffDebugEntry[]) => import("./lib/stream-sniff.js").SniffDebugEntry[] | null} update
- */
-function updateSniffDebug(tabId, update) {
-  const prev = sniffWriteChains.get(tabId) || Promise.resolve();
-  const next = prev
-    .then(async () => {
-      const key = sniffDebugKey(tabId);
-      const stored = await chrome.storage.session.get(key);
-      const ring = update(stored[key] || []);
-      if (ring === null) await chrome.storage.session.remove(key);
-      else await chrome.storage.session.set({ [key]: ring });
-    })
-    .catch((err) => console.warn("[TLDR] sniff debug store", err))
-    .finally(() => {
-      if (sniffWriteChains.get(tabId) === next) sniffWriteChains.delete(tabId);
-    });
-  sniffWriteChains.set(tabId, next);
-  return next;
-}
-
 /** @param {number} tabId */
 function clearSniffed(tabId) {
   updateSniffed(tabId, () => null);
-  updateSniffDebug(tabId, () => null);
 }
 
 // Frame origin → tabs hosting a frame of that origin (most recent first).
@@ -238,18 +207,11 @@ async function onSniffHeadersReceived(details) {
   const viaSW = details.tabId < 0;
   const contentType = headerValue(details.responseHeaders, "Content-Type");
   const kind = classifyStream(details.url, contentType);
-  // Cheap, sync gate: rejected top-frame requests never reach the debug ring,
-  // so skip attribution and storage entirely for them.
-  if (!kind && !shouldDebugRecord({ frameId: details.frameId, viaSW })) return;
+  if (!kind) return;
+  if (details.statusCode < 200 || details.statusCode >= 300) return;
   const tabId = viaSW ? await attributeSwRequest(details) : details.tabId;
   if (tabId === null) return;
   const now = Date.now();
-  if (!kind) {
-    const dbg = debugEntry(details.url, contentType, details.statusCode, viaSW, now);
-    if (dbg) updateSniffDebug(tabId, (ring) => pushDebug(ring, dbg));
-    return;
-  }
-  if (details.statusCode < 200 || details.statusCode >= 300) return;
   const entry = {
     url: details.url,
     kind,
@@ -486,10 +448,13 @@ chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
     );
     return false;
   }
-  if (msg.type === "extracted-media") {
-    handleExtractedMedia(msg, sourceTabId).catch((e) =>
-      console.error("[TLDR] handleExtractedMedia", e),
-    );
+  if (msg.type === "analyze-video") {
+    // From the side panel's video-chip CTA (sender has no tab — the target
+    // tab travels in the message).
+    handleAnalyzeVideo(msg).catch((e) => {
+      console.error("[TLDR] analyze-video", e);
+      broadcast({ type: "extraction-error", error: stringifyError(e) });
+    });
     return false;
   }
   if (msg.type === "summarize-active-tab") {
@@ -514,47 +479,9 @@ async function handleSummarizeActiveTab() {
  *   panel (only when the user is still on that tab).
  */
 async function handleExtractedPage(msg, sourceTabId) {
-  // No media in the DOM — but a player in a cross-origin iframe may still
-  // have fetched an HLS/DASH manifest. Prefer that over the page text.
-  if (sourceTabId !== null) {
-    let sniffed = null;
-    let sniffedStreams = null;
-    try {
-      const list = await getSniffed(sourceTabId);
-      sniffed = pickSniffedMedia(list);
-      sniffedStreams = toSniffedStreams(list);
-    } catch (err) {
-      console.warn("[TLDR] sniffed streams lookup failed", err);
-    }
-    if (!sniffed) {
-      try {
-        const stored = await chrome.storage.session.get(sniffDebugKey(sourceTabId));
-        console.info(
-          `[TLDR] no manifest sniffed for tab ${sourceTabId}; ` +
-            `sniffed=${sniffedStreams?.length ?? 0}, recent unclassified requests:`,
-          summarizeDebug(stored[sniffDebugKey(sourceTabId)] || []),
-          sniffedStreams,
-        );
-      } catch {
-        // diagnostics only
-      }
-    }
-    if (sniffed) {
-      await handleExtractedMedia(
-        {
-          url: msg.url,
-          mediaUrl: sniffed.mediaUrl,
-          altCandidates: sniffed.altCandidates,
-          mediaHeaders: sniffed.mediaHeaders,
-          sniffedStreams,
-          title: msg.title,
-          text: msg.text,
-        },
-        sourceTabId,
-      );
-      return;
-    }
-  }
+  // Toolbar = this page, always. Videos found on the page (including a
+  // sniffed HLS/DASH player) are offered as video chips in the side panel
+  // and submitted via `analyze-video` — see handleAnalyzeVideo.
   /** @type {JobCreateRequest} */
   const req = {
     url: normalizeUrl(msg.url),
@@ -608,10 +535,13 @@ function _mergeCookies(primary, extra) {
  * cookies from sibling subdomains.
  *
  * ``mediaHeaders`` is set only for network-sniffed streams (see
- * handleExtractedPage): the Referer/Origin/User-Agent the player sent,
+ * handleAnalyzeVideo): the Referer/Origin/User-Agent the player sent,
  * which pirate-ish CDNs check.
  *
- * @param {{url:string, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], mediaHeaders?:Record<string,string>|null, sniffedStreams?:import("./lib/api-types.js").SniffedStream[]|null, title?:string|null, text?:string}} msg
+ * ``jobUrl`` (video chips) overrides the job's ``url``; ``url`` stays the
+ * page URL for cookies.
+ *
+ * @param {{url:string, jobUrl?:string|null, mediaUrl:string, altCandidates?:{mediaUrl:string,kind:string,label:string}[], mediaHeaders?:Record<string,string>|null, sniffedStreams?:import("./lib/api-types.js").SniffedStream[]|null, title?:string|null, text?:string}} msg
  * @param {number|null} sourceTabId
  */
 async function handleExtractedMedia(msg, sourceTabId) {
@@ -643,7 +573,9 @@ async function handleExtractedMedia(msg, sourceTabId) {
 
   /** @type {JobCreateRequest} */
   const req = {
-    url: normalizeUrl(msg.url),
+    // A video chip's key (`…#tldr-video=N`) is the job identity and must
+    // reach the daemon verbatim — normalizeUrl would strip the fragment.
+    url: msg.jobUrl || normalizeUrl(msg.url),
     kind: "media",
     media_url: msg.mediaUrl,
     alt_media_candidates: altCandidates.length ? altCandidates : null,
@@ -658,6 +590,53 @@ async function handleExtractedMedia(msg, sourceTabId) {
     sniffed_streams: msg.sniffedStreams?.length ? msg.sniffedStreams : null,
   };
   await submitJob(req, sourceTabId);
+}
+
+/**
+ * Create the job for one side-panel video chip (lib/page-videos.js). The
+ * chip's ``key`` is the job URL, so a repeat click reuses the daemon's job.
+ *
+ *   youtube → kind=youtube for the canonical watch URL
+ *   embed   → kind=media, url = media_url = normalized embed URL
+ *   native  → kind=media, media_url = element src, url = key
+ *   stream  → kind=media from the sniffed manifests of that frame's origin
+ *             (whole tab list if none match), same shape as before
+ *
+ * @param {{tabId: number, chip: import("./lib/page-videos.js").VideoChip}} msg
+ */
+async function handleAnalyzeVideo({ tabId, chip }) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab?.url || !chip?.key) return;
+  const title = [tab.title, chip.label].filter(Boolean).join(" — ") || null;
+  if (chip.type === "youtube") {
+    await handleExtractedYouTube({ url: chip.key, title: null }, tabId);
+    return;
+  }
+  if (chip.type === "stream") {
+    const list = await getSniffed(tabId);
+    const scoped = scopeSniffed(list, chip.frameUrl);
+    const use = scoped.some((e) => e.kind === "hls" || e.kind === "dash") ? scoped : list;
+    const sniffed = pickSniffedMedia(use);
+    if (!sniffed) throw new Error("No stream was captured for this player yet — press play and try again.");
+    await handleExtractedMedia(
+      {
+        url: tab.url,
+        jobUrl: chip.key,
+        mediaUrl: sniffed.mediaUrl,
+        altCandidates: sniffed.altCandidates,
+        mediaHeaders: sniffed.mediaHeaders,
+        sniffedStreams: toSniffedStreams(use),
+        title,
+      },
+      tabId,
+    );
+    return;
+  }
+  if (!chip.mediaUrl) return;
+  await handleExtractedMedia(
+    { url: tab.url, jobUrl: chip.key, mediaUrl: chip.mediaUrl, title },
+    tabId,
+  );
 }
 
 /**
@@ -746,7 +725,10 @@ async function submitJob(req, sourceTabId) {
 // Tab tracking — sidepanel content follows the active tab.
 //
 // On any change to the active tab (switched, navigated, window focus moved),
-// look up whether we have a cached job for the new URL. If yes, point the
+// look up whether we have a cached job for the new URL (the PAGE job: the
+// lookup is an exact url match, so video-chip jobs keyed
+// `<page>#tldr-video=N` never answer it). `tabId` lets the panel tell a
+// real tab switch from a focus change on the tab whose video chip it shows. If yes, point the
 // sidepanel at it; if no, point it at "empty / not yet summarized" state.
 // ---------------------------------------------------------------------------
 
@@ -794,7 +776,7 @@ async function syncSidepanelForTab(tab) {
   // daemon. jobId is omitted to mean "still resolving". The panel uses this
   // to decide whether to blank to a spinner (different URL) or stay put
   // (same URL — e.g. window focus restored on the same tab).
-  await broadcast({ type: "set-active-tab", version, url: normalized });
+  await broadcast({ type: "set-active-tab", version, url: normalized, tabId: tab.id });
 
   let jobId = null;
   try {
@@ -811,7 +793,7 @@ async function syncSidepanelForTab(tab) {
   if (version !== switchVersion) return;
 
   await chrome.storage.session.set({ activeJobId: jobId, activeUrl: normalized });
-  await broadcast({ type: "set-active-tab", version, url: normalized, jobId });
+  await broadcast({ type: "set-active-tab", version, url: normalized, jobId, tabId: tab.id });
 }
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {

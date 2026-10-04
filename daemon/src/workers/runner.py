@@ -49,7 +49,8 @@ from src.workers.queue import WhisperQueue
 
 log = logging.getLogger(__name__)
 
-# Mirrors extension/src/content/extract.js's MIN_MEDIA_DURATION_SECONDS.
+# Floor for kind=media; the extension's video chips use a stricter 60 s
+# (extension/src/lib/page-videos.js MIN_VIDEO_SECONDS).
 # Probed duration below this many seconds means the "media" the extension
 # found almost certainly isn't speech — a UI notification ding, not a
 # podcast/lecture — so we skip Whisper transcription entirely and fall back

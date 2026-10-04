@@ -1097,3 +1097,53 @@ body {
 .transcript-translating .spinner {
   margin: 0 auto 0.6rem;
 }
+
+/* ---------------------------------------------------------------------------
+ * Video chips (app.js "Video chips"): Page + one per live video. Not sticky —
+ * the topbar → tab-nav → lang-bar sticky offsets stay as they are.
+ * ------------------------------------------------------------------------- */
+.chip-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.chip-bar[hidden] { display: none; }
+.video-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 100%;
+  padding: 0.15rem 0.55rem;
+  font: inherit;
+  font-size: 0.85em;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.video-chip:hover { background: var(--assistant-bg); }
+.video-chip--nojob { border-style: dashed; color: var(--muted); }
+.video-chip--active {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--user-bg);
+  color: var(--user-fg);
+}
+.video-chip__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14em;
+}
+.video-chip__dur { color: var(--muted); font-variant-numeric: tabular-nums; }
+.video-chip--playing::before {
+  content: "";
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: #1e8e3e;
+  box-shadow: 0 0 0 2px rgba(30, 142, 62, 0.25);
+}

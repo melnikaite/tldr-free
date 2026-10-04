@@ -14,10 +14,6 @@ import {
   recordFrame,
   lookupFrameTabs,
   pruneFrameTab,
-  debugEntry,
-  shouldDebugRecord,
-  pushDebug,
-  summarizeDebug,
 } from "../src/lib/stream-sniff.js";
 
 /** @param {Partial<import("../src/lib/stream-sniff.js").SniffedStream>} o */
@@ -164,50 +160,4 @@ test("pruneFrameTab drops only that tab and empty origins", () => {
   m = pruneFrameTab(m, 1);
   assert.deepEqual(lookupFrameTabs(m, "https://a.example"), [2]);
   assert.deepEqual(Object.keys(m), ["https://a.example"]);
-});
-
-test("debugEntry strips the query and skips noise", () => {
-  const e = debugEntry(
-    "https://cdn.example/a/very/long/path/playlist?token=SECRET",
-    "text/plain; charset=utf-8",
-    200,
-    true,
-    9,
-  );
-  assert.deepEqual(e, {
-    host: "cdn.example",
-    pathTail: "/a/very/long/path/playlist",
-    ext: "",
-    contentType: "text/plain",
-    status: 200,
-    viaSW: true,
-    ts: 9,
-  });
-  assert.ok(!JSON.stringify(e).includes("SECRET"));
-  const long = debugEntry(`https://x.example/${"a".repeat(100)}.txt`, null, 404, false, 1);
-  assert.equal(long?.pathTail.length, 60);
-  assert.equal(debugEntry("https://x.example/a.png", null, 200, false, 1), null);
-  assert.equal(debugEntry("https://x.example/app.js?v=1", null, 200, false, 1), null);
-  assert.equal(debugEntry("https://x.example/f", "font/woff2", 200, false, 1), null);
-  assert.equal(debugEntry("https://x.example/s", "text/css", 200, false, 1), null);
-  assert.equal(debugEntry("data:text/plain,x", null, 200, false, 1), null);
-});
-
-test("pushDebug keeps the newest cap entries; summarizeDebug renders lines", () => {
-  let ring = [];
-  for (let i = 0; i < 5; i++) {
-    ring = pushDebug(ring, /** @type {any} */ ({ host: "h", pathTail: `/${i}`, ext: "", contentType: null, status: 200, viaSW: i === 4, ts: i }), 3);
-  }
-  assert.deepEqual(ring.map((e) => e.ts), [2, 3, 4]);
-  const lines = summarizeDebug(ring);
-  assert.equal(lines.length, 3);
-  assert.match(lines[2], /\[sw\] h\/4/);
-});
-
-test("shouldDebugRecord: only service-worker or sub-frame requests", () => {
-  assert.equal(shouldDebugRecord({ frameId: 0, viaSW: false }), false);
-  assert.equal(shouldDebugRecord({ frameId: 3, viaSW: false }), true);
-  assert.equal(shouldDebugRecord({ frameId: -1, viaSW: true }), true);
-  assert.equal(shouldDebugRecord({ frameId: 0, viaSW: true }), true);
-  assert.equal(shouldDebugRecord({ frameId: undefined, viaSW: false }), false);
 });

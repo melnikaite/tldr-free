@@ -158,6 +158,49 @@ let _pollId = /** @type {number | null} */ (null);
 /** Tab id we're polling. Re-resolved per poll if it goes stale. */
 let _pollTabId = /** @type {number | null} */ (null);
 
+/**
+ * Where this job's media lives when it was opened from a side-panel video
+ * chip (app.js sets it): that tab + frame, and the chip's duration as the
+ * expected-duration fallback. null = the usual source-tab lookup (YouTube
+ * tab by video id / tab by page URL). Lets a kind=youtube job from an
+ * embed chip seek and caption inside the iframe instead of youtube.com.
+ *
+ * @typedef {{ tabId: number, frameId: number | null, duration: number | null }} MediaTarget
+ * @type {MediaTarget | null}
+ */
+let _mediaTarget = null;
+
+/**
+ * @param {MediaTarget | null} target
+ */
+export function setMediaTarget(target) {
+  const prev = _mediaTarget;
+  _mediaTarget = target;
+  const same = prev === target || (!!prev && !!target
+    && prev.tabId === target.tabId && prev.frameId === target.frameId
+    && prev.duration === target.duration);
+  if (same) return;
+  if (_pollId !== null) {
+    _stopPoll();
+    _startPoll().catch(() => {});
+  }
+}
+
+/** @returns {MediaTarget | null} */
+export function getMediaTarget() {
+  return _mediaTarget;
+}
+
+/** Preferred frames for probes (the chip's frame), or null for all. */
+export function mediaTargetFrames() {
+  return _mediaTarget && _mediaTarget.frameId != null ? [_mediaTarget.frameId] : null;
+}
+
+/** Job duration, else the chip's (before the daemon has filled it in). */
+function _expectedDuration() {
+  return _job?.duration_seconds || _mediaTarget?.duration || null;
+}
+
 /** Has the user clicked into this tab at least once for this job? */
 let _opened = false;
 
@@ -1274,7 +1317,7 @@ async function _pollOnce() {
  */
 async function _readMediaState(tabId) {
   try {
-    const best = await probeTab(tabId, expectedMediaRange());
+    const best = await probeTab(tabId, expectedMediaRange(), mediaTargetFrames());
     if (!best) return null;
     _maybeRebindCaptions(best.info);
     // Known duration but nothing matches (ad, another video, different
@@ -1524,6 +1567,7 @@ function _highlight(currentSec, scroll) {
  */
 async function _findSourceTab() {
   if (!_job) return null;
+  if (_mediaTarget) return _mediaTarget.tabId;
   try {
     const videoId = resolveVideoId(_job);
     if (videoId) {
@@ -1595,8 +1639,9 @@ async function _injectCaptionsIntoTab(data, auto = false) {
       tabId,
       cues,
       data.language_code || "x-tldr",
-      expectedRange(_job.duration_seconds, cues[cues.length - 1].start),
+      expectedRange(_expectedDuration(), cues[cues.length - 1].start),
       auto ? _boundFrameUrl : null,
+      mediaTargetFrames(),
     );
     if (bound) _boundFrameUrl = bound;
   } catch {
@@ -1615,7 +1660,7 @@ async function _injectCaptionsIntoTab(data, auto = false) {
 export function expectedMediaRange() {
   if (!_job) return null;
   return expectedRange(
-    _job.duration_seconds,
+    _expectedDuration(),
     _cues.length ? _cues[_cues.length - 1].sec : 0,
   );
 }

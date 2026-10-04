@@ -38,6 +38,14 @@ import {
 } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { seekTab } from "../lib/media-frames.js";
+import {
+  EMBED_PATTERNS,
+  buildChips,
+  chipKeyForJob,
+  formatDuration,
+  scanFrame,
+} from "../lib/page-videos.js";
+import { normalizeUrl } from "../lib/url.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
   setActiveJob as _chatSetActiveJob,
@@ -70,6 +78,7 @@ let _lastBroadcastJobId = /** @type {string | null} */ (null);
  */
 function setActiveJob(job) {
   _chatSetActiveJob(job);
+  _syncChipsToJob(job);
   transcript.setJob(job);
   const newId = job?.id ?? null;
   const wasNoJob = _lastBroadcastJobId == null;
@@ -119,6 +128,268 @@ const activeJobIds = new Set();
 
 openLibraryBtn?.addEventListener("click", () => {
   chrome.tabs.create({ url: chrome.runtime.getURL("src/library/index.html") });
+});
+
+// ---------------------------------------------------------------------------
+// Video chips (see lib/page-videos.js and "Video chips" in .claude/extension.md)
+//
+// A chip bar under the topbar: "Page" (the page job, what the toolbar
+// makes) plus one chip per video live in the current tab. Each chip is its
+// own job, found by its key (= job URL). Chips are rebuilt from the tab on
+// open / tab switch / sniff:<tabId> change / a 3 s poll while visible —
+// never restored from the DB. The bar is hidden while a tab has no videos.
+//
+// Selection follows the shown job (`_syncChipsToJob`, called from
+// setActiveJob): whichever chip's key equals job.url is highlighted, so a
+// job created from a chip (background flips activeJobId) lands on it. A
+// video chip's tab/frame/duration become transcript.js's media target, so
+// seek + captions hit that element.
+// ---------------------------------------------------------------------------
+
+const chipBarEl = /** @type {HTMLElement | null} */ (document.getElementById("chip-bar"));
+const CHIP_POLL_MS = 3000;
+/** Tab the chips describe. @type {number | null} */
+let _chipTabId = null;
+/** normalizeUrl(tab.url) — the Page chip's key. */
+let _chipPageUrl = "";
+/** @type {import("../lib/page-videos.js").VideoChip[]} */
+let _chips = [];
+/** "page", a video chip key, or null (shown job isn't one of this tab's). @type {string | null} */
+let _selectedChip = "page";
+/** Selected chip per tab, in memory only. @type {Map<number, string>} */
+const _selectedByTab = new Map();
+/** key → job id (null = no job yet). Filled lazily via listJobs({url}). @type {Map<string, string | null>} */
+const _jobIdByKey = new Map();
+let _chipPollId = /** @type {number | null} */ (null);
+let _chipRefreshSeq = 0;
+let _chipRefreshTimer = /** @type {number | null} */ (null);
+let _chipBarSig = "";
+
+const _YT_WATCH_RE = /^https?:\/\/(?:[^/]*\.)?(?:youtube\.com|youtu\.be)\//i;
+const _PDF_RE = /\.pdf(?:$|[?#])/i;
+
+function _startChipPoll() {
+  if (_chipPollId !== null) return;
+  _chipPollId = /** @type {number} */ (
+    setInterval(() => refreshChips().catch(() => {}), CHIP_POLL_MS)
+  );
+}
+
+function _stopChipPoll() {
+  if (_chipPollId !== null) clearInterval(_chipPollId);
+  _chipPollId = null;
+}
+
+function _scheduleChipRefresh() {
+  if (_chipRefreshTimer !== null) return;
+  _chipRefreshTimer = /** @type {number} */ (
+    setTimeout(() => {
+      _chipRefreshTimer = null;
+      refreshChips().catch(() => {});
+    }, 300)
+  );
+}
+
+/** Active tab of the panel's window. */
+async function _panelTab() {
+  const win = await chrome.windows.getCurrent();
+  const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+  return tab;
+}
+
+/**
+ * A different tab (or a navigation) — forget its chips; selection goes back
+ * to Page. Called on set-active-tab phase 1.
+ * @param {number | null} tabId
+ */
+function _resetChipsForTab(tabId) {
+  if (tabId != null && tabId === _chipTabId) return;
+  _chipTabId = tabId;
+  _chipPageUrl = "";
+  _chips = [];
+  _selectedChip = "page";
+  transcript.setMediaTarget(null);
+  _renderChipBar();
+  refreshChips().catch(() => {});
+}
+
+/**
+ * Whether a set-active-tab for (tabId, url) concerns the tab/page whose
+ * video chip is on screen right now.
+ * @param {number | undefined} tabId
+ * @param {string} url
+ */
+function _isVideoChipShownFor(tabId, url) {
+  return tabId != null && tabId === _chipTabId && url === _chipPageUrl
+    && !!_selectedChip && _selectedChip !== "page";
+}
+
+/** Rescan the current tab and rebuild the chip list. */
+async function refreshChips() {
+  const seq = ++_chipRefreshSeq;
+  const tab = await _panelTab();
+  const usable = !!(tab?.id && tab.url && /^https?:/i.test(tab.url)
+    && !_YT_WATCH_RE.test(tab.url) && !_PDF_RE.test(tab.url));
+  if (!usable || !tab?.id || !tab.url) {
+    // No chips here (YouTube watch page = the video itself, PDFs, chrome://).
+    if (seq !== _chipRefreshSeq) return;
+    _chips = [];
+    _renderChipBar();
+    return;
+  }
+  const tabId = tab.id;
+  const pageUrl = normalizeUrl(tab.url);
+  /** @type {any[]} */
+  let frames = [];
+  try {
+    frames = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: scanFrame,
+      args: [EMBED_PATTERNS],
+    });
+  } catch {
+    // restricted page / tab closing
+  }
+  const key = `sniff:${tabId}`;
+  const stored = await chrome.storage.session.get(key);
+  const chips = buildChips({ pageUrl: tab.url, frames, sniffed: stored[key] || [] });
+  const unknown = [pageUrl, ...chips.map((c) => c.key)].filter((k) => !_jobIdByKey.has(k));
+  await Promise.all(unknown.map(async (k) => {
+    try {
+      const resp = await daemon.listJobs({ url: k, limit: 1 });
+      _jobIdByKey.set(k, resp.items?.[0]?.id ?? null);
+    } catch {
+      // daemon down — retried on the next refresh
+    }
+  }));
+  if (seq !== _chipRefreshSeq) return;
+  if (tabId !== _chipTabId || pageUrl !== _chipPageUrl) {
+    _chipTabId = tabId;
+    _chipPageUrl = pageUrl;
+    _selectedChip = "page";
+  }
+  _chips = chips;
+  const shownKey = _selectedChip && _selectedChip !== "page" ? _selectedChip : null;
+  if (shownKey && !chips.some((c) => c.key === shownKey) && currentRender?.key.startsWith("video-cta:")) {
+    // The video vanished while its CTA was up — back to the page.
+    _selectChip("page").catch(() => {});
+    return;
+  }
+  _syncChipsToJob(peekActiveJob());
+  _renderChipBar();
+}
+
+/**
+ * Highlight the chip of ``job`` and point transcript.js at its media.
+ * @param {import("../lib/api-types.js").JobDetails | null} job
+ */
+function _syncChipsToJob(job) {
+  if (job) {
+    if (job.url) _jobIdByKey.set(job.url, job.id);
+    _selectedChip = chipKeyForJob(job.url, _chipPageUrl, _chips);
+    if (_selectedChip && _chipTabId != null) _selectedByTab.set(_chipTabId, _selectedChip);
+  }
+  const chip = _chips.find((c) => c.key === _selectedChip);
+  transcript.setMediaTarget(
+    job && chip && _chipTabId != null
+      ? { tabId: _chipTabId, frameId: chip.frameId, duration: chip.duration }
+      : null,
+  );
+  _renderChipBar();
+}
+
+/**
+ * Show a chip: its job, or the no-summary / CTA state when it has none.
+ * @param {string} key "page" or a video chip key
+ */
+async function _selectChip(key) {
+  if (_chipTabId != null) _selectedByTab.set(_chipTabId, key);
+  _selectedChip = key;
+  const jobKey = key === "page" ? _chipPageUrl : key;
+  let jobId = _jobIdByKey.get(jobKey);
+  if (jobId === undefined && jobKey) {
+    try {
+      const resp = await daemon.listJobs({ url: jobKey, limit: 1 });
+      jobId = resp.items?.[0]?.id ?? null;
+      _jobIdByKey.set(jobKey, jobId);
+    } catch {
+      jobId = null;
+    }
+  }
+  if (jobId) {
+    if (peekActiveJob()?.id !== jobId) await loadAndRender(jobId);
+    else _syncChipsToJob(peekActiveJob());
+    return;
+  }
+  setActiveJob(null);
+  clearChat();
+  _selectedChip = key;
+  if (key === "page") {
+    renderState({ mode: "no-summary", url: _chipPageUrl });
+  } else {
+    const chip = _chips.find((c) => c.key === key);
+    if (chip) renderState({ mode: "video-cta", chip });
+  }
+  _renderChipBar();
+  window.scrollTo({ top: 0 });
+}
+
+/** After a tab switch: re-open the chip last selected in that tab. */
+async function _restoreRememberedChip() {
+  const tabId = _chipTabId;
+  const want = tabId != null ? _selectedByTab.get(tabId) : null;
+  if (!want || want === "page") return;
+  await refreshChips();
+  if (_chipTabId !== tabId || _selectedChip !== "page") return;
+  if (_chips.some((c) => c.key === want)) await _selectChip(want);
+}
+
+function _renderChipBar() {
+  if (!chipBarEl) return;
+  if (!_chips.length) {
+    if (_chipBarSig !== "") {
+      _chipBarSig = "";
+      chipBarEl.innerHTML = "";
+      chipBarEl.hidden = true;
+    }
+    return;
+  }
+  const items = [
+    { key: "page", icon: "📄", label: "Page", duration: null, playing: false },
+    ..._chips.map((c) => ({
+      key: c.key,
+      icon: c.type === "youtube" ? "▶" : "🎬",
+      label: c.label,
+      duration: c.duration,
+      playing: c.playing,
+    })),
+  ];
+  const html = items.map((it) => {
+    const jobKey = it.key === "page" ? _chipPageUrl : it.key;
+    const cls = [
+      "video-chip",
+      it.key === _selectedChip ? "video-chip--active" : "",
+      _jobIdByKey.get(jobKey) ? "" : "video-chip--nojob",
+      it.playing ? "video-chip--playing" : "",
+    ].filter(Boolean).join(" ");
+    const dur = formatDuration(it.duration);
+    return `<button type="button" class="${cls}" data-chip-key="${escapeHtml(it.key)}" title="${escapeHtml(it.label)}">`
+      + `<span class="video-chip__icon" aria-hidden="true">${it.icon}</span>`
+      + `<span class="video-chip__label">${escapeHtml(it.label)}</span>`
+      + (dur ? `<span class="video-chip__dur">${dur}</span>` : "")
+      + `</button>`;
+  }).join("");
+  if (html === _chipBarSig) return;
+  _chipBarSig = html;
+  chipBarEl.innerHTML = html;
+  chipBarEl.hidden = false;
+}
+
+chipBarEl?.addEventListener("click", (ev) => {
+  const btn = /** @type {HTMLElement} */ (ev.target).closest("[data-chip-key]");
+  if (!btn) return;
+  const key = /** @type {HTMLElement} */ (btn).dataset.chipKey || "page";
+  _selectChip(key).catch((e) => console.warn("[TLDR] chip select", e));
 });
 
 // ---------------------------------------------------------------------------
@@ -314,6 +585,21 @@ async function _focusTab(tab) {
  * @param {{ videoId: string, mediaPageUrl: string, seconds: number, fallbackUrl: string }} opts
  */
 async function _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }) {
+  // Job opened from a video chip: seek THAT chip's element/frame in its tab
+  // (an embed's kind=youtube job must not navigate to youtube.com).
+  const target = transcript.getMediaTarget();
+  if (target) {
+    try {
+      const tab = await chrome.tabs.get(target.tabId);
+      await _focusTab(tab);
+      await seekTab(
+        target.tabId, seconds, transcript.expectedMediaRange(), transcript.mediaTargetFrames(),
+      );
+      return;
+    } catch {
+      // tab gone — fall through to the URL-based lookup
+    }
+  }
   const lookupUrl = videoId ? fallbackUrl : mediaPageUrl || fallbackUrl;
   const existing = await _findTab(lookupUrl);
   if (existing?.id !== undefined) {
@@ -460,6 +746,10 @@ async function handleExtractionError(rawError) {
  * @param {{jobId?:string, shouldSwitch?:boolean}} msg
  */
 async function handleJobCreated(msg) {
+  if (msg.jobId && msg.url) {
+    _jobIdByKey.set(msg.url, msg.jobId);
+    _renderChipBar();
+  }
   if (!msg.jobId || !msg.shouldSwitch) return;
   const active = await getActiveJob();
   if (active?.id === msg.jobId) return;  // already showing it
@@ -491,6 +781,7 @@ function handleJobEvent(event) {
   if (event.action === "deleted") {
     activeJobIds.delete(j.id);
     streamAccCache.delete(j.id);
+    for (const [k, id] of _jobIdByKey) if (id === j.id) _jobIdByKey.delete(k);
   } else if (j.status === "queued" || j.status === "running") {
     activeJobIds.add(j.id);
   } else {
@@ -526,8 +817,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
       console.error("[TLDR] search hand-over", e),
     );
   }
+  if (area === "session" && _chipTabId != null && changes[`sniff:${_chipTabId}`]) {
+    _scheduleChipRefresh();
+  }
   if (area === "session" && changes.activeJobId) {
     const id = changes.activeJobId.newValue;
+    // Tab sync re-pointing at the page job while a video chip of that same
+    // page is shown — not a real switch.
+    if (id && _selectedChip && _selectedChip !== "page" && id === _jobIdByKey.get(_chipPageUrl)) {
+      return;
+    }
     if (id) {
       loadAndRender(id).catch((e) => console.error("[TLDR] storage.onChanged", e));
     }
@@ -548,6 +847,8 @@ async function bootstrap() {
   // Panel opened by the library click itself — pick the hand-over up here.
   if (transcriptSearchHandoff) await _receiveSearchHandoff(transcriptSearchHandoff);
   await seedBadge();
+  _startChipPoll();
+  refreshChips().catch((e) => console.warn("[TLDR] chips", e));
   if (activeJobId) {
     // An existing job takes precedence over the health gate below — if it's
     // cached and done, there's nothing to warn about; if loading it fails,
@@ -649,10 +950,14 @@ async function _recheckIdleHealth(url) {
  * don't need a side-flag like the old `domBlankedBySwitch` to remember
  * whether the DOM was wiped.
  *
- * @param {{ version?: number, url: string, jobId?: string | null }} msg
+ * @param {{ version?: number, url: string, jobId?: string | null, tabId?: number }} msg
  */
 async function handleSetActiveTab(msg) {
   const { url, jobId } = msg;
+  // Same tab + same page while a video chip is shown (window focus came
+  // back, …): keep it. background only knows the page job.
+  if (_isVideoChipShownFor(msg.tabId, url)) return;
+  if (jobId === undefined) _resetChipsForTab(msg.tabId ?? null);
   const active = await getActiveJob();
 
   if (jobId === undefined) {
@@ -669,9 +974,19 @@ async function handleSetActiveTab(msg) {
     const handled = await _gateIdleOnHealth(url);
     if (!handled) renderState({ mode: "no-summary", url });
     window.scrollTo({ top: 0 });
+    _restoreRememberedChip().catch(() => {});
     return;
   }
+  await _showTabJob(jobId, active);
+  _restoreRememberedChip().catch(() => {});
+}
 
+/**
+ * Phase 2 with a resolved page job.
+ * @param {string} jobId
+ * @param {import("../lib/api-types.js").JobDetails | null} active
+ */
+async function _showTabJob(jobId, active) {
   if (active && active.id === jobId) {
     // Same job — render from in-memory. renderState idempotency keeps this
     // a no-op when nothing changed (window focus restored on the same tab
@@ -785,7 +1100,12 @@ async function refreshActiveJob() {
 // Library when they un-minimise gets no `set-active-tab` and would
 // otherwise stay stuck on the cached streaming view.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible") {
+    _stopChipPoll();
+    return;
+  }
+  _startChipPoll();
+  refreshChips().catch(() => {});
   seedBadge().catch(() => {});
   getActiveJob().then((j) => {
     if (isCacheStale(j)) refreshActiveJob();
@@ -809,8 +1129,14 @@ function renderFromJob(job) {
   }
 }
 
+// Latest loadAndRender call wins — a slower getJob for a job the user has
+// already moved away from (e.g. chip switch racing a tab-sync load) must
+// not render over the newer one.
+let _loadSeq = 0;
+
 /** @param {string} jobId */
 async function loadAndRender(jobId) {
+  const seq = ++_loadSeq;
   renderState({ mode: "loading" });
   // Reset scroll to the top so the user sees the new title / summary from
   // the start (otherwise we may be parked deep in the previous job's chat).
@@ -823,9 +1149,10 @@ async function loadAndRender(jobId) {
     job = await daemon.getJob(jobId, { signal: AbortSignal.timeout(8000) });
   } catch (err) {
     console.error("[TLDR] getJob failed", err);
-    renderState({ mode: "error", message: stringifyError(err) });
+    if (seq === _loadSeq) renderState({ mode: "error", message: stringifyError(err) });
     return;
   }
+  if (seq !== _loadSeq) return;
   setActiveJob(job);
 
   // Pull chat history in parallel with summary rendering.
@@ -855,6 +1182,7 @@ async function loadAndRender(jobId) {
  *   | { mode: "error", message: string, job?: import("../lib/api-types.js").JobDetails | null }
  *   | { mode: "done", job: import("../lib/api-types.js").JobDetails, content: string }
  *   | { mode: "streaming", job: import("../lib/api-types.js").JobDetails }
+ *   | { mode: "video-cta", chip: import("../lib/page-videos.js").VideoChip }
  * )} ViewState */
 
 /** @type {{ key: string } | null} */
@@ -893,6 +1221,35 @@ function renderState(state) {
       setStage(null);
       syncChatEnabled(false);
       return;
+
+    case "video-cta": {
+      const c = state.chip;
+      let host = "";
+      try {
+        host = new URL(c.frameUrl || c.mediaUrl || c.key).hostname;
+      } catch {}
+      const dur = formatDuration(c.duration);
+      summaryEl.innerHTML = `
+        <div class="placeholder-block">
+          <p><strong>${escapeHtml(c.label)}</strong></p>
+          <p class="muted small">${escapeHtml([host, dur].filter(Boolean).join(" · "))}</p>
+          <button class="summarize-btn" type="button">Analyze this video</button>
+        </div>
+      `;
+      const btn = /** @type {HTMLButtonElement | null} */ (summaryEl.querySelector(".summarize-btn"));
+      btn?.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Starting…";
+        try {
+          await chrome.runtime.sendMessage({ type: "analyze-video", tabId: _chipTabId, chip: c });
+        } catch (err) {
+          renderState({ mode: "error", message: stringifyError(err) });
+        }
+      });
+      setStage(null);
+      syncChatEnabled(false);
+      return;
+    }
 
     case "welcome": {
       const view = buildWelcomeView(state.step, state.health, {
@@ -970,6 +1327,7 @@ function _stateKey(state) {
     case "error":      return `error:${state.job?.id || ""}:${state.message}`;
     case "done":       return `done:${state.job.id}:${state.content?.length ?? 0}`;
     case "streaming":  return `streaming:${state.job.id}`;
+    case "video-cta":  return `video-cta:${state.chip.key}`;
   }
 }
 

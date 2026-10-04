@@ -151,8 +151,8 @@ disclosed limitation, not a reliability regression) and falls through to
 the normal cookie-aware download.
 
 **Whichever of tier 1/2 first produces a known duration below
-`runner.MEDIA_MIN_DURATION_SECONDS` (12.0, mirrors the extension's
-`MIN_MEDIA_DURATION_SECONDS`) skips the download + Whisper transcribe
+`runner.MEDIA_MIN_DURATION_SECONDS` (12.0; the extension's video chips
+now drop anything under 60 s client-side, `page-videos.js`) skips the download + Whisper transcribe
 entirely** and the job falls back to page text (below). Still unknown
 after both -> falls through to the normal download path, unmodified.
 
@@ -194,9 +194,8 @@ would make the annotation-only check misfire on a real transcript. This is
 purely a `kind=media` thing — the youtube fast/deferred paths are untouched.
 
 **The fallback itself** (`runner._fallback_to_page_text`, shared by all of
-the triggers above) summarizes `WhisperTask.page_text` — extension-supplied text,
-extracted alongside the media candidate by `extract.js`'s
-`extractPageText()` (see extension.md) — instead of audio.
+the triggers above) summarizes `WhisperTask.page_text` — extension-supplied text
+(video-chip jobs currently send none — see extension.md "Video chips") — instead of audio.
 `from_audio_transcript=False` (it isn't a transcript), and it persists via
 `set_extracted`/`mark_done` with **`transcript_source=TranscriptSource.
 PAGE_EXTRACT`** — reusing the same enum value the `kind=page` Readability
