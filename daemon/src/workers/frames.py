@@ -263,6 +263,21 @@ def _compute_window(
     return start, end
 
 
+def frame_seconds(timestamp_seconds: float, index: int) -> float:
+    """Approximate video time of the ``index``-th (0-based) frame that
+    ``fetch_frames`` returned for ``timestamp_seconds``.
+
+    Frames are sampled at ``FRAME_FPS`` from the start of the window
+    ``_compute_window`` cut, so frame ``i`` sits ``i / FRAME_FPS`` seconds
+    after that start. Approximate by up to a keyframe gap (yt-dlp's section
+    cut can begin slightly early), which is plenty for a seek target: the
+    point is that each thumbnail of a multi-frame moment seeks to ITS frame,
+    not all to the moment's first one.
+    """
+    start, _ = _compute_window(timestamp_seconds)
+    return float(round(start + index / FRAME_FPS))
+
+
 def _fmt_hms(seconds: float) -> str:
     """``MM:SS``, or ``H:MM:SS`` past the hour mark. Never negative."""
     total = max(0, int(round(seconds)))

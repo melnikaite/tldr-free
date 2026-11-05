@@ -1172,14 +1172,16 @@ async def fetch_moment_frames(job_id: str, req: FrameFetchRequest) -> FrameFetch
         )
 
     timecode = timecodes.format_timecode(match.timestamp)
+    # Each frame seeks to its OWN time; timecode/phrase stay the moment's
+    # so the client still groups them under one caption.
     items = [
         FrameRef(
-            seconds=match.timestamp,
+            seconds=frames.frame_seconds(match.timestamp, i),
             timecode=timecode,
             phrase=match.phrase,
             frame_url=f"/jobs/{job_id}/frames/{p.parent.name}/{p.name}",
         )
-        for p in frame_paths
+        for i, p in enumerate(frame_paths)
     ]
     return FrameFetchResponse(items=items)
 

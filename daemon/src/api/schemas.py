@@ -619,8 +619,10 @@ class FrameRef(BaseModel):
       no thumbnail for "we checked and there was nothing to see".
     - ``POST /jobs/{id}/frames`` (see ``FrameFetchResponse``) — one
       ``FrameRef`` per extracted frame for the moment the user clicked a
-      "look" affordance on, all sharing that moment's seconds/timecode/
-      phrase. No vision call involved; the user looks themselves.
+      "look" affordance on, all sharing that moment's timecode/phrase
+      (one caption per group) but each carrying its own frame's
+      ``seconds`` so clicking a thumbnail seeks to that frame. No vision
+      call involved; the user looks themselves.
 
     ``frame_url`` is a path rooted at the daemon (``GET
     /jobs/{job_id}/frames/{rel_path}``), not an absolute URL — the client

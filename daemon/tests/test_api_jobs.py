@@ -1413,8 +1413,12 @@ def test_fetch_moment_frames_happy_path(
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["items"]) == 2
+    # Frames are 1 fps from the window start (moment - 2s): each one seeks
+    # to its own time, not all to the moment's.
+    assert [item["seconds"] for item in body["items"]] == [
+        _ACTION_SECONDS - 2, _ACTION_SECONDS - 1,
+    ]
     for item, path in zip(body["items"], frame_paths, strict=True):
-        assert item["seconds"] == _ACTION_SECONDS
         assert item["timecode"] == "00:10"
         assert item["phrase"] == "watch this"
         assert item["frame_url"] == f"/jobs/{job_id}/frames/{path.parent.name}/{path.name}"
