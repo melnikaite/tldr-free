@@ -1,7 +1,7 @@
 // Side panel controller — action mode.
 //
 // Lifecycle:
-//   - On open: read activeJobId from session storage, fetch job details.
+//   - On open: read activeJob:<windowId> from session storage, fetch job details.
 //     If status=done → render cached summary_md. Otherwise subscribe to
 //     /events filtered by job_id and pipe stage / delta / done into the
 //     summary area in real time.
@@ -24,9 +24,11 @@
 //     keep a local count of jobs in queued/running status and recompute on
 //     every relevant event. One initial GET seeds the count.
 //
-// State:
-//   chrome.storage.session.activeJobId  → currently shown job
-//   chrome.storage.session.activeUrl    → URL the panel is following
+// State (per window — each Chrome window has its own panel document):
+//   chrome.storage.session["activeJob:<windowId>"] → {jobId, url} the panel
+//   of that window follows (lib/active-job.js). The panel learns its window
+//   via chrome.windows.getCurrent() and ignores broadcasts / storage changes
+//   carrying another windowId.
 
 import { daemon } from "../lib/daemon-client.js";
 import { getCookiesForDomain, getCookiesForUrl } from "../lib/cookies.js";
@@ -46,16 +48,35 @@ import {
   scanFrame,
 } from "../lib/page-videos.js";
 import { normalizeUrl } from "../lib/url.js";
+import { PAGE_JOB_KINDS, activeJobKey, searchHandoffKey } from "../lib/active-job.js";
+import { followScrollToEnd, programmaticScrollTo, setFollowing } from "../lib/scroll-follow.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
 import {
   setActiveJob as _chatSetActiveJob,
-  getActiveJob,
   peekActiveJob,
   renderHistory,
   clearChat,
+  noteJobStatus,
 } from "./chat.js";
 import * as transcript from "./transcript.js";
 import { buildWelcomeView } from "./welcome.js";
+
+/**
+ * This panel's window. Every per-window key / broadcast is matched against
+ * it; resolved once (a panel document never moves between windows).
+ */
+const _windowIdReady = chrome.windows.getCurrent().then((w) => w.id ?? null);
+
+/** True when a message / state is addressed to this panel's window. @param {unknown} windowId */
+async function _isMyWindow(windowId) {
+  return typeof windowId === "number" && windowId === (await _windowIdReady);
+}
+
+/** Scroll to the top on a genuine view switch; stop following the end. */
+function _scrollTopForSwitch() {
+  setFollowing(false);
+  programmaticScrollTo(0);
+}
 
 /** Remember the id we last broadcast so we only reset the tab on real switches. */
 let _lastBroadcastJobId = /** @type {string | null} */ (null);
@@ -84,6 +105,10 @@ function setActiveJob(job) {
   const wasNoJob = _lastBroadcastJobId == null;
   if (newId !== _lastBroadcastJobId) {
     _lastBroadcastJobId = newId;
+    // A different job is shown — a hand-over for some other job is moot.
+    if (newId && _pendingSearchHandoff && _pendingSearchHandoff.jobId !== newId) {
+      _pendingSearchHandoff = null;
+    }
     // Only force a summary-tab view when the user actually switched
     // between two existing jobs. Going from no-job → job is the
     // "just kicked off processing" path — leave the tab choice alone.
@@ -95,7 +120,7 @@ function setActiveJob(job) {
   if (newId && _pendingSearchHandoff?.jobId === newId) {
     const handoff = _pendingSearchHandoff;
     _pendingSearchHandoff = null;
-    _applySearchHandoff(handoff);
+    if (Date.now() - handoff.at < SEARCH_HANDOFF_TTL_MS) _applySearchHandoff(handoff);
   }
 }
 
@@ -141,7 +166,7 @@ openLibraryBtn?.addEventListener("click", () => {
 //
 // Selection follows the shown job (`_syncChipsToJob`, called from
 // setActiveJob): whichever chip's key equals job.url is highlighted, so a
-// job created from a chip (background flips activeJobId) lands on it. A
+// job created from a chip (background flips activeJob:<windowId>) lands on it. A
 // video chip's tab/frame/duration become transcript.js's media target, so
 // seek + captions hit that element.
 // ---------------------------------------------------------------------------
@@ -256,7 +281,7 @@ async function refreshChips() {
   const unknown = [pageUrl, ...chips.map((c) => c.key)].filter((k) => !_jobIdByKey.has(k));
   await Promise.all(unknown.map(async (k) => {
     try {
-      const resp = await daemon.listJobs({ url: k, limit: 1 });
+      const resp = await daemon.listJobs({ url: k, limit: 1, ...(k === pageUrl ? { kind: PAGE_JOB_KINDS } : {}) });
       _jobIdByKey.set(k, resp.items?.[0]?.id ?? null);
     } catch {
       // daemon down — retried on the next refresh
@@ -303,18 +328,22 @@ function _syncChipsToJob(job) {
  * @param {string} key "page" or a video chip key
  */
 async function _selectChip(key) {
+  const seq = ++_loadSeq;  // a newer view intent supersedes this one
   if (_chipTabId != null) _selectedByTab.set(_chipTabId, key);
   _selectedChip = key;
   const jobKey = key === "page" ? _chipPageUrl : key;
   let jobId = _jobIdByKey.get(jobKey);
   if (jobId === undefined && jobKey) {
     try {
-      const resp = await daemon.listJobs({ url: jobKey, limit: 1 });
+      const resp = await daemon.listJobs({ url: jobKey, limit: 1, ...(key === "page" ? { kind: PAGE_JOB_KINDS } : {}) });
       jobId = resp.items?.[0]?.id ?? null;
       _jobIdByKey.set(jobKey, jobId);
     } catch {
       jobId = null;
     }
+    // Something else (tab switch, another chip, a job load) took over while
+    // listJobs was in flight — don't clear or paint over it.
+    if (seq !== _loadSeq) return;
   }
   if (jobId) {
     if (peekActiveJob()?.id !== jobId) await loadAndRender(jobId);
@@ -331,7 +360,7 @@ async function _selectChip(key) {
     if (chip) renderState({ mode: "video-cta", chip });
   }
   _renderChipBar();
-  window.scrollTo({ top: 0 });
+  _scrollTopForSwitch();
 }
 
 /** After a tab switch: re-open the chip last selected in that tab. */
@@ -446,14 +475,18 @@ document.addEventListener("keydown", (ev) => {
 // Library → side panel search hand-over
 //
 // Opening a job from a filtered library list also writes
-// chrome.storage.session.transcriptSearchHandoff = {jobId, query} in the
-// SAME storage.set as activeJobId (library/app.js openInSidePanel). It is
+// chrome.storage.session["transcriptSearchHandoff:<windowId>"] = {jobId, query} in the
+// SAME storage.set as activeJob:<windowId> (library/app.js openInSidePanel). It is
 // one-shot: removed from storage as soon as the panel reads it, then held
-// here until setActiveJob shows that job (or applied at once if it is
+// here until setActiveJob shows that job (dropped if another job is shown
+// first or after SEARCH_HANDOFF_TTL_MS; applied at once if it is
 // already shown). Jobs without a transcript (page / pdf) ignore it.
 // ---------------------------------------------------------------------------
 
-/** @type {{jobId: string, query: string} | null} */
+/** Hand-overs older than this are dropped instead of applied late. */
+const SEARCH_HANDOFF_TTL_MS = 15000;
+
+/** @type {{jobId: string, query: string, at: number} | null} */
 let _pendingSearchHandoff = null;
 
 /** @param {unknown} raw */
@@ -462,14 +495,15 @@ async function _receiveSearchHandoff(raw) {
   // even if setActiveJob for that job runs while the remove() is in flight.
   const h = /** @type {{jobId?: unknown, query?: unknown} | null} */ (raw);
   if (h && typeof h.jobId === "string" && typeof h.query === "string" && h.query.trim()) {
-    const handoff = { jobId: h.jobId, query: h.query };
+    const handoff = { jobId: h.jobId, query: h.query, at: Date.now() };
     if (_lastBroadcastJobId === handoff.jobId) {
       _applySearchHandoff(handoff);
     } else {
       _pendingSearchHandoff = handoff;
     }
   }
-  await chrome.storage.session.remove("transcriptSearchHandoff");
+  const windowId = await _windowIdReady;
+  if (windowId != null) await chrome.storage.session.remove(searchHandoffKey(windowId));
 }
 
 /** @param {{jobId: string, query: string}} handoff */
@@ -691,9 +725,14 @@ let lastTabVersion = 0;
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "set-active-tab") {
-    if (typeof msg.version === "number" && msg.version < lastTabVersion) return;
-    if (typeof msg.version === "number") lastTabVersion = msg.version;
-    handleSetActiveTab(msg).catch((e) =>
+    // Another window's tab sync — its own panel handles it. Versions are
+    // compared only among this window's messages.
+    _isMyWindow(msg.windowId).then((mine) => {
+      if (!mine) return;
+      if (typeof msg.version === "number" && msg.version < lastTabVersion) return;
+      if (typeof msg.version === "number") lastTabVersion = msg.version;
+      return handleSetActiveTab(msg);
+    }).catch((e) =>
       console.error("[TLDR] set-active-tab", e),
     );
   } else if (msg.type === "job-created") {
@@ -738,12 +777,12 @@ async function handleExtractionError(rawError) {
  * the active one (no hijack). Library also sends it on retry/open with
  * shouldSwitch=true to follow that job explicitly.
  *
- * Why this and not just `chrome.storage.onChanged` on activeJobId:
+ * Why this and not just `chrome.storage.onChanged` on activeJob:<windowId>:
  *   storage.onChanged is debounced — setting the same value twice (e.g.
  *   re-clicking summarize on a deduped URL) won't fire a second time, so
  *   the panel could miss a re-show. The broadcast always fires.
  *
- * @param {{jobId?:string, shouldSwitch?:boolean}} msg
+ * @param {{jobId?:string, url?:string, shouldSwitch?:boolean, windowId?:number}} msg
  */
 async function handleJobCreated(msg) {
   if (msg.jobId && msg.url) {
@@ -751,8 +790,9 @@ async function handleJobCreated(msg) {
     _renderChipBar();
   }
   if (!msg.jobId || !msg.shouldSwitch) return;
-  const active = await getActiveJob();
-  if (active?.id === msg.jobId) return;  // already showing it
+  // Switch only when addressed to this panel's window.
+  if (!(await _isMyWindow(msg.windowId))) return;
+  if (peekActiveJob()?.id === msg.jobId) return;  // already showing it
   await loadAndRender(msg.jobId);
 }
 
@@ -778,6 +818,9 @@ function handleJobEvent(event) {
   // hiding the Transcript tab and confusing the summary view. transcript.js
   // owns chip updates; the badge / patch logic here ignores them.
   if (event.action === "translation_updated") return;
+  // Chat queues questions per job until it is done (any job, shown or not).
+  if (event.action === "deleted") noteJobStatus(j.id, "failed", "The job was deleted.");
+  else noteJobStatus(j.id, j.status, j.error);
   if (event.action === "deleted") {
     activeJobIds.delete(j.id);
     streamAccCache.delete(j.id);
@@ -799,7 +842,8 @@ function handleJobEvent(event) {
 async function patchActiveJobIfMatches(event) {
   const j = event.job;
   if (!j?.id || event.action === "deleted") return;
-  const active = await getActiveJob();
+  // In-memory only — never resurrect a job the panel deliberately cleared.
+  const active = peekActiveJob();
   if (!active || active.id !== j.id) return;
   const merged = { ...active, ...j };
   setActiveJob(merged);
@@ -810,27 +854,30 @@ async function patchActiveJobIfMatches(event) {
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  // Read before the activeJobId branch kicks off loadAndRender, so the
-  // hand-over is pending by the time setActiveJob runs for that job.
-  if (area === "session" && changes.transcriptSearchHandoff?.newValue) {
-    _receiveSearchHandoff(changes.transcriptSearchHandoff.newValue).catch((e) =>
-      console.error("[TLDR] search hand-over", e),
-    );
-  }
-  if (area === "session" && _chipTabId != null && changes[`sniff:${_chipTabId}`]) {
+  if (area !== "session") return;
+  if (_chipTabId != null && changes[`sniff:${_chipTabId}`]) {
     _scheduleChipRefresh();
   }
-  if (area === "session" && changes.activeJobId) {
-    const id = changes.activeJobId.newValue;
+  _windowIdReady.then((windowId) => {
+    if (windowId == null) return;
+    // Only this window's keys (lib/active-job.js). Hand-over first, so it is
+    // pending by the time setActiveJob runs for that job.
+    const handoff = changes[searchHandoffKey(windowId)];
+    if (handoff?.newValue) {
+      _receiveSearchHandoff(handoff.newValue).catch((e) =>
+        console.error("[TLDR] search hand-over", e),
+      );
+    }
+    const change = changes[activeJobKey(windowId)];
+    const id = change?.newValue?.jobId;
+    if (!id) return;
     // Tab sync re-pointing at the page job while a video chip of that same
     // page is shown — not a real switch.
-    if (id && _selectedChip && _selectedChip !== "page" && id === _jobIdByKey.get(_chipPageUrl)) {
-      return;
-    }
-    if (id) {
-      loadAndRender(id).catch((e) => console.error("[TLDR] storage.onChanged", e));
-    }
-  }
+    if (_selectedChip && _selectedChip !== "page" && id === _jobIdByKey.get(_chipPageUrl)) return;
+    // Already showing it (the broadcast usually got here first).
+    if (peekActiveJob()?.id === id) return;
+    loadAndRender(id).catch((e) => console.error("[TLDR] storage.onChanged", e));
+  }).catch(() => {});
 });
 
 bootstrap().catch((e) => {
@@ -839,16 +886,39 @@ bootstrap().catch((e) => {
 });
 
 async function bootstrap() {
-  const { activeJobId, activeUrl, transcriptSearchHandoff } = await chrome.storage.session.get([
-    "activeJobId",
-    "activeUrl",
-    "transcriptSearchHandoff",
-  ]);
+  const windowId = await _windowIdReady;
+  /** @type {{jobId?: string | null, url?: string | null} | undefined} */
+  let state;
+  /** @type {unknown} */
+  let handoff;
+  if (windowId != null) {
+    const got = await chrome.storage.session.get([activeJobKey(windowId), searchHandoffKey(windowId)]);
+    state = got[activeJobKey(windowId)];
+    handoff = got[searchHandoffKey(windowId)];
+  }
   // Panel opened by the library click itself — pick the hand-over up here.
-  if (transcriptSearchHandoff) await _receiveSearchHandoff(transcriptSearchHandoff);
+  if (handoff) await _receiveSearchHandoff(handoff);
   await seedBadge();
   _startChipPoll();
   refreshChips().catch((e) => console.warn("[TLDR] chips", e));
+  let activeJobId = state?.jobId || null;
+  let activeUrl = state?.url || null;
+  if (!state) {
+    // No tab sync has happened for this window yet (fresh window, or state
+    // cleaned up) — resolve this window's active tab directly.
+    const tab = await _panelTab().catch(() => undefined);
+    if (tab?.url && /^https?:/i.test(tab.url)) {
+      activeUrl = normalizeUrl(tab.url);
+      try {
+        const resp = await daemon.listJobs({ url: activeUrl, kind: PAGE_JOB_KINDS, limit: 1 });
+        activeJobId = resp.items?.[0]?.id ?? null;
+      } catch {
+        // daemon down — fall through to the health gate
+      }
+    }
+  }
+  // A tab switch / job load raced bootstrap — it already decided the view.
+  if (_loadSeq !== 0 || peekActiveJob()) return;
   if (activeJobId) {
     // An existing job takes precedence over the health gate below — if it's
     // cached and done, there's nothing to warn about; if loading it fails,
@@ -856,8 +926,8 @@ async function bootstrap() {
     await loadAndRender(activeJobId);
     return;
   }
-  const handled = await _gateIdleOnHealth(activeUrl);
-  if (handled) return;
+  const handled = await _gateIdleOnHealth(activeUrl || undefined);
+  if (handled || _loadSeq !== 0) return;
   if (activeUrl) renderState({ mode: "no-summary", url: activeUrl });
 }
 
@@ -958,22 +1028,27 @@ async function handleSetActiveTab(msg) {
   // back, …): keep it. background only knows the page job.
   if (_isVideoChipShownFor(msg.tabId, url)) return;
   if (jobId === undefined) _resetChipsForTab(msg.tabId ?? null);
-  const active = await getActiveJob();
+  const active = peekActiveJob();
 
   if (jobId === undefined) {
     // Phase 1: probe. background still resolving.
     if (active?.url === url) return;   // same tab — keep current view
+    ++_loadSeq;  // a late load for the tab we left must not paint over this
     renderState({ mode: "loading" });
     return;
   }
 
   // Phase 2: definitive answer.
   if (jobId === null) {
+    const seq = ++_loadSeq;
+    const version = msg.version;
     setActiveJob(null);
     clearChat();
     const handled = await _gateIdleOnHealth(url);
+    // A newer switch / chip / load happened during the /health probe.
+    if (seq !== _loadSeq || (typeof version === "number" && version !== lastTabVersion)) return;
     if (!handled) renderState({ mode: "no-summary", url });
-    window.scrollTo({ top: 0 });
+    _scrollTopForSwitch();
     _restoreRememberedChip().catch(() => {});
     return;
   }
@@ -996,8 +1071,10 @@ async function _showTabJob(jobId, active) {
     // terminal status with a missing payload (see `isCacheStale` for why).
     // Fall back to the cached view if the refresh fails.
     if (isCacheStale(active)) {
+      const seq = _loadSeq;
       const refreshed = await refreshActiveJob();
       if (refreshed) return;
+      if (seq !== _loadSeq || peekActiveJob()?.id !== active.id) return;
     }
     renderFromJob(active);
     return;
@@ -1068,10 +1145,15 @@ function isCacheStale(j) {
  * @returns {Promise<boolean>}
  */
 async function refreshActiveJob() {
-  const active = await getActiveJob();
+  const active = peekActiveJob();
   if (!active) return false;
+  const seq = _loadSeq;
   try {
     const fresh = await daemon.getJob(active.id, { signal: AbortSignal.timeout(8000) });
+    // The panel moved on (another job / tab / chip) while getJob ran — the
+    // late answer for the old job must not paint over the current view.
+    // "true" = handled, so callers don't fall back to rendering it either.
+    if (seq !== _loadSeq || peekActiveJob()?.id !== active.id) return true;
     setActiveJob(fresh);
     renderFromJob(fresh);
     if (fresh.progress_stage === "queued") {
@@ -1107,9 +1189,7 @@ document.addEventListener("visibilitychange", () => {
   _startChipPoll();
   refreshChips().catch(() => {});
   seedBadge().catch(() => {});
-  getActiveJob().then((j) => {
-    if (isCacheStale(j)) refreshActiveJob();
-  });
+  if (isCacheStale(peekActiveJob())) refreshActiveJob();
 });
 
 /**
@@ -1137,10 +1217,12 @@ let _loadSeq = 0;
 /** @param {string} jobId */
 async function loadAndRender(jobId) {
   const seq = ++_loadSeq;
+  const isSwitch = peekActiveJob()?.id !== jobId;
   renderState({ mode: "loading" });
-  // Reset scroll to the top so the user sees the new title / summary from
-  // the start (otherwise we may be parked deep in the previous job's chat).
-  window.scrollTo({ top: 0 });
+  // On a genuine switch, reset scroll to the top so the user sees the new
+  // title / summary from the start (otherwise we may be parked deep in the
+  // previous job's chat). A reload of the same job keeps the reader's place.
+  if (isSwitch) _scrollTopForSwitch();
 
   // Safety net: if getJob hangs (daemon down, dead service worker, …) the
   // user gets a real error after 8s instead of an indefinite spinner.
@@ -1311,8 +1393,10 @@ function renderState(state) {
         `<div class="queued-hint" id="queued-hint" hidden></div>` +
         `<div class="markdown-body" id="summary-stream"></div>`;
       _attachStreamSubscription(state.job);
-      // Chat is disabled while streaming: daemon /ai/qa requires status=done.
-      syncChatEnabled(false);
+      // Chat stays enabled while streaming: daemon QA requires status=done,
+      // so chat.js queues these questions per job and sends them when the
+      // job reports done (noteJobStatus).
+      syncChatEnabled(true);
       return;
     }
   }
@@ -1750,7 +1834,8 @@ function _bindSummarizeButton() {
     btn.disabled = true;
     btn.textContent = "Starting…";
     try {
-      await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
+      // windowId: summarize THIS window's active tab, not the last-focused one.
+      await chrome.runtime.sendMessage({ type: "summarize-active-tab", windowId: await _windowIdReady });
     } catch (err) {
       console.error("[TLDR] summarize-active-tab failed", err);
       renderState({ mode: "error", message: stringifyError(err) });
@@ -1766,13 +1851,16 @@ function _bindRetryButton(job) {
     const id = btn.dataset.retryId;
     if (!id) return;
     btn.setAttribute("disabled", "true");
+    const seq = _loadSeq;
+    // Only act if the panel still shows this job's error (no switch meanwhile).
+    const stillHere = () => seq === _loadSeq && (peekActiveJob()?.id ?? null) === (job?.id ?? null);
     try {
       await daemon.retryJob(id);
-      await loadAndRender(id);
+      if (stillHere()) await loadAndRender(id);
     } catch (err) {
       console.error("[TLDR] retry failed", err);
       btn.removeAttribute("disabled");
-      renderState({ mode: "error", message: stringifyError(err), job });
+      if (stillHere()) renderState({ mode: "error", message: stringifyError(err), job });
     }
   });
 }
@@ -1899,7 +1987,10 @@ function _attachStreamSubscription(job) {
     if (rafId !== null) return;
     rafId = requestAnimationFrame(() => {
       rafId = null;
-      if (acc) streamEl.innerHTML = renderMarkdown(acc, job);
+      if (acc) {
+        streamEl.innerHTML = renderMarkdown(acc, job);
+        followScrollToEnd();  // only while the reader sits at the bottom
+      }
     });
   };
   const cancelRender = () => {
@@ -1947,6 +2038,7 @@ function _attachStreamSubscription(job) {
       // the panel has since switched to a different job and writing here
       // would clobber ITS state.
       if (stillActive) setActiveJob(freshJob);
+      noteJobStatus(job.id, "done");
       renderState({ mode: "done", job: freshJob, content });
     } else if (ev.type === "error") {
       cancelRender();
@@ -1959,6 +2051,7 @@ function _attachStreamSubscription(job) {
       const stillActive = cur?.id === job.id;
       const freshJob = stillActive ? { ...cur, status: "failed", error } : { ...job, status: "failed", error };
       if (stillActive) setActiveJob(freshJob);
+      noteJobStatus(job.id, "failed", error);
       renderState({ mode: "error", message: error, job: freshJob });
     }
   });

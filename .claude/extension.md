@@ -88,7 +88,7 @@ ids per key are cached (`_jobIdByKey`, filled via `listJobs`, updated by
 
 Selection follows the shown job: `setActiveJob` → `_syncChipsToJob` picks
 the chip whose key equals `job.url` (so a job created from a chip lands on
-it when background flips `activeJobId`). A selected video chip becomes
+it when background flips `activeJob:<windowId>`). A selected video chip becomes
 `transcript.setMediaTarget({tabId, frameId, duration})`: source-tab lookup,
 probe/seek/captions (`probeTab`/`seekTab`/`installCaptionsInTab` take
 preferred `frameIds`, falling back to all frames) and the expected-duration
@@ -230,8 +230,8 @@ toolbar click → background.js
    ↓ chrome.sidePanel.open    (panel renders empty/loading)
    ↓ inject content script    (extract.js or youtube.js)
    ↓ POST /jobs → 202 {id}
-   ↓ chrome.storage.session.activeJobId = id   ← only if source URL still matches active tab
-   ↓ broadcast `job-created`
+   ↓ storage.session["activeJob:<windowId>"] = {jobId, url}  ← only if the source tab is still active in its window
+   ↓ broadcast `job-created` {jobId, url, shouldSwitch, windowId}
 
 sidepanel/app.js loadAndRender(id):
    ├─ job.status === "done"   → render cached summary_md, enable chat
@@ -246,7 +246,7 @@ sidepanel/app.js loadHistory(id) (parallel):
 ## First-run welcome screen — idle view is gated behind GET /health
 
 Any render of the idle view (no job for the current tab — bootstrap with
-no `activeJobId`, or `handleSetActiveTab`'s `jobId === null` phase) first
+no stored job for the panel's window, or `handleSetActiveTab`'s `jobId === null` phase) first
 goes through `app.js`'s `_gateIdleOnHealth(url)`, which probes `GET
 /health` once and picks one of four outcomes:
 
@@ -300,8 +300,10 @@ different things.
 
 `background.js` listens to `tabs.onActivated`, `tabs.onUpdated` (URL change
 in active tab), `windows.onFocusChanged`. On any of those:
-`normalizeUrl(tab.url)` → `daemon.listJobs({ url, limit: 1 })` → broadcast
-`{type: "set-active-tab", url, jobId, version}`. The side panel reacts:
+`normalizeUrl(tab.url)` → `daemon.listJobs({ url, kind: "page,pdf,youtube", limit: 1 })`
+(legacy kind=media jobs under a plain page URL are not the page job) →
+broadcast `{type: "set-active-tab", url, jobId, version, tabId, windowId}`
+and store `activeJob:<windowId>`. The side panel reacts:
 
 - `jobId` resolved → `loadAndRender(jobId)`
 - `jobId === null` → render the "no summary yet" placeholder with the URL
@@ -309,7 +311,7 @@ in active tab), `windows.onFocusChanged`. On any of those:
 The lookup is an exact `url` match, so it only ever finds the **page** job
 (video-chip jobs are keyed `<page>#tldr-video=N` / embed URLs). Messages
 carry `tabId`; while a video chip of the same tab + page is shown, the panel
-ignores `set-active-tab` and the matching `activeJobId` storage change (focus
+ignores `set-active-tab` and the matching `activeJob:<windowId>` storage change (focus
 returning to the tab must not yank it back to the page job). A real tab
 switch resets the chips to that tab (Page selected, then the remembered chip
 if it is still live).
@@ -319,9 +321,24 @@ own Library), `chrome://`, `about:blank`, `file://`. Glancing at the Library
 while a job streams keeps the side panel attached to the in-progress
 summary instead of yanking it away.
 
+**Per-window isolation.** Every Chrome window has its own panel document,
+and each panel shows/acts on the job of ITS window's active tab only. State
+is `chrome.storage.session["activeJob:<windowId>"] = {jobId, url}` (keys in
+`lib/active-job.js`); every `set-active-tab` / `job-created` carries
+`windowId`; the panel resolves its own via `chrome.windows.getCurrent()` and
+ignores other windows' messages and keys. `onUpdated` (`tab.active` = active
+in its own window, e.g. autoplay in a background window) therefore only moves
+that window's panel. Library "open in side panel" writes the Library tab's
+window only. `windows.onRemoved` drops the window's keys. There is no global
+key and no in-memory fallback to storage (`chat.peekActiveJob()` only): a
+panel that cleared its job (no-summary / chip CTA) stays cleared. A panel
+with no stored state (fresh window) resolves its active tab itself on boot.
+
 `version` is a monotonic counter (wall-clock-floored — `Math.max(prev + 1,
 Date.now())`) so MV3 service-worker restarts can't fire an "older" version
-than what the side panel already acknowledged. Dedupes via
+than what the side panel already acknowledged. The "newer sync already
+fired, skip phase 2" check is per window (`latestVersionByWindow`); the
+panel compares versions among its own window's messages only. Dedupes via
 `lastSyncedUrlByTab` so a `?t=754s` (timecode click) doesn't re-trigger a
 lookup for the same article.
 
@@ -337,6 +354,30 @@ of order) and re-attaches a still-streaming turn's bubble if one is in flight
 for that job — see the shared-DOM ownership note atop `chat.js`. No "clear
 chat" UI; deleting the Job from the Library drops its `Message` rows via FK
 cascade.
+
+**Question queue (chat.js).** The job id of a question is always `chatJobId`
+(the job on screen in this panel), never storage. Entries are `{jobId, text}`;
+one turn at a time; the drain picks the oldest entry whose job is `done` and
+merges only that job's waiting entries into one turn. The composer stays
+enabled while the summary streams: questions wait (pending bubbles) until
+app.js reports the job done via `noteJobStatus` (called for job events of
+ANY job, so they are sent even after the user switched away); a failed /
+deleted job drops them with an error note. Pending and failed entries are in
+panel memory only, so `renderHistory` re-appends them for their job.
+Composer drafts are per job in `chrome.storage.session["chatDraft:<jobId>"]`
+(saved on input/switch, restored on switch, deleted on send).
+
+**Scroll.** Summary streaming and chat use `lib/scroll-follow.js` "follow"
+mode: auto-scroll only while the reader is at the bottom; any user upward
+scroll (wheel/touch/keys/scrollbar) stops it, returning to the bottom resumes
+it; own scrolls are recognised by the scrollTop they set. Nothing jumps on
+answer done. A genuine job switch scrolls to top and stops following;
+submitting a question resumes following. (Transcript tab: own logic.)
+
+**Stale async in app.js.** `_loadSeq` is bumped by every view intent
+(`loadAndRender`, `_selectChip`, set-active-tab phase 1 / phase 2 `null`);
+anything awaiting (listJobs, /health, getJob in `refreshActiveJob`, retry)
+re-checks it (and the shown job id) before painting.
 
 ## In-flight badge — no polling
 
@@ -494,8 +535,9 @@ in the panel is claimed only when the job has a transcript. The query is
 cleared on every real job switch.
 
 **Library → panel hand-over:** opening a job from a library list with a
-non-empty search box writes `transcriptSearchHandoff = {jobId, query}`
-into `chrome.storage.session` in the same `set()` as `activeJobId`. The
+non-empty search box writes `transcriptSearchHandoff:<windowId> = {jobId, query}`
+into `chrome.storage.session` in the same `set()` as `activeJob:<windowId>`
+(dropped if another job is shown first, or after 15 s). The
 panel (`_receiveSearchHandoff` in `sidepanel/app.js`) removes the key on
 read (one-shot), waits until `setActiveJob` shows that job, then opens the
 Transcript tab with the query prefilled; it is applied after the lazy
@@ -505,9 +547,9 @@ library writes — storage is what a freshly opened panel reads on boot.
 
 ## State (chrome.storage)
 
-- `chrome.storage.session.activeJobId` — currently shown job (clears on browser close)
-- `chrome.storage.session.activeUrl` — last normalized URL synced
-- `chrome.storage.session.transcriptSearchHandoff` — one-shot
+- `chrome.storage.session["activeJob:<windowId>"]` — `{jobId, url}` the panel of that window follows (removed on window close)
+- `chrome.storage.session["chatDraft:<jobId>"]` — unsent composer text per job
+- `chrome.storage.session["transcriptSearchHandoff:<windowId>"]` — one-shot
   `{jobId, query}` from the library, consumed by the side panel (see
   "Find in transcript")
 - `chrome.storage.session["sniff:<tabId>"]` — network-sniffed manifests/subtitles for that tab (see "Network stream sniffing")

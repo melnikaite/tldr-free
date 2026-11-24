@@ -5,13 +5,14 @@
 //   - Subscribe to GET /events for realtime updates (job created/updated/
 //     deleted, workers state). No polling.
 //   - Status/kind filters trigger refetch from daemon.
-//   - Per-row actions: open in side panel (writes activeJobId to session storage,
+//   - Per-row actions: open in side panel (writes activeJob:<windowId> to session storage,
 //     attempts chrome.sidePanel.open), delete (with confirm), retry (failed only).
 
 import { daemon } from "../lib/daemon-client.js";
 import { openEventStream } from "../lib/event-stream.js";
 import { escapeHtml, formatApproxDuration, stringifyError } from "../lib/utils.js";
 import { openSidePanel } from "../lib/browser-compat.js";
+import { activeJobKey, searchHandoffKey } from "../lib/active-job.js";
 
 // Library only renders status badges + queue counter — skip the high-volume
 // stage/delta chatter from running pipelines.
@@ -645,26 +646,32 @@ async function openInSidePanel(id) {
   // toast-on-failure path still works. (The Chrome path inside the shim
   // resolves the current window itself, same as before.)
   const opening = openSidePanel();
-  // A non-empty library search rides along as a one-shot hand-over: the
-  // side panel opens the Transcript tab with it prefilled (sidepanel/app.js
-  // _receiveSearchHandoff). Written in the same set() as activeJobId so the
-  // panel sees both in one storage.onChanged event.
-  const query = filterSearch?.value.trim() || "";
-  await chrome.storage.session.set(
-    query
-      ? { activeJobId: id, transcriptSearchHandoff: { jobId: id, query } }
-      : { activeJobId: id },
-  );
-  // Try to broadcast so an open side panel switches.
-  try {
-    // shouldSwitch=true: Library "open in side panel" / "retry" is an
-    // explicit request to follow this job — bypass the source-tab guard
-    // background.js applies to toolbar-click submissions.
-    await chrome.runtime.sendMessage({
-      type: "job-created", jobId: id, shouldSwitch: true,
-    });
-  } catch {
-    // No side panel listening — that's fine, it'll read storage on next open.
+  // Target ONLY this Library tab's window — that's where the panel opens.
+  // Other windows' panels keep following their own tabs (state is keyed by
+  // windowId, see lib/active-job.js).
+  const win = await chrome.windows.getCurrent();
+  const windowId = win.id;
+  if (windowId != null) {
+    // A non-empty library search rides along as a one-shot hand-over: the
+    // side panel opens the Transcript tab with it prefilled (sidepanel/app.js
+    // _receiveSearchHandoff). Written in the same set() as the active job so
+    // the panel sees both in one storage.onChanged event.
+    const query = filterSearch?.value.trim() || "";
+    /** @type {Record<string, unknown>} */
+    const update = { [activeJobKey(windowId)]: { jobId: id, url: null } };
+    if (query) update[searchHandoffKey(windowId)] = { jobId: id, query };
+    await chrome.storage.session.set(update);
+    // Try to broadcast so an already-open side panel in this window switches.
+    try {
+      // shouldSwitch=true: Library "open in side panel" is an explicit
+      // request to follow this job — bypass the source-tab guard
+      // background.js applies to toolbar-click submissions.
+      await chrome.runtime.sendMessage({
+        type: "job-created", jobId: id, shouldSwitch: true, windowId,
+      });
+    } catch {
+      // No side panel listening — that's fine, it'll read storage on next open.
+    }
   }
   // Best-effort attempt to open the side panel. Requires a user gesture,
   // which the button click satisfies (the call was issued synchronously

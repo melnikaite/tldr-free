@@ -33,8 +33,8 @@
 //   - Keep module-level refs to the live text node + accumulated string so a
 //     window.focus / visibilitychange listener can re-touch the node and
 //     force Chrome to repaint the streaming text immediately.
-//   - On answer done, scroll the bubble start into view (not the end) so the
-//     user reads from the top, not the bottom of a long response.
+//   - Scrolling uses lib/scroll-follow.js "follow" mode: auto-scroll only
+//     while the reader is at the bottom; nothing ever jumps on answer done.
 //
 // Shared-DOM ownership — why every write below is guarded:
 //   The side panel is one document per Chrome window. #chat-messages is a
@@ -60,6 +60,8 @@
 import { daemon } from "../lib/daemon-client.js";
 import { buildFrameRow } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
+import { chatDraftKey } from "../lib/active-job.js";
+import { followScrollToEnd, setFollowing } from "../lib/scroll-follow.js";
 
 /** @import { ChatMessage, FrameRef, JobDetails } from "../lib/api-types.js" */
 
@@ -76,6 +78,7 @@ let chatJobId = null;
 /** @param {JobDetails | null} job */
 export function setActiveJob(job) {
   const newId = job?.id ?? null;
+  if (newId !== chatJobId) _swapDraft(chatJobId, newId);
   // If we're switching away from the job that owns the in-flight turn (if
   // any), turn off its pulsing dot now — the turn keeps streaming in the
   // background, but nothing on screen should look like it's happening on
@@ -86,27 +89,17 @@ export function setActiveJob(job) {
   }
   activeJob = job;
   chatJobId = newId;
-}
-
-/** @returns {Promise<JobDetails | null>} */
-export async function getActiveJob() {
-  if (activeJob) return activeJob;
-  const { activeJobId } = await chrome.storage.session.get("activeJobId");
-  if (!activeJobId) return null;
-  try {
-    activeJob = await daemon.getJob(activeJobId);
-    return activeJob;
-  } catch {
-    return null;
-  }
+  // After the assignments: a "done" here may start a queued turn, which
+  // checks chat ownership synchronously.
+  if (job) _noteStatus(job.id, job.status, job.error);
 }
 
 /**
- * Synchronous read of the in-memory active job — `null` only when nothing
- * has been loaded yet in this panel session (unlike `getActiveJob()`, this
- * never falls back to `chrome.storage.session` + a `daemon.getJob` fetch).
- * For callers that need the freshest already-known job state (e.g. a live
- * mid-stream title patch) without introducing an async gap a later event
+ * Synchronous read of the in-memory active job. Deliberately NO fallback to
+ * chrome.storage.session: that state is per window and the panel clears its
+ * job on purpose (no-summary / video CTA) — resurrecting one from storage
+ * would show another window's or a stale job. For callers that need the
+ * freshest already-known job state (e.g. a live mid-stream title patch) without introducing an async gap a later event
  * could race past — see app.js's stream "done"/"error" handling.
  *
  * @returns {JobDetails | null}
@@ -119,6 +112,60 @@ const form = /** @type {HTMLFormElement | null} */ (document.getElementById("cha
 const input = /** @type {HTMLTextAreaElement | null} */ (document.getElementById("chat-input"));
 const messages = /** @type {HTMLElement | null} */ (document.getElementById("chat-messages"));
 
+// ---------------------------------------------------------------------------
+// Composer draft — one per job, in chrome.storage.session (keyed by job id,
+// not by window) so it survives panel reopen. Saved on input and on switch,
+// restored on switch (empty when none), deleted on send. Typed text never
+// follows the user to another job.
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, string>} in-memory mirror (authoritative once touched) */
+const _drafts = new Map();
+let _draftWriteTimer = /** @type {number | null} */ (null);
+
+/** @param {string} jobId @param {string} text */
+function _persistDraft(jobId, text) {
+  _drafts.set(jobId, text);
+  const key = chatDraftKey(jobId);
+  (text ? chrome.storage.session.set({ [key]: text }) : chrome.storage.session.remove(key))
+    .catch(() => {});
+}
+
+/** @param {string | null} oldId @param {string | null} newId */
+function _swapDraft(oldId, newId) {
+  if (!input) return;
+  if (_draftWriteTimer !== null) {
+    clearTimeout(_draftWriteTimer);
+    _draftWriteTimer = null;
+  }
+  if (oldId) _persistDraft(oldId, input.value);
+  const known = newId ? _drafts.get(newId) : "";
+  input.value = known ?? "";
+  _autoGrowChatInput();
+  if (newId && known === undefined) {
+    const key = chatDraftKey(newId);
+    chrome.storage.session.get(key).then((got) => {
+      const text = typeof got[key] === "string" ? got[key] : "";
+      // Only if still on that job and the user hasn't started typing.
+      if (chatJobId !== newId || _drafts.has(newId) || input.value) return;
+      _drafts.set(newId, text);
+      input.value = text;
+      _autoGrowChatInput();
+    }).catch(() => {});
+  }
+}
+
+input?.addEventListener("input", () => {
+  const jobId = chatJobId;
+  if (!jobId) return;
+  _drafts.set(jobId, input.value);
+  if (_draftWriteTimer !== null) clearTimeout(_draftWriteTimer);
+  _draftWriteTimer = /** @type {number} */ (setTimeout(() => {
+    _draftWriteTimer = null;
+    _persistDraft(jobId, _drafts.get(jobId) ?? "");
+  }, 300));
+});
+
 // Summary tab button — we toggle .tab--qa-active on it while QA is in flight.
 // This adds a pulsing dot via CSS that is visible regardless of which pane is
 // active (the tab nav is always rendered above both panes).
@@ -126,12 +173,6 @@ const messages = /** @type {HTMLElement | null} */ (document.getElementById("cha
 // avoid the conflict where any SSE job-update clears our indicator.
 const _summaryTabBtn = /** @type {HTMLButtonElement | null} */ (
   document.getElementById("tab-summary")
-);
-
-// Summary pane element — consulted at answer-done time to decide whether to
-// scroll to the bubble start (only when the pane is actually visible).
-const _summaryPaneEl = /** @type {HTMLElement | null} */ (
-  document.getElementById("pane-summary")
 );
 
 // Live streaming state — module-level so the focus-recovery listener can
@@ -224,68 +265,146 @@ if (form) {
   });
 }
 
-// While a Q&A stream is running, additional questions don't block the input
-// or open a second request — they queue up here and get concatenated into a
-// single follow-up turn when the current one finishes. Deliberately simple:
-// no per-question ordering guarantees, no parallel requests, no UI for the
-// pending state beyond the user bubbles already on screen.
+// Question queue — per job. Every submitted question becomes an entry
+// {id, jobId, text} and its user bubble shows at once (marked pending). One
+// turn runs at a time; the drain loop picks the oldest entry whose job is
+// `done` (daemon QA 409s otherwise) and merges ONLY that job's entries
+// accumulated meanwhile into one turn — questions for other jobs run as
+// their own turns with their own job id. Entries for a job still being
+// summarised wait until app.js reports it done (noteJobStatus); if it fails
+// they are dropped with an error on their bubbles. Pending entries live
+// only in this panel's memory (not in the DB yet), so renderHistory
+// re-appends them for their job.
 let qaInFlight = false;
-/** @type {string[]} */
+let _pendingSeq = 0;
+/** @type {{id: number, jobId: string, text: string}[]} */
 let pendingQuestions = [];
+/** Last known status per job id. @type {Map<string, string>} */
+const _jobStatus = new Map();
+/** Questions dropped because their job failed — shown with an error on re-render. @type {Map<string, {text: string, error: string}[]>} */
+const _failedQuestions = new Map();
+
+/**
+ * Record a job's status (app.js calls this for every job event / stream
+ * done|error of ANY job, so queued questions get sent even after the user
+ * switched away). `done` drains, `failed` drops that job's queue.
+ *
+ * @param {string} jobId
+ * @param {string | null | undefined} status
+ * @param {string | null} [error]
+ */
+export function noteJobStatus(jobId, status, error) {
+  _noteStatus(jobId, status, error);
+}
+
+/** @param {string} jobId @param {string | null | undefined} status @param {string | null} [error] */
+function _noteStatus(jobId, status, error) {
+  if (!status) return;
+  const prev = _jobStatus.get(jobId);
+  _jobStatus.set(jobId, status);
+  if (status === prev) return;
+  if (status === "done") {
+    _drain().catch((err) => console.error("[TLDR] qa drain failed", err));
+  } else if (status === "failed") {
+    _failQueued(jobId, error || "The summary failed, so this question wasn't sent.");
+  }
+}
+
+/** @param {string} jobId @param {string} error */
+function _failQueued(jobId, error) {
+  const dropped = pendingQuestions.filter((q) => q.jobId === jobId);
+  if (!dropped.length) return;
+  pendingQuestions = pendingQuestions.filter((q) => q.jobId !== jobId);
+  const list = _failedQuestions.get(jobId) || [];
+  for (const q of dropped) list.push({ text: q.text, error });
+  _failedQuestions.set(jobId, list);
+  if (!_ownsChatDom(jobId) || !messages) return;
+  for (const q of dropped) {
+    const el = messages.querySelector(`[data-pending-id="${q.id}"]`);
+    if (el) _markBubbleFailed(/** @type {HTMLElement} */ (el), error);
+  }
+}
+
+/** @param {HTMLElement} wrap @param {string} error */
+function _markBubbleFailed(wrap, error) {
+  wrap.classList.remove("chat-bubble--pending");
+  wrap.classList.add("chat-bubble--failed");
+  wrap.removeAttribute("data-pending-id");
+  const note = document.createElement("div");
+  note.className = "chat-bubble-note error";
+  note.textContent = error;
+  wrap.appendChild(note);
+}
 
 /** @param {string} question */
 async function handleAsk(question) {
-  const { activeJobId } = await chrome.storage.session.get("activeJobId");
-  if (!activeJobId) return;
+  // The job on screen in THIS panel — never a stored/global id.
+  const jobId = chatJobId;
+  if (!jobId) return;
+  const entry = { id: ++_pendingSeq, jobId, text: question };
+  pendingQuestions.push(entry);
 
-  // Show the user's bubble and clear the input immediately, regardless of
-  // whether we're already streaming. Keeping focus lets the user keep typing
-  // follow-ups without a click.
-  appendBubble("user", question);
+  // Show the user's bubble and clear the input immediately. Keeping focus
+  // lets the user keep typing follow-ups without a click. Submitting means
+  // "I want to see the answer": follow the end again.
+  const bubble = appendBubble("user", question);
+  _markPending(bubble, entry.id);
+  setFollowing(true);
   scrollMessagesToEnd();
   if (input) {
     input.value = "";
     _autoGrowChatInput();
     input.focus();
   }
+  if (_draftWriteTimer !== null) {
+    clearTimeout(_draftWriteTimer);
+    _draftWriteTimer = null;
+  }
+  _persistDraft(jobId, "");
 
-  if (qaInFlight) {
-    // Another turn is in flight — stash this one. It'll be picked up (joined
-    // with anything else that piled up) by the drain loop below.
-    pendingQuestions.push(question);
+  if (_jobStatus.get(jobId) !== "done") {
+    // Summary still running: wait for noteJobStatus("done"). Re-check once
+    // in case the done event was missed (throttled panel).
+    daemon.getJob(jobId).then((j) => _noteStatus(jobId, j.status, j.error)).catch(() => {});
     return;
   }
-  // Claim the in-flight slot synchronously (no `await` between the check and
-  // this assignment) so two near-simultaneous submits can't both decide
-  // they're the first turn and fire parallel requests.
+  await _drain();
+}
+
+/** Run queued turns until nothing sendable is left. One turn at a time. */
+async function _drain() {
+  if (qaInFlight) return;
+  // Claimed synchronously (no await between check and set) so two
+  // near-simultaneous calls can't both fire requests.
   qaInFlight = true;
-
-  if (!activeJob) {
-    // Fill once if app.js hasn't published the job yet — never overwrite a
-    // freshly-set job from app.js (which may have a non-null `video_id` that
-    // the daemon hasn't echoed back yet).
-    try {
-      activeJob = await daemon.getJob(activeJobId);
-    } catch {
-      // Continue without — the daemon will 404 if the job is gone.
-    }
-  }
-
-  // Drain loop: run the user's turn, then keep running merged follow-ups
-  // until the queue is empty. Iterative — no recursion in `finally`, so the
-  // stack stays flat and any error in a follow-up surfaces here, not as a
-  // swallowed `.catch(console.error)`.
   try {
-    let next = question;
-    while (next) {
-      await _runQaTurn(activeJobId, next);
-      if (pendingQuestions.length === 0) break;
-      next = pendingQuestions.join("\n\n");
-      pendingQuestions = [];
+    for (;;) {
+      const head = pendingQuestions.find((q) => _jobStatus.get(q.jobId) === "done");
+      if (!head) break;
+      const batch = pendingQuestions.filter((q) => q.jobId === head.jobId);
+      pendingQuestions = pendingQuestions.filter((q) => q.jobId !== head.jobId);
+      if (messages && _ownsChatDom(head.jobId)) {
+        for (const q of batch) {
+          const el = messages.querySelector(`[data-pending-id="${q.id}"]`);
+          if (el) {
+            el.classList.remove("chat-bubble--pending");
+            el.removeAttribute("data-pending-id");
+          }
+        }
+      }
+      await _runQaTurn(head.jobId, batch.map((q) => q.text).join("\n\n"));
     }
   } finally {
     qaInFlight = false;
   }
+}
+
+/** @param {HTMLElement} inner bubble inner @param {number} id */
+function _markPending(inner, id) {
+  const wrap = /** @type {HTMLElement | null} */ (inner.closest(".chat-bubble"));
+  if (!wrap) return;
+  wrap.classList.add("chat-bubble--pending");
+  wrap.dataset.pendingId = String(id);
 }
 
 /**
@@ -394,17 +513,20 @@ async function _runQaTurn(jobId, question) {
           // Render WITH timecode links — the QA prompt now ensures [MM:SS]
           // markers only appear when the answer came from the material, so any
           // marker the LLM emits is a real jump target (not a web_search hallucination).
-          _liveBubbleEl.innerHTML = renderMarkdown(final, activeJob);
-          if (frameRefs.length) {
-            await _appendFrameRow(_liveWrapEl, frameRefs);
-          }
+          const job = activeJob?.id === jobId ? activeJob : null;
+          _liveBubbleEl.innerHTML = renderMarkdown(final, job);
           _setQaActive(false);
-          // Scroll to the START of the assistant bubble so the user reads from
-          // the top, not the bottom of a potentially long answer. Only scroll
-          // when Summary pane is visible — don't yank the user away from Transcript.
-          if (_summaryPaneEl?.classList.contains("tab-pane--active") && _liveWrapEl) {
-            _liveWrapEl.scrollIntoView({ block: "start", behavior: "smooth" });
+          // No jump to the answer's start: a reader who scrolled away stays
+          // put; a following reader just stays at the bottom.
+          const wrap = _liveWrapEl;
+          if (frameRefs.length && wrap) {
+            // Clear the live state before awaiting so a renderHistory during
+            // the await doesn't re-attach a finished turn.
+            _clearLiveTurnState();
+            await _appendFrameRow(wrap, frameRefs, job, jobId);
+            return;
           }
+          scrollMessagesToEnd();
         }
         _clearLiveTurnState();
         return;
@@ -457,6 +579,7 @@ async function _runQaTurn(jobId, question) {
 export async function renderHistory(jobId, items) {
   if (!messages) return;
   if (jobId !== chatJobId) return; // stale response — a different job is on screen now
+  const job = activeJob?.id === jobId ? activeJob : null;
   messages.innerHTML = "";
   const frag = document.createDocumentFragment();
   /** @type {Promise<void>[]} */
@@ -467,10 +590,10 @@ export async function renderHistory(jobId, items) {
       // Timecode links enabled — qa.txt prompt now guards against hallucinated
       // timestamps from web_search, so any [MM:SS] in stored answers is a
       // genuine material reference worth making clickable.
-      bubble.innerHTML = renderMarkdown(m.content, activeJob);
+      bubble.innerHTML = renderMarkdown(m.content, job);
       if (m.frame_refs && m.frame_refs.length) {
         const wrap = /** @type {HTMLElement | null} */ (bubble.closest(".chat-bubble"));
-        framePromises.push(_appendFrameRow(wrap, m.frame_refs));
+        framePromises.push(_appendFrameRow(wrap, m.frame_refs, job, jobId));
       }
     } else {
       bubble.textContent = m.content;
@@ -478,6 +601,9 @@ export async function renderHistory(jobId, items) {
   }
   messages.appendChild(frag);
   await Promise.all(framePromises);
+  // Ownership may have flipped during the await — a newer job's chat now
+  // owns the list; don't append this job's live/pending bubbles to it.
+  if (jobId !== chatJobId) return;
 
   // If this job has a turn still streaming (the user asked a question, tabbed
   // away before it finished, and just tabbed back), re-attach its bubble at
@@ -488,11 +614,23 @@ export async function renderHistory(jobId, items) {
   } else {
     scrollMessagesToEnd();
   }
+  // Questions dropped because the job failed, then those still waiting
+  // (not in the DB yet) — they must not vanish on re-render.
+  for (const f of _failedQuestions.get(jobId) || []) {
+    const inner = appendBubble("user", f.text);
+    const wrap = /** @type {HTMLElement | null} */ (inner.closest(".chat-bubble"));
+    if (wrap) _markBubbleFailed(wrap, f.error);
+  }
+  for (const q of pendingQuestions) {
+    if (q.jobId === jobId) _markPending(appendBubble("user", q.text), q.id);
+  }
+  scrollMessagesToEnd();
 }
 
 /** Wipe all bubbles (called on tab-changed → no-job placeholder). */
 export function clearChat() {
   if (messages) messages.innerHTML = "";
+  if (chatJobId !== null) _swapDraft(chatJobId, null);
   chatJobId = null;
 }
 
@@ -551,9 +689,12 @@ function appendBubble(who, text, container) {
  *
  * @param {HTMLElement | null} bubbleEl
  * @param {FrameRef[] | null | undefined} frameRefs
+ * @param {JobDetails | null} job the job these frames belong to (passed
+ *   explicitly — `activeJob` may be another job by the time the await ends)
+ * @param {string} jobId
  * @returns {Promise<void>}
  */
-async function _appendFrameRow(bubbleEl, frameRefs) {
+async function _appendFrameRow(bubbleEl, frameRefs, job, jobId) {
   if (!bubbleEl || !frameRefs || frameRefs.length === 0) return;
   // Fails soft, deliberately: this renders on top of an already-finished
   // answer bubble (live path) or an already-built history list (renderHistory,
@@ -563,8 +704,10 @@ async function _appendFrameRow(bubbleEl, frameRefs) {
   // rejection, and must never take the rendered text down with it.
   try {
     const base = await daemon.baseUrl();
-    const row = buildFrameRow(activeJob, frameRefs, base);
+    if (!_ownsChatDom(jobId) || !bubbleEl.isConnected) return;
+    const row = buildFrameRow(job, frameRefs, base);
     bubbleEl.insertAdjacentElement("afterend", row);
+    scrollMessagesToEnd();
   } catch (err) {
     console.warn("[TLDR] failed to render frame thumbnails", err);
   }
@@ -583,12 +726,7 @@ function renderErrorBubble(bubble, message) {
 }
 
 function scrollMessagesToEnd() {
-  // Single page-level scroll now. Auto-stick to the bottom only if the user
-  // is already near it — otherwise they're reading the summary or earlier
-  // history and shouldn't be yanked.
-  const root = document.scrollingElement || document.documentElement;
-  const distFromBottom = root.scrollHeight - root.scrollTop - window.innerHeight;
-  if (distFromBottom < 120) {
-    root.scrollTop = root.scrollHeight;
-  }
+  // Single page-level scroll, "follow" mode (lib/scroll-follow.js): only
+  // while the reader is at the bottom; any upward user scroll stops it.
+  followScrollToEnd();
 }

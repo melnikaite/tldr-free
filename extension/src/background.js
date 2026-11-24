@@ -20,6 +20,7 @@ import {
   upsertStream,
 } from "./lib/stream-sniff.js";
 import { scopeSniffed } from "./lib/page-videos.js";
+import { PAGE_JOB_KINDS, activeJobKey, searchHandoffKey } from "./lib/active-job.js";
 
 /** @import {
  *   JobCreateRequest,
@@ -458,7 +459,7 @@ chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
     return false;
   }
   if (msg.type === "summarize-active-tab") {
-    handleSummarizeActiveTab().catch((e) =>
+    handleSummarizeActiveTab(msg.windowId).catch((e) =>
       console.error("[TLDR] summarize-active-tab", e),
     );
     return false;
@@ -466,8 +467,11 @@ chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
   return false;
 });
 
-async function handleSummarizeActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+/** @param {number} [windowId] the asking panel's window (absent: last focused) */
+async function handleSummarizeActiveTab(windowId) {
+  const [tab] = await chrome.tabs.query(
+    typeof windowId === "number" ? { active: true, windowId } : { active: true, lastFocusedWindow: true },
+  );
   if (!tab) return;
   await summarizeTab(tab);
 }
@@ -667,10 +671,10 @@ async function handleExtractedYouTube(msg, sourceTabId) {
  * progress and stream the summary.
  *
  * The broadcast goes out for every successful submit so the sidebar's badge
- * counter and Library's table can refresh. We only flip the global
- * ``activeJobId`` (which the sidepanel uses to decide what to display)
- * when the user is still on the source tab (the one where they clicked
- * summarize) — otherwise we'd hijack the panel away from whatever the user
+ * counter and Library's table can refresh. We only flip the source tab's
+ * window's ``activeJob:<windowId>`` (which that window's panel uses to
+ * decide what to display) when the source tab is still the active one in
+ * its window — otherwise we'd hijack the panel away from whatever the user
  * is now looking at.
  *
  * Tab-id comparison (NOT URL comparison) — `sender.tab.id` from the content
@@ -697,15 +701,18 @@ async function submitJob(req, sourceTabId) {
     return;
   }
 
+  // Switch only the source tab's own window, and only while that tab is
+  // still the active one there (per-window: each window has its own panel).
   let shouldSwitch = false;
+  /** @type {number | undefined} */
+  let windowId;
   if (sourceTabId != null) {
     try {
-      const [activeTab] = await chrome.tabs.query({
-        active: true, lastFocusedWindow: true,
-      });
-      shouldSwitch = activeTab?.id === sourceTabId;
+      const src = await chrome.tabs.get(sourceTabId);
+      shouldSwitch = !!src?.active;
+      windowId = src?.windowId;
     } catch (err) {
-      console.warn("[TLDR] tabs.query failed", err);
+      console.warn("[TLDR] tabs.get failed", err);
     }
   }
 
@@ -714,10 +721,13 @@ async function submitJob(req, sourceTabId) {
     jobId: resp.id,
     url: req.url,
     shouldSwitch,
+    windowId,
   });
 
-  if (shouldSwitch) {
-    await chrome.storage.session.set({ activeJobId: resp.id, activeUrl: req.url });
+  if (shouldSwitch && windowId != null) {
+    await chrome.storage.session.set({
+      [activeJobKey(windowId)]: { jobId: resp.id, url: req.url },
+    });
   }
 }
 
@@ -752,6 +762,12 @@ const lastSyncedUrlByTab = new Map();
 // larger than both the local counter and any version any previous worker
 // ever issued (assuming a sane clock).
 let switchVersion = 0;
+// Latest version issued per window — the "newer sync already fired" check
+// in syncSidepanelForTab is per window, so a switch in window 2 never
+// cancels window 1's phase 2. Lost on SW restart, which only matters for
+// syncs in flight at that moment (the version space itself survives).
+/** @type {Map<number, number>} */
+const latestVersionByWindow = new Map();
 
 function nextSwitchVersion() {
   switchVersion = Math.max(switchVersion + 1, Date.now());
@@ -769,18 +785,20 @@ async function syncSidepanelForTab(tab) {
   // for the library URL itself.
   if (!/^https?:/i.test(url)) return;
 
+  const windowId = tab.windowId;
   const normalized = normalizeUrl(url);
   const version = nextSwitchVersion();
+  latestVersionByWindow.set(windowId, version);
 
   // Phase 1: tell the panel which tab we're moving to *before* hitting the
   // daemon. jobId is omitted to mean "still resolving". The panel uses this
   // to decide whether to blank to a spinner (different URL) or stay put
   // (same URL — e.g. window focus restored on the same tab).
-  await broadcast({ type: "set-active-tab", version, url: normalized, tabId: tab.id });
+  await broadcast({ type: "set-active-tab", version, url: normalized, tabId: tab.id, windowId });
 
   let jobId = null;
   try {
-    const resp = await daemon.listJobs({ url: normalized, limit: 1 });
+    const resp = await daemon.listJobs({ url: normalized, kind: PAGE_JOB_KINDS, limit: 1 });
     jobId = resp.items?.[0]?.id ?? null;
   } catch (err) {
     console.warn("[TLDR] tab sync listJobs failed", err);
@@ -790,10 +808,10 @@ async function syncSidepanelForTab(tab) {
 
   // A newer syncSidepanelForTab fired after us — its phase 1 already moved
   // the panel forward. Don't clobber it with our late phase 2.
-  if (version !== switchVersion) return;
+  if (latestVersionByWindow.get(windowId) !== version) return;
 
-  await chrome.storage.session.set({ activeJobId: jobId, activeUrl: normalized });
-  await broadcast({ type: "set-active-tab", version, url: normalized, jobId, tabId: tab.id });
+  await chrome.storage.session.set({ [activeJobKey(windowId)]: { jobId, url: normalized } });
+  await broadcast({ type: "set-active-tab", version, url: normalized, jobId, tabId: tab.id, windowId });
 }
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -806,6 +824,9 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   }
 });
 
+// `tab.active` = active in ITS window (possibly a background window, e.g.
+// YouTube autoplay there). That is fine: the sync is keyed by tab.windowId,
+// so only that window's panel follows.
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
   if (!tab.active) return;
@@ -819,6 +840,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastSyncedUrlByTab.delete(tabId);
   clearSniffed(tabId);
   updateFrameOrigins((map) => pruneFrameTab(map, tabId));
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  latestVersionByWindow.delete(windowId);
+  chrome.storage.session.remove([activeJobKey(windowId), searchHandoffKey(windowId)]).catch(() => {});
 });
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {

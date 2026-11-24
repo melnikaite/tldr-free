@@ -159,6 +159,24 @@ let _pollId = /** @type {number | null} */ (null);
 let _pollTabId = /** @type {number | null} */ (null);
 
 /**
+ * Generation of poll starts. ``_startPoll`` captures it before awaiting
+ * ``_findSourceTab``; ``_stopPoll`` bumps it, so a start that was in
+ * flight when the poll was stopped (job switch, tab hide, media-target
+ * change) finds the token changed and bails instead of installing an
+ * interval for the wrong job/tab.
+ */
+let _pollGen = 0;
+/** True while a ``_startPoll`` is awaiting its tab lookup (single-flight). */
+let _pollStarting = false;
+
+/**
+ * Bumped on every ``_showLanguage`` call and every real job switch, so a
+ * transcript fetch that resolves after the user moved on (other job or
+ * other language) is cached but never rendered.
+ */
+let _viewSeq = 0;
+
+/**
  * Where this job's media lives when it was opened from a side-panel video
  * chip (app.js sets it): that tab + frame, and the chip's duration as the
  * expected-duration fallback. null = the usual source-tab lookup (YouTube
@@ -180,7 +198,7 @@ export function setMediaTarget(target) {
     && prev.tabId === target.tabId && prev.frameId === target.frameId
     && prev.duration === target.duration);
   if (same) return;
-  if (_pollId !== null) {
+  if (_pollId !== null || _pollStarting) {
     _stopPoll();
     _startPoll().catch(() => {});
   }
@@ -307,6 +325,10 @@ export function setJob(job) {
   if (!sameJob) {
     // Real switch — tear down everything.
     _stopPoll();
+    _viewSeq++;
+    _scrollOnNextHighlight = false;
+    // _mediaTarget is deliberately NOT reset here: app.js calls
+    // setMediaTarget for the new job (via _syncChipsToJob) BEFORE setJob.
     _textCache.clear();
     _captionsData = null;
     _boundFrameUrl = null;
@@ -448,7 +470,8 @@ function _renderNoJobState() {
     btn.disabled = true;
     btn.textContent = "Starting…";
     try {
-      await chrome.runtime.sendMessage({ type: "summarize-active-tab" });
+      const win = await chrome.windows.getCurrent();
+      await chrome.runtime.sendMessage({ type: "summarize-active-tab", windowId: win.id });
     } catch (err) {
       bodyEl.innerHTML = `<p class="placeholder">Couldn't start: ${stringifyError(err)}</p>`;
     }
@@ -468,6 +491,8 @@ function _renderNoJobState() {
 async function _showLanguage(lang) {
   if (!_job || !bodyEl) return;
 
+  const seq = ++_viewSeq;
+  const job = _job;
   _currentLang = lang;
   _renderChips();
   _renderSourceNotice();
@@ -480,13 +505,17 @@ async function _showLanguage(lang) {
   if (!data) {
     bodyEl.innerHTML = `<div class="transcript-translating"><div class="spinner"></div><p>Loading transcript…</p></div>`;
     try {
-      data = await daemon.getTranscript(_job.id, lang ?? undefined);
+      data = await daemon.getTranscript(job.id, lang ?? undefined);
     } catch (err) {
+      if (seq !== _viewSeq || _job?.id !== job.id || _currentLang !== lang) return;
       bodyEl.innerHTML = `<p class="placeholder">Couldn't load transcript: ${stringifyError(err)}</p>`;
       _syncExportButton();
       return;
     }
+    // Cache under the key it was requested for (still valid for that
+    // job/lang), but only render if the view hasn't moved on meanwhile.
     _textCache.set(key, data);
+    if (seq !== _viewSeq || _job?.id !== job.id || _currentLang !== lang) return;
   }
 
   // Pending = extraction or translation still in flight. Show a
@@ -922,6 +951,7 @@ function _renderDiagnosticsControl() {
 
 showDiagnosticsBtn?.addEventListener("click", async () => {
   if (!_job) return;
+  const jobId = _job.id;
   if (diagnosticsStatusEl) {
     diagnosticsStatusEl.textContent = "Fetching…";
     diagnosticsStatusEl.className = "hint";
@@ -929,7 +959,9 @@ showDiagnosticsBtn?.addEventListener("click", async () => {
   diagnosticsActionsEl?.classList.add("hidden");
   diagnosticsReportEl?.classList.add("hidden");
   try {
-    const report = await daemon.getJobDiagnostics(_job.id);
+    const report = await daemon.getJobDiagnostics(jobId);
+    // Switched job meanwhile — don't attach A's report to B's section.
+    if (_job?.id !== jobId) return;
     if (!report.available) {
       if (diagnosticsStatusEl) {
         diagnosticsStatusEl.textContent = "No diagnostics were recorded for this job.";
@@ -949,6 +981,7 @@ showDiagnosticsBtn?.addEventListener("click", async () => {
       diagnosticsStatusEl.className = "hint";
     }
   } catch (err) {
+    if (_job?.id !== jobId) return;
     if (diagnosticsStatusEl) {
       diagnosticsStatusEl.textContent = `Failed to fetch diagnostics: ${stringifyError(err)}`;
       diagnosticsStatusEl.className = "hint err";
@@ -1104,10 +1137,18 @@ function _renderChips() {
     ev.preventDefault();
     const val = input.value.trim();
     if (!val) return;
+    if (!_job) return;
     input.disabled = true;
-    daemon.translateTranscript(_job.id, val)
+    // Capture the job at request time: the panel may switch jobs before
+    // the POST resolves, and the response belongs to THIS job only.
+    const reqJob = _job;
+    daemon.translateTranscript(reqJob.id, val)
       .then((result) => {
         input.value = "";
+        // Panel moved to another job (same-id patches replace the object,
+        // so compare ids):
+        // the SSE translation_updated path will refresh it if we come back.
+        if (!_job || _job.id !== reqJob.id) return;
         // If the daemon told us this IS the source language, just switch
         // the view — no chip needs to appear (the source chip already
         // exists). A dedup response of "partial" means a previous run
@@ -1251,10 +1292,22 @@ const POLL_INTERVAL_MS = 500;
 
 async function _startPoll() {
   if (_pollId !== null) return;
-  if (!_job) return;
+  if (!_job || _pollStarting) return;
+  const gen = _pollGen;
+  const jobId = _job.id;
+  _pollStarting = true;
   // Resolve once which tab to poll. ``_findSourceTab`` searches by
   // video_id (YouTube) or by canonical URL (media).
-  _pollTabId = await _findSourceTab();
+  let tabId;
+  try {
+    tabId = await _findSourceTab();
+  } finally {
+    // Only release the flag if no _stopPoll intervened (it resets it).
+    if (gen === _pollGen) _pollStarting = false;
+  }
+  // Stopped or switched job while we were looking — drop this start.
+  if (gen !== _pollGen || _job?.id !== jobId || _pollId !== null) return;
+  _pollTabId = tabId;
   if (_pollTabId == null) {
     // No matching tab open — nothing to follow. The user can still
     // click [MM:SS] links to open one. Nothing will consume
@@ -1271,6 +1324,8 @@ async function _startPoll() {
 }
 
 function _stopPoll() {
+  _pollGen++;
+  _pollStarting = false;
   if (_pollId !== null) {
     clearInterval(_pollId);
     _pollId = null;
