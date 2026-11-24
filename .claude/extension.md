@@ -73,6 +73,8 @@ unknown duration is kept. Visibility/`controls` are deliberately not used
 - YouTube embed → `https://www.youtube.com/watch?v=<id>`, a normal kind=youtube job;
 - other embed → normalized embed URL as both `url` and `media_url`, kind=media;
 - native / sniffed → `${normalizeUrl(pageUrl)}#tldr-video=${Math.round(duration)}`
+  (same-duration siblings: first keeps the plain key, later ones get
+  `~<hash of src host+path>` for native, `~<n>` scan order for blob players)
   (iframe/manifest URLs carry per-load tokens, duration doesn't; it also
   separates trailer from film). `normalizeUrl` strips fragments, so this key is
   passed as `jobUrl` and sent verbatim — never re-normalize it. Sniffed
@@ -94,7 +96,11 @@ probe/seek/captions (`probeTab`/`seekTab`/`installCaptionsInTab` take
 preferred `frameIds`, falling back to all frames) and the expected-duration
 fallback all use it — so an embed's kind=youtube job seeks inside the
 iframe instead of navigating to youtube.com. The selected chip is remembered
-per tabId in memory and restored after a tab switch.
+per tabId in memory and restored after a tab switch. Before a timecode click
+seeks the stored tabId, `_verifiedMediaTargetTab` re-checks that the tab
+still shows the chip's page (`sameMediaPage`) and, when a duration is known,
+that its main media still matches it; otherwise it falls back to `_findTab`
+(own window first, then others).
 
 ## Network stream sniffing (players in cross-origin iframes)
 
@@ -108,7 +114,15 @@ headers (Referer/Origin/User-Agent, needs `extraHeaders`) come from
 `onSendHeaders`; Content-Type and status from `onHeadersReceived`, which is
 the single recording point (non-2xx and segments are never recorded). Lists
 live in `chrome.storage.session` under `sniff:<tabId>` (cap 40, oldest
-dropped), cleared on a `main_frame` request and on tab close.
+dropped), scoped to the page the tab shows (needs `webNavigation`):
+`onCommitted` (top frame) starts a fresh list per document and stashes the
+old one by `documentId` (`sniffStash:<tabId>`, last 3) so a bfcache
+back/forward restore — same documentId, no requests — gets its list back;
+`onHistoryStateUpdated` (SPA) resets only when `pageIdentity`
+(origin+path+`v`/`id`-like params) changes, keeping entries seen in the last
+3 s (manifest often fetched just before pushState). Current document in
+`sniffPage:<tabId>`. All three keys are dropped on tab close. Pure logic:
+`onDocumentCommitted` / `onHistoryChanged` in `stream-sniff.js`.
 
 The list feeds the side panel's video chips (a `blob:` player in a frame
 whose origin has a sniffed manifest → a chip; see "Video chips"). When such a
@@ -362,7 +376,10 @@ merges only that job's waiting entries into one turn. The composer stays
 enabled while the summary streams: questions wait (pending bubbles) until
 app.js reports the job done via `noteJobStatus` (called for job events of
 ANY job, so they are sent even after the user switched away); a failed /
-deleted job drops them with an error note. Pending and failed entries are in
+deleted job parks them with an error note; when the job leaves `failed`
+(retry — app.js also calls `noteJobStatus(id, "queued")` right after
+`retryJob`), the parked bubbles flip back to pending in place (same ids, so
+no duplicates) and are sent once the job is done. Pending and failed entries are in
 panel memory only, so `renderHistory` re-appends them for their job.
 Composer drafts are per job in `chrome.storage.session["chatDraft:<jobId>"]`
 (saved on input/switch, restored on switch, deleted on send).
@@ -553,6 +570,7 @@ library writes — storage is what a freshly opened panel reads on boot.
   `{jobId, query}` from the library, consumed by the side panel (see
   "Find in transcript")
 - `chrome.storage.session["sniff:<tabId>"]` — network-sniffed manifests/subtitles for that tab (see "Network stream sniffing")
+- `chrome.storage.session["sniffPage:<tabId>"]` / `["sniffStash:<tabId>"]` — the document the list belongs to / stashed lists for bfcache restores
 - `chrome.storage.session["sniffFrames"]` — frame-origin → tab map for service-worker attribution
 - `chrome.storage.local.daemonUrl` — daemon endpoint (default `http://localhost:8765`)
 - `chrome.storage.local.daemonEverReachable` — set `true` by

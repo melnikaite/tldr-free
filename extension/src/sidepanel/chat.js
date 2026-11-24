@@ -272,7 +272,9 @@ if (form) {
 // accumulated meanwhile into one turn — questions for other jobs run as
 // their own turns with their own job id. Entries for a job still being
 // summarised wait until app.js reports it done (noteJobStatus); if it fails
-// they are dropped with an error on their bubbles. Pending entries live
+// they are parked with an error on their bubbles; if the job leaves
+// `failed` (retry), they go back to pending and are sent once it's done —
+// a question is never silently lost. Pending entries live
 // only in this panel's memory (not in the DB yet), so renderHistory
 // re-appends them for their job.
 let qaInFlight = false;
@@ -281,7 +283,7 @@ let _pendingSeq = 0;
 let pendingQuestions = [];
 /** Last known status per job id. @type {Map<string, string>} */
 const _jobStatus = new Map();
-/** Questions dropped because their job failed — shown with an error on re-render. @type {Map<string, {text: string, error: string}[]>} */
+/** Questions parked because their job failed — shown with an error on re-render, re-queued on retry. @type {Map<string, {id: number, text: string, error: string}[]>} */
 const _failedQuestions = new Map();
 
 /**
@@ -297,12 +299,26 @@ export function noteJobStatus(jobId, status, error) {
   _noteStatus(jobId, status, error);
 }
 
+/**
+ * The job was just retried (POST /jobs/{id}/retry succeeded). Flip it out of
+ * `failed` so parked questions re-queue even if the SSE status event is
+ * missed — but only if it is still `failed`: a status event that already
+ * arrived (e.g. `done` on a fast retry) must not be overwritten.
+ * @param {string} jobId
+ */
+export function noteJobRetried(jobId) {
+  if (_jobStatus.get(jobId) === "failed") _noteStatus(jobId, "queued");
+}
+
 /** @param {string} jobId @param {string | null | undefined} status @param {string | null} [error] */
 function _noteStatus(jobId, status, error) {
   if (!status) return;
   const prev = _jobStatus.get(jobId);
   _jobStatus.set(jobId, status);
   if (status === prev) return;
+  // Left `failed` (retried): parked questions go back to pending; the
+  // `done` branch below (now or later) sends them.
+  if (prev === "failed") _requeueFailed(jobId);
   if (status === "done") {
     _drain().catch((err) => console.error("[TLDR] qa drain failed", err));
   } else if (status === "failed") {
@@ -316,20 +332,45 @@ function _failQueued(jobId, error) {
   if (!dropped.length) return;
   pendingQuestions = pendingQuestions.filter((q) => q.jobId !== jobId);
   const list = _failedQuestions.get(jobId) || [];
-  for (const q of dropped) list.push({ text: q.text, error });
+  for (const q of dropped) list.push({ id: q.id, text: q.text, error });
   _failedQuestions.set(jobId, list);
   if (!_ownsChatDom(jobId) || !messages) return;
   for (const q of dropped) {
     const el = messages.querySelector(`[data-pending-id="${q.id}"]`);
-    if (el) _markBubbleFailed(/** @type {HTMLElement} */ (el), error);
+    if (el) _markBubbleFailed(/** @type {HTMLElement} */ (el), error, q.id);
   }
 }
 
-/** @param {HTMLElement} wrap @param {string} error */
-function _markBubbleFailed(wrap, error) {
+/**
+ * Job `jobId` was retried: move its parked (failed) questions back into the
+ * pending queue, keeping their ids so the on-screen bubbles flip back to
+ * pending in place (no duplicates; renderHistory then shows them once, as
+ * pending).
+ * @param {string} jobId
+ */
+function _requeueFailed(jobId) {
+  const parked = _failedQuestions.get(jobId);
+  if (!parked?.length) return;
+  _failedQuestions.delete(jobId);
+  for (const f of parked) pendingQuestions.push({ id: f.id, jobId, text: f.text });
+  if (!_ownsChatDom(jobId) || !messages) return;
+  for (const f of parked) {
+    const wrap = /** @type {HTMLElement | null} */ (messages.querySelector(`[data-failed-id="${f.id}"]`));
+    if (!wrap) continue;
+    wrap.classList.remove("chat-bubble--failed");
+    wrap.removeAttribute("data-failed-id");
+    wrap.querySelectorAll(".chat-bubble-note.error").forEach((n) => n.remove());
+    wrap.classList.add("chat-bubble--pending");
+    wrap.dataset.pendingId = String(f.id);
+  }
+}
+
+/** @param {HTMLElement} wrap @param {string} error @param {number} id */
+function _markBubbleFailed(wrap, error, id) {
   wrap.classList.remove("chat-bubble--pending");
   wrap.classList.add("chat-bubble--failed");
   wrap.removeAttribute("data-pending-id");
+  wrap.dataset.failedId = String(id);
   const note = document.createElement("div");
   note.className = "chat-bubble-note error";
   note.textContent = error;
@@ -619,7 +660,7 @@ export async function renderHistory(jobId, items) {
   for (const f of _failedQuestions.get(jobId) || []) {
     const inner = appendBubble("user", f.text);
     const wrap = /** @type {HTMLElement | null} */ (inner.closest(".chat-bubble"));
-    if (wrap) _markBubbleFailed(wrap, f.error);
+    if (wrap) _markBubbleFailed(wrap, f.error, f.id);
   }
   for (const q of pendingQuestions) {
     if (q.jobId === jobId) _markPending(appendBubble("user", q.text), q.id);

@@ -27,10 +27,31 @@ const TRACKING_PARAMS = new Set([
   "gclid",
   "msclkid",
   "yclid",
-  "ref",
   "ref_src",
   "_ga",
 ]);
+
+// `ref` is meaningful on many sites (GitHub branch/tag refs, API docs,
+// referral programmes that change content), so it is NOT globally tracking.
+// Strip it only on hosts where it is known to be a pure share/referral tag
+// that never changes the page. Kept deliberately tiny — when in doubt, keep.
+// Product Hunt appends ?ref=<surface> (header_nav, home, …) to its own
+// post links purely for attribution; the post is identified by the path.
+const REF_TRACKING_HOSTS = new Set(["producthunt.com"]);
+
+/** @param {string} host lowercased hostname */
+function _refIsTracking(host) {
+  return REF_TRACKING_HOSTS.has(host.replace(/^www\./, ""));
+}
+
+/**
+ * Whether a fragment identifies the page (hash-routed SPA) rather than a
+ * position inside it: `#/path` or `#!path` (hashbang).
+ * @param {string} hash URL#hash including the leading "#"
+ */
+function _isRouteHash(hash) {
+  return hash.startsWith("#/") || hash.startsWith("#!");
+}
 
 const YT_HOST_RE =
   /^(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com)$/i;
@@ -98,10 +119,13 @@ export function normalizeUrl(rawUrl) {
     return rawUrl;
   }
 
-  u.hash = "";
   u.hostname = u.hostname.toLowerCase();
+  const isYt = YT_HOST_RE.test(u.hostname);
+  // Route-like fragments (#/inbox, #!/item/1) are page identity in
+  // hash-routed SPAs; anything else (#section, #t=754, #comments) is noise.
+  if (isYt || !_isRouteHash(u.hash)) u.hash = "";
 
-  if (YT_HOST_RE.test(u.hostname)) {
+  if (isYt) {
     // YouTube: identity is the video id. Anything else (t=, list=, index=,
     // ab_channel=, pp=, etc.) is noise.
     const videoId = extractYoutubeVideoId(u.toString());
@@ -115,10 +139,42 @@ export function normalizeUrl(rawUrl) {
     return u.toString();
   }
 
+  const stripRef = _refIsTracking(u.hostname);
   for (const key of [...u.searchParams.keys()]) {
-    if (TRACKING_PARAMS.has(key.toLowerCase())) {
+    const k = key.toLowerCase();
+    if (TRACKING_PARAMS.has(k) || (stripRef && k === "ref")) {
       u.searchParams.delete(key);
     }
   }
   return u.toString();
+}
+
+/**
+ * Whether ``tabUrl`` shows the same page/video as ``targetUrl``: YouTube by
+ * video id (any host/path form — m., music., youtu.be, /shorts/, /live/),
+ * everything else by `normalizeUrl` (tracking params / fragments ignored).
+ *
+ * @param {string | null | undefined} tabUrl
+ * @param {string | null | undefined} targetUrl
+ */
+export function sameMediaPage(tabUrl, targetUrl) {
+  if (!tabUrl || !targetUrl) return false;
+  const want = extractYoutubeVideoId(targetUrl);
+  if (want) return extractYoutubeVideoId(tabUrl) === want;
+  return normalizeUrl(tabUrl) === normalizeUrl(targetUrl);
+}
+
+/**
+ * Pick the tab showing ``url`` (see `sameMediaPage`), preferring tabs in
+ * ``windowId`` (the side panel's own window), then any other window.
+ *
+ * @template {{ url?: string, windowId?: number }} T
+ * @param {T[]} tabs
+ * @param {string} url
+ * @param {number | null} [windowId]
+ * @returns {T | undefined}
+ */
+export function pickTabForUrl(tabs, url, windowId = null) {
+  const matches = tabs.filter((t) => sameMediaPage(t.url, url));
+  return matches.find((t) => windowId != null && t.windowId === windowId) ?? matches[0];
 }

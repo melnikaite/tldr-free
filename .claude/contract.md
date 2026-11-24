@@ -92,6 +92,15 @@ sending to the daemon (both create and lookup). Implications:
 - For YouTube, identity is the video id alone — `/shorts/`, `/embed/`,
   `youtu.be/...`, `&list=...` all collapse to
   `https://www.youtube.com/watch?v=<id>`.
+- Fragments are dropped (`#section`, `#t=754`) EXCEPT route-like ones —
+  `#/…` or `#!…` — which are page identity in hash-routed SPAs and are kept.
+- Tracking params (`utm_*`, `fbclid`, `gclid`, `ref_src`, …) are stripped
+  everywhere. `ref` is NOT global (GitHub branch refs etc. are meaningful);
+  it is stripped only on the tiny `REF_TRACKING_HOSTS` list in `url.js`.
+  Changing these rules can orphan previously saved pages (accepted).
+- Tab matching (`sameMediaPage` / `pickTabForUrl`) uses the same rules:
+  YouTube by video id across m./music./youtu.be/`/shorts/`/`/live/`, other
+  pages by `normalizeUrl`; the side panel prefers tabs in its own window.
 - Daemon stores whatever it gets and looks up on the same canonical form.
 
 If you add a new URL family, extend `normalizeUrl` — never special-case on

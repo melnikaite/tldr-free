@@ -39,7 +39,7 @@ import {
   MOMENT_MATCH_TOLERANCE_SECONDS,
 } from "../lib/frame-thumbnails.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { seekTab } from "../lib/media-frames.js";
+import { probeTab, seekTab } from "../lib/media-frames.js";
 import {
   EMBED_PATTERNS,
   buildChips,
@@ -47,7 +47,7 @@ import {
   formatDuration,
   scanFrame,
 } from "../lib/page-videos.js";
-import { normalizeUrl } from "../lib/url.js";
+import { normalizeUrl, pickTabForUrl, sameMediaPage } from "../lib/url.js";
 import { PAGE_JOB_KINDS, activeJobKey, searchHandoffKey } from "../lib/active-job.js";
 import { followScrollToEnd, programmaticScrollTo, setFollowing } from "../lib/scroll-follow.js";
 import { escapeHtml, stringifyError } from "../lib/utils.js";
@@ -56,6 +56,7 @@ import {
   peekActiveJob,
   renderHistory,
   clearChat,
+  noteJobRetried,
   noteJobStatus,
 } from "./chat.js";
 import * as transcript from "./transcript.js";
@@ -177,6 +178,11 @@ const CHIP_POLL_MS = 3000;
 let _chipTabId = null;
 /** normalizeUrl(tab.url) — the Page chip's key. */
 let _chipPageUrl = "";
+/**
+ * Page URL the current media target (transcript.setMediaTarget) was built
+ * for — re-checked against the tab before seeking it (tab may have navigated).
+ */
+let _mediaTargetPageUrl = "";
 /** @type {import("../lib/page-videos.js").VideoChip[]} */
 let _chips = [];
 /** "page", a video chip key, or null (shown job isn't one of this tab's). @type {string | null} */
@@ -234,6 +240,7 @@ function _resetChipsForTab(tabId) {
   _chips = [];
   _selectedChip = "page";
   transcript.setMediaTarget(null);
+  _mediaTargetPageUrl = "";
   _renderChipBar();
   refreshChips().catch(() => {});
 }
@@ -315,6 +322,7 @@ function _syncChipsToJob(job) {
     if (_selectedChip && _chipTabId != null) _selectedByTab.set(_chipTabId, _selectedChip);
   }
   const chip = _chips.find((c) => c.key === _selectedChip);
+  _mediaTargetPageUrl = _chipPageUrl;
   transcript.setMediaTarget(
     job && chip && _chipTabId != null
       ? { tabId: _chipTabId, frameId: chip.frameId, duration: chip.duration }
@@ -551,46 +559,43 @@ document.body.addEventListener("click", (ev) => {
 });
 
 /**
- * Find an already-open tab for ``url``.
- * YouTube URLs are matched by video ID so extra query params (&t=, &autoplay=,
- * etc.) on the open tab don't prevent the match. Other URLs are matched by
- * canonical form (fragment stripped on both sides), so a timecode anchor
- * like ``…/podcast#t=754`` matches the live tab at ``…/podcast``.
- * Returns the first matching Tab, or ``undefined`` if none is open.
+ * Find an already-open tab for ``url``: YouTube by video id (any host/path
+ * form), everything else by `normalizeUrl` (tracking params / non-route
+ * fragments ignored) — see `pickTabForUrl` in lib/url.js. Tabs in this
+ * panel's own window win over other windows.
  *
  * @param {string} url
  * @returns {Promise<chrome.tabs.Tab | undefined>}
  */
 async function _findTab(url) {
   try {
-    const parsed = new URL(url);
-    if (parsed.hostname.endsWith("youtube.com") && parsed.searchParams.has("v")) {
-      const videoId = parsed.searchParams.get("v");
-      const ytTabs = await chrome.tabs.query({ url: "*://www.youtube.com/watch*" });
-      return ytTabs.find((t) => {
-        try {
-          return new URL(t.url ?? "").searchParams.get("v") === videoId;
-        } catch {
-          return false;
-        }
-      });
-    }
-    parsed.hash = "";
-    const canonical = parsed.toString();
-    const tabs = await chrome.tabs.query({});
-    return tabs.find((t) => {
-      if (!t.url) return false;
-      try {
-        const tabUrl = new URL(t.url);
-        tabUrl.hash = "";
-        return tabUrl.toString() === canonical;
-      } catch {
-        return t.url === url;
-      }
-    });
+    const [tabs, windowId] = await Promise.all([chrome.tabs.query({}), _windowIdReady]);
+    return pickTabForUrl(tabs, url, windowId);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether the chip's stored media target still shows the chip's page and
+ * media: the tab exists, its URL still matches the page the chip was built
+ * for, and (when a duration is known) its main media still matches it.
+ * A tab that navigated away must not get seeked.
+ *
+ * @param {import("./transcript.js").MediaTarget} target
+ * @returns {Promise<chrome.tabs.Tab | null>}
+ */
+async function _verifiedMediaTargetTab(target) {
+  const pageUrl = _mediaTargetPageUrl;
+  if (!pageUrl) return null;
+  const tab = await chrome.tabs.get(target.tabId).catch(() => null);
+  if (!tab || !sameMediaPage(tab.url, pageUrl)) return null;
+  const range = transcript.expectedMediaRange();
+  if (range) {
+    const best = await probeTab(target.tabId, range, transcript.mediaTargetFrames()).catch(() => null);
+    if (!best || !best.info.matches) return null;
+  }
+  return tab;
 }
 
 /**
@@ -621,10 +626,12 @@ async function _focusTab(tab) {
 async function _openTimecode({ videoId, mediaPageUrl, seconds, fallbackUrl }) {
   // Job opened from a video chip: seek THAT chip's element/frame in its tab
   // (an embed's kind=youtube job must not navigate to youtube.com).
+  // Only if the tab still shows the chip's page/media — otherwise fall
+  // through to the URL-based lookup.
   const target = transcript.getMediaTarget();
-  if (target) {
+  const tab = target ? await _verifiedMediaTargetTab(target) : null;
+  if (target && tab) {
     try {
-      const tab = await chrome.tabs.get(target.tabId);
       await _focusTab(tab);
       await seekTab(
         target.tabId, seconds, transcript.expectedMediaRange(), transcript.mediaTargetFrames(),
@@ -1856,6 +1863,9 @@ function _bindRetryButton(job) {
     const stillHere = () => seq === _loadSeq && (peekActiveJob()?.id ?? null) === (job?.id ?? null);
     try {
       await daemon.retryJob(id);
+      // Job left `failed`: questions parked on it go back to pending (chat.js)
+      // even if the SSE status event is missed.
+      noteJobRetried(id);
       if (stillHere()) await loadAndRender(id);
     } catch (err) {
       console.error("[TLDR] retry failed", err);

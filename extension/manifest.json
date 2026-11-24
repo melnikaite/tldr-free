@@ -11,7 +11,8 @@
     "cookies",
     "scripting",
     "storage",
-    "webRequest"
+    "webRequest",
+    "webNavigation"
   ],
   "host_permissions": [
     "http://localhost/*",

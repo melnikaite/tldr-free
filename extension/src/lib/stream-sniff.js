@@ -296,3 +296,101 @@ export function pruneFrameTab(map, tabId) {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Page scoping. A tab's list must describe the page the tab shows NOW.
+// background.js keys it by the top document (webNavigation documentId) and,
+// within one document, by `pageIdentity` for SPA (pushState) navigations.
+
+/** Query params that name the content itself (watch?v=…, ?id=…). */
+const IDENTITY_PARAMS = ["v", "id", "video", "vid", "episode", "ep"];
+
+/**
+ * What "the same page" means for SPA navigations: origin + path + the few
+ * content-naming query params. Other params and the hash are ignored, so
+ * pushState for filters, tracking, pagination-by-query or anchors doesn't
+ * wipe still-valid streams; a path change (or ?v= change) does.
+ * @param {string | null | undefined} url
+ * @returns {string | null}
+ */
+export function pageIdentity(url) {
+  let u;
+  try {
+    u = new URL(url || "");
+  } catch {
+    return null;
+  }
+  const params = IDENTITY_PARAMS.filter((k) => u.searchParams.has(k)).map(
+    (k) => `${k}=${u.searchParams.get(k)}`,
+  );
+  return `${u.origin}${u.pathname.replace(/\/+$/, "")}${params.length ? `?${params.join("&")}` : ""}`;
+}
+
+/**
+ * SPAs often fetch the next video's manifest a moment BEFORE they pushState;
+ * entries seen within ``graceMs`` survive an identity change.
+ */
+export const SPA_GRACE_MS = 3000;
+
+/**
+ * @template {{lastSeen: number}} T
+ * @param {T[]} list @param {number} now @param {number} [graceMs]
+ * @returns {T[]}
+ */
+export function keepRecent(list, now, graceMs = SPA_GRACE_MS) {
+  return (list || []).filter((e) => now - e.lastSeen <= graceMs);
+}
+
+/** How many left-behind documents' lists are kept per tab for bfcache. */
+export const STASH_DOCS = 3;
+
+/**
+ * @typedef {object} TabSniffState
+ * @property {SniffedStream[]} list
+ * @property {{documentId: string | null, identity: string | null} | null} page
+ * @property {Array<{documentId: string, list: SniffedStream[]}>} stash
+ */
+
+/**
+ * New top-level document committed in the tab. The outgoing document's
+ * list is stashed under its documentId; if the incoming document is one we
+ * stashed (a back/forward bfcache restore keeps its documentId and makes no
+ * network requests), its list comes back, else the list starts empty.
+ * @param {TabSniffState} state
+ * @param {string | null} documentId
+ * @param {string} url
+ * @returns {TabSniffState}
+ */
+export function onDocumentCommitted(state, documentId, url, cap = STASH_DOCS) {
+  const prevDoc = state.page?.documentId ?? null;
+  if (documentId && prevDoc === documentId) {
+    return { ...state, page: { documentId, identity: pageIdentity(url) } };
+  }
+  let stash = (state.stash || []).filter((s) => s.documentId !== prevDoc && s.documentId !== documentId);
+  const restored = documentId ? (state.stash || []).find((s) => s.documentId === documentId) : undefined;
+  if (prevDoc && state.list?.length) stash = [{ documentId: prevDoc, list: state.list }, ...stash];
+  return {
+    list: restored ? restored.list : [],
+    page: { documentId, identity: pageIdentity(url) },
+    stash: stash.slice(0, cap),
+  };
+}
+
+/**
+ * Same-document (pushState/replaceState) navigation. Only a change of
+ * `pageIdentity` resets the list, and recent entries are kept (SPA_GRACE_MS).
+ * @param {TabSniffState} state @param {string} url @param {number} now
+ * @returns {TabSniffState}
+ */
+export function onHistoryChanged(state, url, now) {
+  const identity = pageIdentity(url);
+  const prev = state.page?.identity ?? null;
+  if (prev === identity) return state;
+  return {
+    ...state,
+    // Unknown previous identity (SW restarted before any commit was seen):
+    // don't guess, just start tracking.
+    list: prev === null ? state.list : keepRecent(state.list, now),
+    page: { documentId: state.page?.documentId ?? null, identity },
+  };
+}

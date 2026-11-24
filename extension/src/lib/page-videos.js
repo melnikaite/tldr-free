@@ -26,6 +26,8 @@
 //     Iframe/manifest URLs carry per-load tokens, the duration doesn't, and
 //     it tells trailer from film. The fragment is part of the key, so it
 //     must reach the daemon verbatim — never pass it through normalizeUrl().
+//     Same-duration siblings: the first keeps the plain key, later ones get
+//     `~<hash of src host+path>` (native) or `~<n>` (blob:, scan order).
 //
 // Pure except `scanFrame` (self-contained, serialized via toString()).
 
@@ -86,11 +88,39 @@ export function embedKey(url) {
 
 /**
  * Job URL for a native/sniffed video of ``pageUrl``.
+ * ``disambig`` (optional) separates videos of one page that share a rounded
+ * duration; "" keeps the historical key, so the common single-video case
+ * (and every job created before this existed) still matches.
  * @param {string} pageUrl
  * @param {number} duration seconds
+ * @param {string} [disambig]
  */
-export function videoKey(pageUrl, duration) {
-  return `${normalizeUrl(pageUrl)}${VIDEO_KEY_MARK}${Math.round(duration)}`;
+export function videoKey(pageUrl, duration, disambig = "") {
+  const base = `${normalizeUrl(pageUrl)}${VIDEO_KEY_MARK}${Math.round(duration)}`;
+  return disambig ? `${base}~${disambig}` : base;
+}
+
+/**
+ * Stable short id of a native media src: host+path only (query strings carry
+ * per-load tokens). FNV-1a, base36. null for blob:/data:/unparseable.
+ * @param {string | null | undefined} src
+ * @returns {string | null}
+ */
+export function srcIdentity(src) {
+  let u;
+  try {
+    u = new URL(src || "");
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  const s = `${u.host}${u.pathname}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
 }
 
 /** Whether ``url`` is a native/sniffed video key (not a page URL). */
@@ -182,6 +212,13 @@ export function buildChips({ pageUrl, frames, sniffed = [] }) {
   const chips = new Map();
   const ok = (frames || []).filter((f) => f && f.result);
   const manifests = (sniffed || []).filter((e) => e.kind === "hls" || e.kind === "dash");
+  // Rounded duration → identities already keyed with it. The first video of
+  // a duration keeps the plain key (back-compat); a later one with a
+  // different identity gets a suffix: its src host+path hash (stable across
+  // reloads) or, for blob: players, its ordinal among same-duration players
+  // in scan (frame/DOM) order. Same src twice = same video → one chip.
+  /** @type {Map<number, string[]>} */
+  const seenByDuration = new Map();
 
   // 1. Embed iframes seen in any frame's DOM.
   for (const f of ok) {
@@ -219,7 +256,17 @@ export function buildChips({ pageUrl, frames, sniffed = [] }) {
       if (m.src) type = "native";
       else if (m.blob && frameHasManifest) type = "stream";
       if (!type) continue;
-      const key = videoKey(pageUrl, m.duration);
+      const rounded = Math.round(m.duration);
+      const hash = type === "native" ? srcIdentity(m.src) : null;
+      const idents = seenByDuration.get(rounded) || [];
+      seenByDuration.set(rounded, idents);
+      // blob: players (and unparseable srcs) have no stable trait: each is
+      // its own video, numbered by position.
+      const ident = hash ? `h:${hash}` : `seq:${idents.length}`;
+      let idx = idents.indexOf(ident);
+      if (idx < 0) idx = idents.push(ident) - 1;
+      const disambig = idx === 0 ? "" : hash || `${idx + 1}`;
+      const key = videoKey(pageUrl, m.duration, disambig);
       const prev = chips.get(key);
       if (prev) {
         if (!m.paused) prev.playing = true;

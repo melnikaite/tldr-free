@@ -11,6 +11,7 @@ import {
   isEmbedUrl,
   isVideoKey,
   scopeSniffed,
+  srcIdentity,
   videoKey,
 } from "../src/lib/page-videos.js";
 
@@ -78,7 +79,7 @@ test("embed with unknown duration is kept; known short one is dropped", () => {
   assert.equal(chips[0].mediaUrl, "https://player.vimeo.com/video/1");
 });
 
-test("native media: needs http src and known duration >= 60, dedups by key", () => {
+test("native media: needs http src and known duration >= 60; same-duration srcs stay apart", () => {
   const chips = buildChips({
     pageUrl: PAGE,
     frames: [
@@ -93,11 +94,12 @@ test("native media: needs http src and known duration >= 60, dedups by key", () 
   });
   assert.deepEqual(chips.map((c) => c.key), [
     "https://kino.example/film/123#tldr-video=5400",
+    `https://kino.example/film/123#tldr-video=5400~${srcIdentity("https://cdn.example/film-hd.mp4")}`,
     "https://kino.example/film/123#tldr-video=1800",
   ]);
   assert.equal(chips[0].mediaUrl, "https://cdn.example/film.mp4");
-  assert.equal(chips[0].playing, true);
-  assert.equal(chips[1].label, "Episode 1");
+  assert.equal(chips[1].playing, true);
+  assert.equal(chips[2].label, "Episode 1");
 });
 
 test("blob player becomes a stream chip only with a manifest from its frame's origin", () => {
@@ -171,4 +173,43 @@ test("formatDuration", () => {
   assert.equal(formatDuration(5400), "1:30:00");
   assert.equal(formatDuration(null), "");
   assert.equal(formatDuration(NaN), "");
+});
+
+test("same-duration native videos get distinct, stable keys; first keeps plain key", () => {
+  const build = (q) =>
+    buildChips({
+      pageUrl: PAGE,
+      frames: [
+        frame(0, {
+          media: [
+            media({ src: `https://cdn.example/a.mp4?tok=${q}`, duration: 600.2 }),
+            media({ src: `https://cdn.example/b.mp4?tok=${q}`, duration: 599.9 }),
+            media({ src: `https://cdn.example/a.mp4?tok=${q}`, duration: 600.2 }),
+          ],
+        }),
+      ],
+    });
+  const one = build("1");
+  assert.equal(one.length, 2);
+  assert.equal(one[0].key, videoKey(PAGE, 600));
+  assert.equal(one[1].key, videoKey(PAGE, 600, srcIdentity("https://cdn.example/b.mp4")));
+  assert.notEqual(one[0].key, one[1].key);
+  // Reload: new tokens, same keys.
+  assert.deepEqual(build("2").map((c) => c.key), one.map((c) => c.key));
+});
+
+test("same-duration blob players are numbered in scan order", () => {
+  const chips = buildChips({
+    pageUrl: PAGE,
+    frames: [frame(0, { media: [media({ blob: true, duration: 300 }), media({ blob: true, duration: 300 })] })],
+    sniffed: [{ kind: "hls", frameUrl: "https://kino.example/film/123" }],
+  });
+  assert.deepEqual(chips.map((c) => c.key), [videoKey(PAGE, 300), videoKey(PAGE, 300, "2")]);
+  assert.ok(chips.every((c) => isVideoKey(c.key)));
+});
+
+test("srcIdentity ignores query, rejects blob", () => {
+  assert.equal(srcIdentity("https://x.example/v.mp4?a=1"), srcIdentity("https://x.example/v.mp4?a=2"));
+  assert.notEqual(srcIdentity("https://x.example/v.mp4"), srcIdentity("https://x.example/w.mp4"));
+  assert.equal(srcIdentity("blob:https://x.example/uuid"), null);
 });

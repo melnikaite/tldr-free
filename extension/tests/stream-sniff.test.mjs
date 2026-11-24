@@ -14,6 +14,10 @@ import {
   recordFrame,
   lookupFrameTabs,
   pruneFrameTab,
+  keepRecent,
+  onDocumentCommitted,
+  onHistoryChanged,
+  pageIdentity,
 } from "../src/lib/stream-sniff.js";
 
 /** @param {Partial<import("../src/lib/stream-sniff.js").SniffedStream>} o */
@@ -160,4 +164,54 @@ test("pruneFrameTab drops only that tab and empty origins", () => {
   m = pruneFrameTab(m, 1);
   assert.deepEqual(lookupFrameTabs(m, "https://a.example"), [2]);
   assert.deepEqual(Object.keys(m), ["https://a.example"]);
+});
+
+const s = (url, lastSeen = 0) => ({ url, kind: "hls", frameUrl: null, referer: null, origin: null, userAgent: null, firstSeen: lastSeen, lastSeen });
+
+test("pageIdentity: path and ?v= matter, other params and hash don't", () => {
+  const a = pageIdentity("https://x.example/watch?v=1&t=30#c");
+  assert.equal(a, pageIdentity("https://x.example/watch?t=99&v=1"));
+  assert.notEqual(a, pageIdentity("https://x.example/watch?v=2"));
+  assert.equal(pageIdentity("https://x.example/feed?page=2"), pageIdentity("https://x.example/feed/"));
+  assert.notEqual(pageIdentity("https://x.example/a"), pageIdentity("https://x.example/b"));
+});
+
+test("new document resets the list and stashes the old one; bfcache restore brings it back", () => {
+  let st = { list: [], page: null, stash: [] };
+  st = onDocumentCommitted(st, "docA", "https://x.example/a");
+  st = { ...st, list: [s("https://cdn/a.m3u8")] };
+  st = onDocumentCommitted(st, "docB", "https://x.example/b");
+  assert.deepEqual(st.list, []);
+  st = { ...st, list: [s("https://cdn/b.m3u8")] };
+  // Back: bfcache restore of docA (same documentId).
+  st = onDocumentCommitted(st, "docA", "https://x.example/a");
+  assert.deepEqual(st.list.map((e) => e.url), ["https://cdn/a.m3u8"]);
+  // Forward again.
+  st = onDocumentCommitted(st, "docB", "https://x.example/b");
+  assert.deepEqual(st.list.map((e) => e.url), ["https://cdn/b.m3u8"]);
+  // Non-bfcache back: a NEW document for the same URL starts empty.
+  st = onDocumentCommitted(st, "docA2", "https://x.example/a");
+  assert.deepEqual(st.list, []);
+  // Unknown documentId (old browsers): plain reset.
+  st = onDocumentCommitted({ ...st, list: [s("u")] }, null, "https://x.example/c");
+  assert.deepEqual(st.list, []);
+  assert.ok(st.stash.length <= 3);
+});
+
+test("re-commit of the same document keeps the list", () => {
+  let st = onDocumentCommitted({ list: [], page: null, stash: [] }, "d", "https://x.example/a");
+  st = { ...st, list: [s("m")] };
+  assert.deepEqual(onDocumentCommitted(st, "d", "https://x.example/a").list, st.list);
+});
+
+test("SPA pushState: reset only on identity change, keep recent entries", () => {
+  let st = onDocumentCommitted({ list: [], page: null, stash: [] }, "d", "https://x.example/watch/1");
+  st = { ...st, list: [s("old", 1000), s("new", 9000)] };
+  assert.equal(onHistoryChanged(st, "https://x.example/watch/1?t=5#x", 10000), st);
+  const moved = onHistoryChanged(st, "https://x.example/watch/2", 10000);
+  assert.deepEqual(moved.list.map((e) => e.url), ["new"]);
+  assert.deepEqual(keepRecent(st.list, 10000, 500), []);
+  // Unknown previous identity (SW restart): don't wipe.
+  const fresh = onHistoryChanged({ list: st.list, page: null, stash: [] }, "https://x.example/w/3", 10000);
+  assert.equal(fresh.list, st.list);
 });

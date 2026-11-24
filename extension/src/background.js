@@ -13,6 +13,8 @@ import {
   classifyStream,
   headerValue,
   lookupFrameTabs,
+  onDocumentCommitted,
+  onHistoryChanged,
   pickSniffedMedia,
   pruneFrameTab,
   recordFrame,
@@ -87,20 +89,44 @@ const pendingRequestHeaders = new Map();
 /** @type {Map<number, Promise<void>>} */
 const sniffWriteChains = new Map();
 
+/** @param {number} tabId */
+const sniffPageKey = (tabId) => `sniffPage:${tabId}`;
+/** @param {number} tabId */
+const sniffStashKey = (tabId) => `sniffStash:${tabId}`;
+
 /**
+ * Read-modify-write a tab's whole sniff state: the live list (`sniff:<id>`,
+ * what the side panel reads), the top document it belongs to
+ * (`sniffPage:<id>`) and stashed lists of left-behind documents
+ * (`sniffStash:<id>`, for bfcache back/forward). See stream-sniff.js
+ * "Page scoping".
  * @param {number} tabId
- * @param {(list: import("./lib/stream-sniff.js").SniffedStream[]) => import("./lib/stream-sniff.js").SniffedStream[] | null} update
- *   returns the new list, or null to delete the key
+ * @param {(state: import("./lib/stream-sniff.js").TabSniffState) => import("./lib/stream-sniff.js").TabSniffState | null} update
+ *   returns the new state, or null to delete everything
  */
-function updateSniffed(tabId, update) {
+function updateSniffState(tabId, update) {
   const prev = sniffWriteChains.get(tabId) || Promise.resolve();
   const next = prev
     .then(async () => {
-      const key = sniffKey(tabId);
-      const stored = await chrome.storage.session.get(key);
-      const list = update(stored[key] || []);
-      if (list === null) await chrome.storage.session.remove(key);
-      else await chrome.storage.session.set({ [key]: list });
+      const keys = [sniffKey(tabId), sniffPageKey(tabId), sniffStashKey(tabId)];
+      const stored = await chrome.storage.session.get(keys);
+      const before = {
+        list: stored[keys[0]] || [],
+        page: stored[keys[1]] || null,
+        stash: stored[keys[2]] || [],
+      };
+      const state = update(before);
+      if (state === null) {
+        await chrome.storage.session.remove(keys);
+        return;
+      }
+      // Only write what changed: the panel listens to `sniff:<id>` changes.
+      /** @type {Record<string, unknown>} */
+      const out = {};
+      if (state.list !== before.list) out[keys[0]] = state.list;
+      if (state.page !== before.page) out[keys[1]] = state.page;
+      if (state.stash !== before.stash) out[keys[2]] = state.stash;
+      if (Object.keys(out).length) await chrome.storage.session.set(out);
     })
     .catch((err) => console.warn("[TLDR] sniff store", err))
     .finally(() => {
@@ -110,9 +136,17 @@ function updateSniffed(tabId, update) {
   return next;
 }
 
+/**
+ * @param {number} tabId
+ * @param {(list: import("./lib/stream-sniff.js").SniffedStream[]) => import("./lib/stream-sniff.js").SniffedStream[]} update
+ */
+function updateSniffed(tabId, update) {
+  return updateSniffState(tabId, (st) => ({ ...st, list: update(st.list) }));
+}
+
 /** @param {number} tabId */
 function clearSniffed(tabId) {
-  updateSniffed(tabId, () => null);
+  updateSniffState(tabId, () => null);
 }
 
 // Frame origin → tabs hosting a frame of that origin (most recent first).
@@ -243,15 +277,16 @@ async function onSniffHeadersReceived(details) {
   chrome.webRequest.onHeadersReceived.addListener(onSniffHeadersReceived, filter, [
     "responseHeaders",
   ]);
-  // A new top-level document means a new page: forget the old streams and
-  // the old page's frames. Every frame (top or sub) is remembered by origin
-  // for service-worker attribution.
+  // A top-level navigation request prunes the old page's frames. Every frame
+  // (top or sub) is remembered by origin for service-worker attribution.
+  // The stream list itself is reset by webNavigation below, not here: a
+  // main_frame request misses bfcache restores (no request at all) and
+  // fires for navigations that never commit (downloads, 204s).
   chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
       if (details.tabId < 0) return;
       const now = Date.now();
       if (details.type === "main_frame") {
-        clearSniffed(details.tabId);
         updateFrameOrigins((map) =>
           recordFrame(pruneFrameTab(map, details.tabId), details.url, details.tabId, now),
         );
@@ -265,6 +300,29 @@ async function onSniffHeadersReceived(details) {
     (details) => pendingRequestHeaders.delete(details.requestId),
     filter,
   );
+}
+
+// Keep each tab's list scoped to the page it currently shows.
+//  - onCommitted (top frame): a new document → fresh list; the old one is
+//    stashed by documentId. A bfcache back/forward restore also commits but
+//    keeps its documentId and refetches nothing, so its stashed list returns.
+//  - onHistoryStateUpdated (top frame, pushState/replaceState): SPA video
+//    swaps. Trade-off: we can't know which streams belong to which "virtual
+//    page", so we reset only when pageIdentity (origin+path+?v=-like params)
+//    changes — query/hash tweaks and infinite scroll keep the list — and
+//    keep entries seen in the last few seconds, since SPAs often fetch the
+//    next manifest just before pushState. A site that swaps videos without
+//    changing the path keeps stale entries (as before this existed).
+if (chrome.webNavigation) {
+  chrome.webNavigation.onCommitted.addListener((details) => {
+    if (details.frameId !== 0 || details.tabId < 0) return;
+    const docId = /** @type {{documentId?: string}} */ (details).documentId || null;
+    updateSniffState(details.tabId, (st) => onDocumentCommitted(st, docId, details.url));
+  });
+  chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    if (details.frameId !== 0 || details.tabId < 0) return;
+    updateSniffState(details.tabId, (st) => onHistoryChanged(st, details.url, Date.now()));
+  });
 }
 
 // ---------------------------------------------------------------------------
