@@ -28,6 +28,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,31 @@ def _audio_dir() -> Path:
     p = Path(get_config().storage.data_dir) / "audio"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# Prefix of the per-job audio subdirectory under ``_audio_dir()``. Every
+# job downloads into its own ``job-<id>/`` so yt-dlp's ``%(id)s`` naming
+# (the bare URL basename for generic media, e.g. ``master``) can never make
+# two jobs share — or reuse, or delete — each other's audio file.
+JOB_AUDIO_DIR_PREFIX = "job-"
+
+
+def _job_audio_dir(job_id: str) -> Path:
+    """``<data_dir>/audio/job-<job_id>`` — per-job download directory."""
+    p = _audio_dir() / f"{JOB_AUDIO_DIR_PREFIX}{job_id}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _remove_job_audio(audio_path: Path) -> None:
+    """Unlink ``audio_path`` and, when it lives in a per-job directory,
+    remove that directory too (leftover partials/cookie files included).
+    A legacy flat ``audio/<name>`` path only has the file itself removed."""
+    parent = audio_path.parent
+    if parent.name.startswith(JOB_AUDIO_DIR_PREFIX) and parent.parent == _audio_dir():
+        shutil.rmtree(parent, ignore_errors=True)
+    else:
+        audio_path.unlink(missing_ok=True)
 
 
 async def _checkpoint_pause(
@@ -335,7 +361,7 @@ async def _process_one(
             audio_path, audio_duration = await youtube.download_audio(
                 url=task_url,
                 cookies=task_cookies,
-                dir=_audio_dir(),
+                dir=_job_audio_dir(task_job_id),
                 http_headers=task_http_headers,
             )
             download_succeeded = True
@@ -653,8 +679,7 @@ async def _process_one(
         full_success = transcribe_done and audio_path is not None
         if full_success and audio_path is not None:
             try:
-                if audio_path.exists():
-                    audio_path.unlink()
+                _remove_job_audio(audio_path)
             except OSError:
                 log.warning("runner: failed to unlink audio file %s", audio_path)
             try:

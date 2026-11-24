@@ -1707,3 +1707,29 @@ def test_get_job_diagnostics_never_carries_transcript_text(client: TestClient) -
     assert "private summary" not in body_text
 
 
+
+
+def test_post_jobs_dedupe_matches_kind(client: TestClient) -> None:
+    """A legacy kind=media row keyed by the plain page URL must not be
+    returned when the page itself is summarised."""
+    from src.storage import repo as _repo
+
+    url = "https://example.com/with-video"
+    media = _repo.create_job(url=url, kind="media", media_url="https://cdn/x/master.m3u8")
+    _repo.update_status(media.id, status="done")
+
+    page = client.post("/jobs", json={"url": url, "kind": "page", "page_text": "body"}).json()
+    assert page["id"] != media.id
+    assert page["kind"] == "page"
+    _wait_until_done(client, page["id"])
+
+    # Same kind again → deduped onto the page job.
+    again = client.post("/jobs", json={"url": url, "kind": "page", "page_text": "x"}).json()
+    assert again["id"] == page["id"]
+
+    # kind filter accepts a comma-separated list (tab sync: "not media").
+    r = client.get("/jobs", params={"url": url, "kind": "page,pdf,youtube", "limit": 1})
+    items = r.json()["items"]
+    assert [i["id"] for i in items] == [page["id"]]
+    r = client.get("/jobs", params={"url": url, "kind": "media"})
+    assert [i["id"] for i in r.json()["items"]] == [media.id]

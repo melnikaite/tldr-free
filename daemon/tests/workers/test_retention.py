@@ -653,3 +653,26 @@ async def test_retention_worker_runs_audio_sweep_every_cycle_even_when_disabled(
         await retention.retention_worker()
 
     assert sweep_calls == 1
+
+
+def test_audio_sweep_handles_per_job_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``job-<id>/`` dirs: kept while referenced, removed once old + orphaned."""
+    monkeypatch.setattr(retention, "_audio_dir", lambda: tmp_path)
+    live = tmp_path / "job-live"
+    dead = tmp_path / "job-dead"
+    for d in (live, dead):
+        d.mkdir()
+        f = d / "master.opus"
+        f.write_bytes(b"x")
+        _age(f, _OLD_SECONDS)
+        _age(d, _OLD_SECONDS)
+    monkeypatch.setattr(
+        retention.repo, "all_referenced_audio_paths", lambda: {str(live / "master.opus")}
+    )
+
+    retention._sweep_orphaned_audio()
+
+    assert live.exists()
+    assert not dead.exists()

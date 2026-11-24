@@ -49,6 +49,11 @@ subscribe via `POST /ai/stream {job_id}` to follow.
 The pipeline coroutine is held in a module-level `_BACKGROUND_TASKS` set
 in `api.jobs` so Python's GC doesn't kill it.
 
+Dedup keys on `(url, kind)`, not url alone: legacy `kind=media` rows were
+keyed by the plain page URL, so a url-only match handed the page request a
+video job. `GET /jobs?kind=` takes a comma-separated list
+(`kind=page,pdf,youtube` = "anything but a per-video media job").
+
 ## Background work is globally pausable — soft pause between steps
 
 A single `workers.control.get_control()` flag (flipped via
@@ -266,6 +271,21 @@ variant), only for `#EXT-X-ENDLIST` playlists. Otherwise yt-dlp metadata
 (caption fast path) or the downloaded file's yt-dlp/ffprobe duration
 (Whisper path, which never overwrites an EXTINF value). Never derived from
 caption/transcript timing; unknown stays null.
+
+## Downloaded audio is per-job
+
+`runner` downloads into `<data_dir>/audio/job-<id>/` (`_job_audio_dir`),
+never the shared `audio/` root: yt-dlp names files `%(id)s.<ext>` and a
+generic media URL's id is its basename (`master` for every
+`.../master.m3u8`), and yt-dlp skips a download whose file exists — so a
+shared dir let job B transcribe job A's kept-for-retry audio, and
+concurrent jobs clobber/delete each other's files and partials. Success
+removes the whole dir; failure keeps it (retry reuses `Job.audio_path`);
+`repo.delete_job` removes `job-<id>/`; retention sweeps orphaned `job-*`
+dirs by newest-content mtime. Legacy rows with a flat `audio/<name>` path
+still reuse/clean up as before, but a flat file is only unlinked on delete
+when no other row references it. Subtitle downloads use a per-call
+`tldr-subs-*` temp dir under `subtitles/` for the same reason.
 
 ## Media and PDF jobs are ephemeral on restart
 

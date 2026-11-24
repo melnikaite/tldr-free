@@ -494,7 +494,7 @@ def _to_message(row: Any) -> MessageModel:
 async def create_job(req: JobCreateRequest) -> JSONResponse:
     """Persist the row, kick off the background pipeline, return 202.
 
-    Dedup: if there's already a job for this URL in ``queued`` / ``running``
+    Dedup: if there's already a job for this URL and kind in ``queued`` / ``running``
     / ``done``, return that one instead of starting a new pipeline. Only
     ``failed`` jobs are bypassed — clicking the toolbar after a failure is
     treated as an explicit retry.
@@ -508,21 +508,6 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
     create duplicates.
     """
     async with _create_lock:
-        existing_rows, _ = repo.list_jobs(url=req.url, limit=1)
-        if existing_rows:
-            existing = existing_rows[0]
-            if existing.status in (
-                JobStatus.QUEUED.value,
-                JobStatus.RUNNING.value,
-                JobStatus.DONE.value,
-            ):
-                body = JobCreateResponse(
-                    id=existing.id,
-                    kind=JobKind(existing.kind),
-                    status=JobStatus(existing.status),
-                )
-                return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
-
         # Decode the optional PDF payload up front so we can fail fast on
         # bad base64 rather than crashing the pipeline coroutine later.
         pdf_bytes: bytes | None = None
@@ -538,6 +523,23 @@ async def create_job(req: JobCreateRequest) -> JSONResponse:
         kind = pipeline.infer_kind(
             req.url, req.kind, req.media_url, pdf_bytes_present=pdf_bytes is not None,
         )
+
+        # Same URL is not enough: a page and a video on it can share a key
+        # (legacy media rows used the plain page URL), so match the kind too.
+        existing_rows, _ = repo.list_jobs(url=req.url, kind=kind.value, limit=1)
+        if existing_rows:
+            existing = existing_rows[0]
+            if existing.status in (
+                JobStatus.QUEUED.value,
+                JobStatus.RUNNING.value,
+                JobStatus.DONE.value,
+            ):
+                body = JobCreateResponse(
+                    id=existing.id,
+                    kind=JobKind(existing.kind),
+                    status=JobStatus(existing.status),
+                )
+                return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
 
         # For YouTube the extension's scraped title is unreliable (SPA, fast
         # tab switching), so seed with the video id. The pipeline overwrites
@@ -755,7 +757,11 @@ async def bulk_delete_jobs(req: JobDeleteRequest) -> JobDeleteResponse:
 @router.get("", response_model=JobListResponse)
 def list_jobs(
     status: str | None = Query(default=None, description="Comma-separated statuses"),
-    kind: str | None = Query(default=None, description="page | youtube"),
+    kind: str | None = Query(
+        default=None,
+        description="Comma-separated kinds (page, pdf, youtube, media), e.g. "
+        "kind=page,pdf,youtube to skip per-video media jobs",
+    ),
     since: str | None = Query(default=None, description="ISO-8601 datetime"),
     url: str | None = Query(
         default=None,
@@ -780,7 +786,7 @@ def list_jobs(
 
     rows, total = repo.list_jobs(
         status=statuses,
-        kind=kind,
+        kind=_parse_status_filter(kind),
         since=since_dt,
         url=url,
         q=q_stripped or None,

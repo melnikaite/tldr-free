@@ -29,6 +29,8 @@ import glob
 import json
 import logging
 import re
+import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -807,7 +809,12 @@ def _download_subtitles_sync(
     """
     from yt_dlp import YoutubeDL
 
+    # Each call gets its own scratch subdirectory: yt-dlp names subtitle
+    # files ``<id>.<lang>.<ext>`` and a generic media URL's id is just its
+    # basename (``master``), so concurrent jobs sharing ``dir`` would read or
+    # delete each other's files.
     dir.mkdir(parents=True, exist_ok=True)
+    dir = Path(tempfile.mkdtemp(prefix="tldr-subs-", dir=dir))
     cookie_path = write_netscape_cookie_file(cookies, dir) if cookies else None
 
     try:
@@ -898,9 +905,7 @@ def _download_subtitles_sync(
             with contextlib.suppress(OSError):
                 sub_path.unlink()
     finally:
-        if cookie_path is not None:
-            with contextlib.suppress(OSError):
-                cookie_path.unlink(missing_ok=True)
+        shutil.rmtree(dir, ignore_errors=True)
 
 
 async def download_subtitles(

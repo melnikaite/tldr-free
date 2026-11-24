@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import shutil
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -749,7 +750,7 @@ def _escape_like(value: str) -> str:
 def list_jobs(
     *,
     status: str | Iterable[str] | None = None,
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     since: datetime | None = None,
     url: str | None = None,
     q: str | None = None,
@@ -760,7 +761,7 @@ def list_jobs(
 
     ``status`` accepts either a single string ("queued") or an iterable
     (["queued", "running"]) — the comma-split form from the API maps cleanly
-    to the latter.
+    to the latter. ``kind`` accepts the same two shapes.
 
     ``url`` does an exact match. Used by the extension to look up whether the
     current tab has already been summarized.
@@ -814,8 +815,9 @@ def list_jobs(
             base_stmt = base_stmt.where(Job.status.in_(statuses))  # type: ignore[attr-defined]
             count_stmt = count_stmt.where(Job.status.in_(statuses))  # type: ignore[attr-defined]
         if kind is not None:
-            base_stmt = base_stmt.where(Job.kind == kind)
-            count_stmt = count_stmt.where(Job.kind == kind)
+            kinds = [kind] if isinstance(kind, str) else list(kind)
+            base_stmt = base_stmt.where(Job.kind.in_(kinds))  # type: ignore[attr-defined]
+            count_stmt = count_stmt.where(Job.kind.in_(kinds))  # type: ignore[attr-defined]
         if since is not None:
             base_stmt = base_stmt.where(Job.created_at >= since)
             count_stmt = count_stmt.where(Job.created_at >= since)
@@ -930,7 +932,7 @@ def delete_job(job_id: str) -> bool:
         cached_audio = job.audio_path
         session.delete(job)
     if cached_audio:
-        _safe_unlink(Path(cached_audio))
+        _remove_cached_audio(cached_audio, job_id)
     _delete_job_frames(job_id)
     _emit_deleted(job_id)
     return True
@@ -949,6 +951,25 @@ def _delete_job_frames(job_id: str) -> None:
         delete_job_frames(job_id)
     except Exception:
         log.warning("repo: failed to delete frames for job %s", job_id)
+
+
+def _remove_cached_audio(audio_path: str, job_id: str) -> None:
+    """Remove a deleted job's cached audio.
+
+    Current downloads live in a per-job ``audio/job-<id>/`` directory
+    (see ``workers.runner._job_audio_dir``) — the whole directory goes.
+    Legacy rows point at a flat ``audio/<yt-dlp id>.<ext>`` file whose name
+    could be shared with another job (generic media ids are URL basenames),
+    so that file is only unlinked when no remaining row references it.
+    """
+    path = Path(audio_path)
+    if path.parent.name == f"job-{job_id}":
+        shutil.rmtree(path.parent, ignore_errors=True)
+        return
+    if audio_path in all_referenced_audio_paths():
+        log.info("repo: keeping shared legacy audio %s (still referenced)", audio_path)
+        return
+    _safe_unlink(path)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -1042,7 +1063,7 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
     ``delete_job``. This path used to drop the rows only, which left orphaned
     multi-MB audio files behind on every retention sweep.
     """
-    cached_audio: list[str] = []
+    cached_audio: list[tuple[str, str]] = []
     with session_scope() as session:
         stmt = select(Job.id).where(Job.added_at < cutoff)
         ids = list(session.exec(stmt).all())
@@ -1053,15 +1074,15 @@ def delete_jobs_older_than(cutoff: datetime) -> int:
             job = session.get(Job, job_id)
             if job is not None:
                 if job.audio_path:
-                    cached_audio.append(job.audio_path)
+                    cached_audio.append((job.audio_path, job_id))
                 # Clear linked rows explicitly — keep behaviour stable across
                 # SQLite pragma states (matches delete_job).
                 session.exec(
                     Message.__table__.delete().where(Message.job_id == job_id)  # type: ignore[attr-defined]
                 )
                 session.delete(job)
-    for path in cached_audio:
-        _safe_unlink(Path(path))
+    for path, owner_id in cached_audio:
+        _remove_cached_audio(path, owner_id)
     for job_id in ids:
         _delete_job_frames(job_id)
         _emit_deleted(job_id)

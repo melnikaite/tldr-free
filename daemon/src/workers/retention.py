@@ -93,6 +93,8 @@ _AUDIO_ORPHAN_GRACE_SECONDS = 24 * 60 * 60     # 24 hours
 # ``storage``: keep the layering one-directional).
 _CHUNK_TMP_DIR_PREFIX = "tldr-chunks-"
 _RECUT_TMP_DIR_PREFIX = "tldr-recut-"
+# Mirrors ``workers.runner.JOB_AUDIO_DIR_PREFIX`` (per-job audio dirs).
+_JOB_AUDIO_DIR_PREFIX = "job-"
 
 
 def _audio_dir() -> Path:
@@ -241,7 +243,13 @@ def _sweep_orphaned_audio() -> None:
     for ref in referenced:
         with contextlib.suppress(OSError):  # unresolvable reference just doesn't contribute
             referenced_resolved.add(Path(ref).resolve())
-    referenced_basenames = {Path(ref).name for ref in referenced}
+    # Per-job refs (``job-<id>/master.opus``) are excluded: their basenames
+    # are generic and would otherwise pin unrelated flat legacy files forever.
+    referenced_basenames = {
+        Path(ref).name for ref in referenced
+        if not Path(ref).parent.name.startswith(_JOB_AUDIO_DIR_PREFIX)
+    }
+    referenced_parent_names = {Path(ref).parent.name for ref in referenced}
 
     now = time.time()
     removed = 0
@@ -250,6 +258,18 @@ def _sweep_orphaned_audio() -> None:
             name = entry.name
             if name.startswith(_CHUNK_TMP_DIR_PREFIX) or name.startswith(_RECUT_TMP_DIR_PREFIX):
                 if not entry.is_dir():
+                    continue
+                newest = _newest_mtime_under(entry)
+                if (now - newest) > _AUDIO_ORPHAN_GRACE_SECONDS:
+                    shutil.rmtree(entry)
+                    removed += 1
+                continue
+
+            if name.startswith(_JOB_AUDIO_DIR_PREFIX) and entry.is_dir():
+                # Per-job download dir (``runner._job_audio_dir``): kept while
+                # any row's audio_path lives inside it, otherwise judged by
+                # its newest content like the scratch dirs above.
+                if name in referenced_parent_names:
                     continue
                 newest = _newest_mtime_under(entry)
                 if (now - newest) > _AUDIO_ORPHAN_GRACE_SECONDS:
