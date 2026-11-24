@@ -11,6 +11,17 @@ e.g. `"Brazilian Portuguese"`) is passed through verbatim.
 
 Don't hardcode a language anywhere — in code OR in prompts.
 
+## Summary shape: conclusions first
+
+`summary_single.txt` / `summary_reduce.txt` produce `## Key takeaways`
+(2–4 sentences of actual verdicts/answers/recommendations — explicitly not
+"this video covers X") then `## Key points` (bullets, timestamped for
+transcripts). Headings are written in English in the prompt and the model
+translates them into `output_language` (hence "## Обзор" in Russian output
+historically). `summary_chunk.txt` must keep each chunk's verdicts/prices/
+recommendations or the reduce step has nothing to lead with. No code parses
+the heading names.
+
 ## All LLM calls go through one semaphore
 
 `llm.client._llm_lock()` (sized by `config.llm.max_concurrent_calls`,
@@ -500,7 +511,9 @@ whole LINES instead (simpler, and `cap_markers_per_line` — the non-streaming
 primitive, used as-is elsewhere — could be reused directly on each completed
 line), but that regressed real streaming latency badly: measured real
 summaries have their single LONGEST line as the very FIRST thing the model
-generates (the "## Обзор"/Overview paragraph, 613-706 chars measured) —
+generates (the top prose paragraph: measured as the old "## Обзор"/Overview
+at 613-706 chars; today's "## Key takeaways" is 2-4 sentences, still one long
+line) —
 with
 line-level buffering the side panel sat empty for 3-5s (gemma, ~50 tok/s) to
 7-8s (qwen3-vl, ~21 tok/s) at the most-watched moment of the whole UX, then

@@ -2,15 +2,15 @@ You are a note-taking assistant. Create a summary in: {output_language}.
 
 {source_note}
 
-Summary structure:
+Summary structure (translate the section headings into {output_language}):
 
-## Overview
+## Key takeaways
 
-3–5 sentences about what this material covers and what its main idea or goal is.
+2–4 sentences that give the reader the material's actual conclusions up front, so they can stop here if that is all they need: the verdict, the answer, the result, the recommendation — with the decisive specifics (names, numbers, prices) and the main reason. Example of the right kind of sentence: "The best tracker overall is X at $99, because it is the only one with accurate GPS and a week of battery life." This section is NOT a description of what the material covers, its topic, or its goal — never write "This video covers…", "The article discusses…", "The goal is…". If the material reaches no conclusion (e.g. pure narrative or news), state its single most important point or outcome instead.
 
 ## Key points
 
-The most important claims, facts, and conclusions, as bullet points — each one complete sentence. Use as many as the content genuinely warrants: a short clip may need only 2–3, a dense talk up to ~10. Synthesise; do not restate the material sentence by sentence or pad the list to hit a count.
+The supporting claims, facts, and conclusions, as bullet points — each one complete sentence. Use as many as the content genuinely warrants: a short clip may need only 2–3, a dense talk up to ~10. Synthesise; do not restate the material sentence by sentence or pad the list to hit a count.
 
 Rules:
 - Always respond in: {output_language}, regardless of the source language.

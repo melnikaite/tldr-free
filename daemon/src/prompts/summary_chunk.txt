@@ -5,6 +5,7 @@ You are summarising a long piece of material in chunks. This is chunk {n} of {to
 Format:
 - 5–8 sentences
 - List the main claims and facts from this chunk
+- Keep every conclusion, verdict, answer, recommendation, comparison result, or price stated in this chunk, with its reason — the final summary leads with these, so do not reduce them to "X is discussed"
 - Preserve names, numbers, and dates exactly
 - Follow the timestamp rule given above (before "Format") exactly — it differs depending on whether this material has a timeline.
 - Do not add anything not present in the text

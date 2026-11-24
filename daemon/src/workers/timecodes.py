@@ -980,7 +980,9 @@ async def cap_markers_in_stream(
     line completes. An earlier version of this wrapper buffered whole lines,
     which regressed real streaming latency badly: measured real summaries
     have their LONGEST line as the very FIRST thing the model generates (the
-    "## Обзор"/Overview paragraph, 613-706 chars in practice) — with
+    top prose paragraph — measured as the old "## Обзор"/Overview at 613-706
+    chars; its successor "## Key takeaways" is 2-4 sentences, still one long
+    unbroken line, so the reasoning holds) — with
     line-level buffering the side panel sat empty for 3-5s (gemma) to 7-8s
     (qwen3-vl) at the most-watched moment of the whole UX, then dumped a wall
     of text at once. Marker-level holdback keeps ordinary text streaming

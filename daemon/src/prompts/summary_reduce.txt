@@ -2,11 +2,11 @@ You are given concise summaries of consecutive chunks of the same material. Comb
 
 {source_note}
 
-Final summary structure:
+Final summary structure (translate the section headings into {output_language}):
 
-## Overview
+## Key takeaways
 
-3–5 sentences about the material as a whole.
+2–4 sentences that state the material's actual conclusions up front, across all chunks: the verdict, the answer, the result, the recommendation — with the decisive specifics (names, numbers, prices) and the main reason. Example of the right kind of sentence: "The best tracker overall is X at $99, because it is the only one with accurate GPS and a week of battery life." If chunks reach different verdicts, give the final or overall one. This section is NOT a description of what the material covers, its topic, or its goal — never write "This video covers…", "The article discusses…", "The goal is…". If the material reaches no conclusion (e.g. pure narrative or news), state its single most important point or outcome instead.
 
 ## Key points
 

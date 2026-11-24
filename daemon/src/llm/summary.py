@@ -246,7 +246,7 @@ async def _intermediate_reduce(
     Only used when the final reduce's input would itself blow the context
     budget (see ``_fold_partials``). Reuses ``summary_reduce.txt`` rather
     than adding a second prompt file: its instructions ("combine these chunk
-    summaries into Overview + Key points, preserve markers") describe
+    summaries into Key takeaways + Key points, preserve markers") describe
     exactly the operation an intermediate fold needs too — the caller just
     treats the output as one more partial instead of the final answer.
     """
