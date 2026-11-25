@@ -18,9 +18,12 @@ threshold before the final reduce and folds hierarchically if it doesn't fit.
 Prompts: prompts/summary_single.txt, summary_chunk.txt, summary_reduce.txt.
 
 Every LLM call in this module (streaming and non-streaming, map and reduce)
-is guarded against a repetition-loop degeneration by ``llm.repetition`` —
-see that module's docstring for the measured incident and threshold
-rationale.
+is guarded against a repetition-loop degeneration by ``llm.degeneration``
+(``guard_stream`` on streams, ``trim`` on complete text) — see that module's
+docstring for the measured incidents and threshold calibration. Streaming
+callers of ``stream_summarize`` must ``degeneration.trim`` the accumulated
+summary before persisting it (the guard stops generation but can't retract
+deltas already yielded).
 
 The timestamp rule is source-dependent, threaded the same way as the
 recognition-error note: ``_TRANSCRIPT_SOURCE_NOTE`` carries a mechanical
@@ -58,8 +61,8 @@ from pathlib import Path
 
 from src.config import get_config
 from src.llm import client as llm_client
+from src.llm import degeneration
 from src.llm.chunking import pack_lines, split_for_summary
-from src.llm.repetition import abort_on_repeated_lines, trim_repeated_tail
 from src.llm.tokens import count_tokens
 
 # Ceiling on the map-phase chunk budget; stream_summarize takes the actual
@@ -162,12 +165,13 @@ async def _stream_single_pass(
         output_language=output_language,
         source_note=source_note,
     )
-    # abort_on_repeated_lines guards against a small local model locking
-    # into a repetition loop and burning the whole max_tokens budget on one
-    # line — see llm/repetition.py for the measured incident and threshold
-    # rationale.
-    async for delta in abort_on_repeated_lines(
-        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3)
+    # guard_stream stops a small local model that locked into a repetition
+    # loop from burning the whole max_tokens budget — see llm/degeneration.py.
+    # It can't retract deltas already yielded: callers of stream_summarize
+    # run degeneration.trim on the accumulated text before persisting.
+    async for delta in degeneration.guard_stream(
+        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3),
+        label="summary single-pass",
     ):
         yield delta
 
@@ -194,8 +198,8 @@ async def _summarize_chunk(
     # Non-streaming call — nothing to abort mid-generation — but a
     # degenerate chunk summary must not be fed into the reduce phase as if
     # it were legitimate content, so trim it the same way the streaming
-    # paths would have. See llm/repetition.py.
-    return trim_repeated_tail(result)
+    # paths would have. See llm/degeneration.py.
+    return degeneration.trim(result, label=f"summary chunk {n}/{total}")
 
 
 def _build_reduce_prompt(
@@ -228,8 +232,9 @@ async def _stream_reduce(
         output_language=output_language,
         source_note=source_note,
     )
-    async for delta in abort_on_repeated_lines(
-        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3)
+    async for delta in degeneration.guard_stream(
+        llm_client.stream_complete(prompt, max_tokens=2000, temperature=0.3),
+        label="summary reduce",
     ):
         yield delta
 
@@ -256,7 +261,7 @@ async def _intermediate_reduce(
     result = (await llm_client.complete(prompt, max_tokens=1500, temperature=0.3)).strip()
     # Same reasoning as _summarize_chunk: a degenerate intermediate fold
     # would otherwise poison the next fold round / the final reduce.
-    return trim_repeated_tail(result)
+    return degeneration.trim(result, label="summary intermediate reduce")
 
 
 async def _fold_partials(

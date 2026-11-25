@@ -79,9 +79,10 @@ _TRANSCRIPT_CHUNK_TOKENS = 2000
 
 # Streaming loop guard + post-hoc degeneration check: a run of MORE than
 # this many consecutive identical non-empty output lines is treated as a
-# model gone into a repetition loop. Mirrors the QA path's
-# ``api.ai._DEGEN_TAIL_RE`` but line-granular (translation output is
-# line-shaped by contract, unlike free-prose QA answers).
+# model gone into a repetition loop. Deliberately NOT ``llm.degeneration``
+# (the Q&A/summary guard): translation output is line-shaped by contract and
+# must tolerate the input's own repetition (see below), which that
+# shingle-based detector would flag.
 #
 # This is a FLOOR, not an absolute cap — see ``_degenerate_run_threshold``.
 # Real transcripts legitimately repeat a line many times in a row

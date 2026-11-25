@@ -34,7 +34,7 @@ from typing import Any
 
 from src.api.schemas import JobStatus, TranscriptSource
 from src.config import get_config
-from src.llm import languages
+from src.llm import degeneration, languages
 from src.llm import summary as llm_summary
 from src.workers import timecodes, transcribe, youtube
 from src.workers.broker import (
@@ -201,7 +201,9 @@ async def _fallback_to_page_text(
     ):
         parts.append(delta)
         broker.publish(job_id, delta_event(delta))
-    summary = timecodes.strip_timecode_placeholders("".join(parts).strip())
+    summary = timecodes.strip_timecode_placeholders(
+        degeneration.trim("".join(parts), label=f"summary job {job_id}").strip()
+    )
     # Not audio-derived — any [MM:SS] marker here is a model hallucination,
     # same rationale as pipeline._summarize_and_finish's non-audio branch.
     summary = timecodes.strip_all_timecodes(summary)
@@ -626,7 +628,9 @@ async def _process_one(
         ):
             parts.append(delta)
             broker.publish(task_job_id, delta_event(delta))
-        summary = timecodes.strip_timecode_placeholders("".join(parts).strip())
+        summary = timecodes.strip_timecode_placeholders(
+            degeneration.trim("".join(parts), label=f"summary job {task_job_id}").strip()
+        )
 
         if not summary:
             broker.publish(task_job_id, error_event("LLM returned empty summary"))

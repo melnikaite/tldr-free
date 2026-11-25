@@ -154,6 +154,40 @@ the "general knowledge to explain/contextualize" permission intact but
 tells the model plainly to say "the material doesn't cover this" instead
 of inventing a current/external specific it has no way to have looked up.
 
+## LLM output loops: ONE detector, `llm/degeneration.py`
+
+Small local models sometimes finish the real content and then loop until
+`max_tokens` — filler runs (`<br>`, bare `[MM:SS]`), a line/bullet cycle of
+any period, or a whole paragraph repeated with slight rewording (Q&A
+message 267). Every Q&A answer and every summary call (single-pass, map
+chunks, intermediate and final reduce) goes through `llm/degeneration.py`;
+don't add shape-specific regexes elsewhere.
+
+- Detector: word 6-shingles (tags -> `<tag>`, timecodes -> `<tc>`,
+  ordered-list markers dropped); loop = >= 80% of the last 32 shingles
+  already occurred >= 2 times earlier (i.e. a THIRD copy — a single
+  restatement is legit), or the text ends in 6+ tag/timecode tokens. Cut
+  goes back to the start of the 2nd copy, snapped to a line start.
+  Thresholds + calibration table against the live DB are in the module
+  docstring — re-run that calibration if you change them.
+- Streaming: `guard_stream` (summary) / `LoopWatch` (Q&A in `api/ai.py`)
+  re-check every 64 chars and close the upstream generator on detection
+  (cancels the LLM request). Already-sent deltas are NOT retracted — the
+  invariant is that every consumer runs `degeneration.trim` on the
+  accumulated text before persisting it and before the `done` event; the
+  side panel re-renders from the `done` payload (`chat.js` for Q&A,
+  `app.js` for summaries), replacing the raw streamed text. New streaming
+  consumers of `stream_summarize` must do the same.
+- Every cut logs a WARNING with a label (job id / call site) and the
+  number of discarded chars.
+- `llm/qa.py`'s `clean_answer` (tag-only / bare-timecode LINES anywhere in
+  the answer) and `timecodes.strip_all_timecodes` for document sources are
+  separate concerns and stay.
+- The translator keeps its own line-aligned guard (`workers/translator.py`):
+  its output must stay line-aligned with the input and its threshold floats
+  with the input's own repetition — a faithful translation of a Whisper
+  loop is legit there, but this detector would flag it.
+
 ## Timecodes are formatted in ONE place
 
 `daemon/src/workers/timecodes.build_marked_text` is the single source of
@@ -784,7 +818,7 @@ honest `partial` status, never a silently dropped chunk.
    and unmarked output lines that follow a match get absorbed into it
    (recovers a line the model split in two). Any input marker not found
    fails verification — as does a repetition-loop catch mirroring
-   `api.ai._DEGEN_TAIL_RE` (line-granular here since output is
+   the old Q&A filler-tail regex (line-granular here since output is
    line-shaped by contract): a run of more than `_MAX_REPEATED_LINES` (6)
    identical output lines, EXCEPT the threshold floats up to match
    whatever run-length the INPUT of that call already contains

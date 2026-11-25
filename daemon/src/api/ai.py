@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -21,6 +20,7 @@ from fastapi.responses import StreamingResponse
 
 from src.api.schemas import AUDIO_TRANSCRIPT_SOURCES, AIStreamRequest, JobStatus
 from src.config import get_config
+from src.llm import degeneration
 from src.llm import qa as llm_qa
 from src.storage import repo
 from src.workers import timecodes
@@ -34,16 +34,6 @@ from src.workers.broker import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai", tags=["ai"])
-
-# A small local model finishes the answer, then degenerates into a repetition
-# loop — a run of <br> tags, a stray closing tag, or bare [MM:SS] markers — and
-# keeps emitting until max_tokens. The real answer is already complete by then,
-# so once the output ENDS with 6+ consecutive such filler tokens we stop reading
-# the stream (cuts the live spam and the wasted generation). clean_answer()
-# trims whatever partial filler slipped through before the cutoff.
-_DEGEN_TAIL_RE = re.compile(
-    r"(?:\s*(?:<[^>]+>|\[\d{1,2}:\d{2}(?::\d{2})?\])\s*){6,}\Z"
-)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -107,19 +97,26 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
     # thumbnails without redoing the LOOK step. Stays empty when the LOOK
     # step never ran, or ran but found nothing relevant.
     frame_refs: list[dict[str, Any]] = []
+    # Stop as soon as the answer degenerates into a repetition loop (filler
+    # runs, a paragraph/bullet cycle) — see llm/degeneration.py. The streamed
+    # deltas can't be retracted, but the `done` event below carries the
+    # trimmed answer and the side panel re-renders the bubble from it.
+    label = f"qa job {job_id}"
+    watch = degeneration.LoopWatch(label)
+    answer_stream = llm_qa.stream_answer(
+        job=job,
+        question=question,
+        output_language=cfg.output.language_name,
+        from_audio=from_audio,
+    )
     try:
-        async for item in llm_qa.stream_answer(
-            job=job,
-            question=question,
-            output_language=cfg.output.language_name,
-            from_audio=from_audio,
-        ):
+        async for item in answer_stream:
             if isinstance(item, str):
                 parts.append(item)
                 yield _sse(delta_event(item))
-                # Stop as soon as the output degenerates into a filler loop —
-                # don't keep streaming junk to the client or burning tokens.
-                if _DEGEN_TAIL_RE.search("".join(parts)[-400:]):
+                if watch.feed(item):
+                    # Closing the generator cancels the LLM request.
+                    await degeneration.aclose_quietly(answer_stream)
                     break
             elif item.get("type") == "frames":
                 frame_refs.extend(item.get("items") or [])
@@ -132,10 +129,10 @@ async def _qa_stream(job: Any, question: str) -> AsyncIterator[str]:
         yield _sse(error_event(f"qa failed: {exc}"))
         return
 
-    # Final tidy: strip any partial filler that slipped through before the
-    # degeneration cutoff above (bare [MM:SS] dumps, runs of <br>, stray tags)
-    # so the stored — and reloaded — message is clean.
-    answer = llm_qa.clean_answer("".join(parts).strip())
+    # Cut the looped tail (if any), then strip leftover filler lines (bare
+    # [MM:SS] dumps, tag-only lines) that a loop cut doesn't cover because
+    # they sit mid-answer, so the stored — and reloaded — message is clean.
+    answer = llm_qa.clean_answer(degeneration.trim("".join(parts), label=label).strip())
     # Document sources (web page / PDF) have no timecodes to begin with, so
     # any [MM:SS] marker here is a model hallucination — strip it deterministically.
     if not from_audio:

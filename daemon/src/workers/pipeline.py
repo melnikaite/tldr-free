@@ -41,7 +41,7 @@ from src.api.schemas import (
     TranscriptSource,
 )
 from src.config import get_config
-from src.llm import languages
+from src.llm import degeneration, languages
 from src.llm import summary as llm_summary
 from src.llm import vision as llm_vision
 from src.storage import repo
@@ -1136,7 +1136,9 @@ async def _summarize_and_finish(
         broker.publish(job_id, error_event(f"summarization failed: {exc}"))
         return
 
-    summary_md = timecodes.strip_timecode_placeholders("".join(parts).strip())
+    summary_md = timecodes.strip_timecode_placeholders(
+        degeneration.trim("".join(parts), label=f"summary job {job_id}").strip()
+    )
     # Non-transcript sources (web pages, PDFs) have no timecodes in the source,
     # so any [MM:SS] marker here is a model hallucination — strip them all. For
     # audio sources real markers must survive, so this only runs for the rest.
